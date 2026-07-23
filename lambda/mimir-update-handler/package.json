@@ -1,0 +1,9 @@
+{
+  "name": "mimir-update-handler",
+  "version": "1.0.0",
+  "description": "Lambda function for updating Mimir items with generated summaries",
+  "main": "index.js",
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.0.0"
+  }
+}

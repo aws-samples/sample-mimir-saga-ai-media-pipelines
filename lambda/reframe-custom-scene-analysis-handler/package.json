@@ -1,0 +1,9 @@
+{
+  "name": "reframe-custom-scene-analysis-handler",
+  "version": "1.0.0",
+  "description": "Analyses each scene to determine CROP or TILE layout decision",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.0.0",
+    "@aws-sdk/client-bedrock-runtime": "^3.0.0"
+  }
+}

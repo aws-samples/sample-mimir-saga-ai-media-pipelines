@@ -1,0 +1,10 @@
+{
+  "name": "story-research-handler",
+  "version": "1.0.0",
+  "description": "Generates research content for a Saga story using Bedrock",
+  "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "^3.0.0",
+    "@aws-sdk/client-s3": "^3.0.0",
+    "@aws-sdk/client-secrets-manager": "^3.0.0"
+  }
+}

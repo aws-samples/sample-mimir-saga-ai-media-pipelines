@@ -1,0 +1,11 @@
+{
+  "name": "chapterize-handler",
+  "version": "1.0.0",
+  "description": "Lambda function to chapterize video content using Amazon Nova via Bedrock Converse API",
+  "main": "index.js",
+  "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "^3.0.0",
+    "@aws-sdk/client-secrets-manager": "^3.0.0",
+    "@aws-sdk/client-s3": "^3.0.0"
+  }
+}

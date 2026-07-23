@@ -1,0 +1,44 @@
+# Compiled JavaScript files from TypeScript
+lib/**/*.js
+bin/**/*.js
+*.d.ts
+
+# Jest config is needed
+!jest.config.js
+
+# Dependencies and build outputs
+node_modules
+cdk.out
+.cdk.staging
+
+# Exclude sensitive configuration files
+parameters.json
+keys.txt
+
+# Exclude large media files
+*.mp4
+sample media/
+
+# Graphics templates contain embedded station logos — keep directory, ignore content
+graphics/templates/*.json
+graphics/README.md
+
+# Exclude reference API specs (third-party, not our code)
+reference/
+
+# Exclude generated security scan reports
+ash-security-report.html
+cdk-nag-results.txt
+
+__pycache__
+lambda/reframe-custom-ei-handler/probe-metadata.js
+scripts/probe-ei-metadata.mjs
+scripts/test-ei-handler.json
+scripts/test-mediaconvert.js
+scripts/test-transcript-fetch.js
+scripts/test-note-patch-description.js
+scripts/test-notes-api.js
+scripts/check-description-field.js
+scripts/check-metadata-form.js
+scripts/test-mimir-description.js
+scripts/check-item-transcript.js

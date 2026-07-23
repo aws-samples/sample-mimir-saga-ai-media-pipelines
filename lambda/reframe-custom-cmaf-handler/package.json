@@ -1,0 +1,9 @@
+{
+  "name": "reframe-custom-cmaf-handler",
+  "version": "1.0.0",
+  "description": "CMAF conversion, Rekognition scene detection, and scene preparation for reframe-custom pipeline",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.0.0",
+    "@aws-sdk/client-rekognition": "^3.0.0"
+  }
+}

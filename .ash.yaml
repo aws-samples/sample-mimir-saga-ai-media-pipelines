@@ -1,0 +1,75 @@
+global_settings:
+  suppressions:
+    # === Unfixable transitive vulnerability in aws-cdk-lib ===
+    - rule_id: 'GHSA-q3j6-qgpj-74h6'
+      path: 'package-lock.json'
+      reason: 'fast-uri vulnerability is a nested dependency inside aws-cdk-lib that cannot be overridden from the consuming project. This is a CDK infrastructure tool dependency only — not deployed to Lambda or runtime environments. Tracked upstream: https://github.com/aws/aws-cdk/issues'
+
+    - rule_id: 'GHSA-v39h-62p7-jpjc'
+      path: 'package-lock.json'
+      reason: 'fast-uri vulnerability is a nested dependency inside aws-cdk-lib that cannot be overridden from the consuming project. This is a CDK infrastructure tool dependency only — not deployed to Lambda or runtime environments. Tracked upstream: https://github.com/aws/aws-cdk/issues'
+
+    # === False positive: variable/parameter names containing "key", "secret", "api" ===
+    - rule_id: 'SECRET-SECRET-KEYWORD'
+      path: 'lib/infrastructure-stack.ts'
+      reason: 'Variable named mimirApiKey/sagaApiKey — references to Secrets Manager ARNs, not actual secrets'
+
+    - rule_id: 'SECRET-SECRET-KEYWORD'
+      path: 'lib/saga-feeds-stack.ts'
+      reason: 'Variable named mimirApiKey — references to Secrets Manager ARN, not actual secret'
+
+    - rule_id: 'SECRET-SECRET-KEYWORD'
+      path: 'parameters.example.json'
+      reason: 'Placeholder values (your-mimir-api-key-here) — not real credentials'
+
+    - rule_id: 'SECRET-SECRET-KEYWORD'
+      path: 'README.md'
+      reason: 'Documentation showing parameter names (mimirApiKey, sagaApiKey) — not actual secrets'
+
+    - rule_id: 'SECRET-SECRET-KEYWORD'
+      path: '.kiro/specs/*/design.md'
+      reason: 'Design documentation referencing secret ARN variable names, not actual secrets'
+
+    - rule_id: 'SECRET-SECRET-KEYWORD'
+      path: 'scripts/create-mimir-webhook.sh'
+      reason: 'Script reads API key from parameters.json at runtime — variable name triggers false positive'
+
+    - rule_id: 'SECRET-SECRET-KEYWORD'
+      path: 'upload_video_to_mimir.py'
+      reason: 'Function parameter named api_key — not a hardcoded secret'
+
+    # === False positive: high-entropy strings in inline Lambda code ===
+    - rule_id: 'SECRET-BASE64-HIGH-ENTROPY-STRING'
+      path: 'lib/constructs/agentcore.ts'
+      reason: 'Inline Python Lambda code for CDK custom resources — contains code strings, not secrets'
+
+    - rule_id: 'SECRET-BASE64-HIGH-ENTROPY-STRING'
+      path: 'lib/observability-stack.ts'
+      reason: 'Inline Python Lambda code for CDK custom resources — contains code strings, not secrets'
+
+    # === False positive: placeholder values in example config ===
+    - rule_id: 'CKV_SECRET_6'
+      path: 'parameters.example.json'
+      reason: 'Contains placeholder text (your-mimir-api-key-here) for documentation — not real credentials'
+
+    # === By design: container binds to 0.0.0.0 for AgentCore Runtime ===
+    - rule_id: 'B104'
+      path: 'agents/mimir-mcp-server/mimir_mcp.py'
+      reason: 'MCP server must bind to 0.0.0.0 to accept connections from AgentCore Runtime container orchestration'
+
+    # === By design: template literals in fetch URLs are not format string injection ===
+    - rule_id: 'javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring'
+      path: 'lambda/story-context-handler/index.js'
+      reason: 'Template literals used to construct API URLs from trusted environment variables and item IDs — not user-controlled format strings'
+
+    - rule_id: 'javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring'
+      path: 'lambda/mimir-update-handler/index.js'
+      reason: 'Template literal constructs Mimir API URL from item ID — not user-controlled format string'
+
+    - rule_id: 'javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring'
+      path: 'lambda/saga-feed-handler/index.js'
+      reason: 'Template literal constructs API URL from trusted parameters — not user-controlled format string'
+
+    - rule_id: 'javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring'
+      path: 'scripts/test-vector-search.js'
+      reason: 'Template literal in console.log for debugging — not a security risk'

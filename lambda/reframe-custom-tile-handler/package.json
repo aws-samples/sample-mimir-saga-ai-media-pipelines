@@ -1,0 +1,8 @@
+{
+  "name": "reframe-custom-tile-handler",
+  "version": "1.0.0",
+  "description": "FFmpeg-based tile layout for reframe-custom pipeline",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.0.0"
+  }
+}

@@ -1,0 +1,5 @@
+# FFmpeg static binaries — too large for git (77MB each)
+# Download from https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
+# and place ffmpeg + ffprobe in bin/
+bin/ffmpeg
+bin/ffprobe

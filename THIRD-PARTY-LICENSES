@@ -1,0 +1,61 @@
+# Third-Party Licenses
+
+This project uses the following third-party dependencies:
+
+## Root CDK Project (package.json)
+
+| Dependency | Version | License |
+|---|---|---|
+| aws-cdk-lib | ^2.227.0 | Apache-2.0 |
+| constructs | ^10.4.3 | Apache-2.0 |
+| @aws-sdk/client-secrets-manager | ^3.1024.0 | Apache-2.0 |
+| source-map-support | ^0.5.21 | MIT |
+| aws-cdk (dev) | ^2.1033.0 | Apache-2.0 |
+| ts-node (dev) | ^10.9.2 | MIT |
+| typescript (dev) | ^5.9.3 | Apache-2.0 |
+| @types/node (dev) | ^24.10.1 | MIT |
+
+## Lambda Functions (Node.js)
+
+| Dependency | Version | License |
+|---|---|---|
+| @aws-sdk/client-s3 | ^3.0.0 | Apache-2.0 |
+| @aws-sdk/client-secrets-manager | ^3.0.0 | Apache-2.0 |
+| @aws-sdk/client-bedrock-runtime | ^3.0.0 | Apache-2.0 |
+| @aws-sdk/client-bedrock-agentcore | ^3.0.0 | Apache-2.0 |
+| @aws-sdk/client-sfn | ^3.0.0 | Apache-2.0 |
+| @aws-sdk/client-ssm | ^3.0.0 | Apache-2.0 |
+| @aws-sdk/client-s3vectors | ^3.0.0 | Apache-2.0 |
+| @aws-sdk/client-transcribe | ^3.0.0 | Apache-2.0 |
+| @aws-sdk/lib-storage | ^3.0.0 | Apache-2.0 |
+| @aws-sdk/s3-request-presigner | ^3.0.0 | Apache-2.0 |
+| xml2js | ^0.6.2 | MIT |
+
+## Python Agents
+
+### rough-cut-agent (requirements.txt)
+
+| Dependency | Version | License |
+|---|---|---|
+| strands-agents | >=0.1.0 | Apache-2.0 |
+| bedrock-agentcore | >=0.1.21 | Apache-2.0 |
+| strands-agents-tools | >=0.1.0 | Apache-2.0 |
+| boto3 | >=1.34.0 | Apache-2.0 |
+| requests | >=2.31.0 | Apache-2.0 |
+
+### xml-processor-agent (requirements.txt)
+
+| Dependency | Version | License |
+|---|---|---|
+| strands-agents | >=0.1.0 | Apache-2.0 |
+| bedrock-agentcore | >=0.1.21 | Apache-2.0 |
+| strands-agents-tools | >=0.1.0 | Apache-2.0 |
+| boto3 | >=1.34.0 | Apache-2.0 |
+
+### mimir-mcp-server (requirements.txt)
+
+| Dependency | Version | License |
+|---|---|---|
+| mcp | >=1.20.0 | MIT |
+| httpx | >=0.27.0 | BSD-3-Clause |
+| boto3 | >=1.35.0 | Apache-2.0 |

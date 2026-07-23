@@ -1,0 +1,474 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Mimir & Saga AI Media Pipelines - Deployment Pipeline. Creates a CodeBuild
+  project that clones the repository, restores configuration from SSM Parameter
+  Store, and runs deploy.sh. The first build starts automatically on stack
+  creation. Supports one-click re-deploys: start a new build to pull the latest
+  code and redeploy. Configuration (parameters.json) is persisted in an SSM
+  SecureString parameter so subsequent builds are idempotent.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Required: Mimir & Saga Credentials"
+        Parameters:
+          - MimirApiKey
+          - SagaApiKey
+      - Label:
+          default: "Platform Settings"
+        Parameters:
+          - MimirInstance
+          - SagaApiUrl
+          - SummaryFieldName
+          - EnableTranscribeFallback
+          - MimirAllowedIssuer
+      - Label:
+          default: "Application Settings"
+        Parameters:
+          - ProductName
+          - VisibilityGroupMap
+      - Label:
+          default: "Deployment Source"
+        Parameters:
+          - RepoUrl
+          - GitBranch
+          - GitHubTokenSecretName
+    ParameterLabels:
+      MimirApiKey:
+        default: "Mimir API Key"
+      SagaApiKey:
+        default: "Saga API Key"
+      MimirInstance:
+        default: "Mimir Instance (e.g., us)"
+      SagaApiUrl:
+        default: "Saga API Base URL"
+      SummaryFieldName:
+        default: "Mimir Summary Field Name"
+      EnableTranscribeFallback:
+        default: "Enable Transcribe Fallback"
+      MimirAllowedIssuer:
+        default: "Allowed Cognito Issuer (optional)"
+      ProductName:
+        default: "Product Name"
+      VisibilityGroupMap:
+        default: "Visibility Group Map (optional JSON)"
+      RepoUrl:
+        default: "Git Repository URL"
+      GitBranch:
+        default: "Git Branch"
+      GitHubTokenSecretName:
+        default: "GitHub Token Secret Name (private repos only)"
+
+Parameters:
+  MimirApiKey:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: >
+      Mimir API key (format: sakm.<identifier>.<secret>). Required on first
+      deploy. Leave blank on re-deploys - the value is restored from SSM.
+      Alternatively, leave blank and pre-populate the SSM config parameter
+      (see stack outputs).
+
+  SagaApiKey:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: >
+      Saga API key. Required on first deploy. Leave blank on re-deploys -
+      the value is restored from SSM.
+
+  MimirInstance:
+    Type: String
+    Default: us
+    Description: >
+      Mimir instance region identifier. Used to construct the Mimir API base
+      URL (https://<instance>.mjoll.no).
+
+  SagaApiUrl:
+    Type: String
+    Default: https://us.mjoll.no
+    Description: Base URL for the Saga API.
+
+  SummaryFieldName:
+    Type: String
+    Default: description
+    Description: >
+      Mimir metadata field where AI-generated summaries are written. Must be a
+      valid field in your tenant's MDF (e.g., description, summary, ai_summary).
+
+  EnableTranscribeFallback:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      When 'true', the Summarize action runs Amazon Transcribe on items with no
+      Mimir transcript. Set to 'false' to keep summaries visual-only and avoid
+      Transcribe costs.
+
+  MimirAllowedIssuer:
+    Type: String
+    Default: ''
+    Description: >
+      Optional. Pin the Cognito issuer URL allowed to invoke custom actions
+      (e.g., https://cognito-idp.us-east-1.amazonaws.com/us-east-1_XXXXXXXXX).
+      Leave blank to accept any valid AWS Cognito issuer.
+
+  ProductName:
+    Type: String
+    Default: Mimir Saga AI
+    Description: >
+      Product name used for stack naming and SSM parameter paths. The buildspec
+      derives PascalCase (e.g., "MimirSagaAI") and an acronym (e.g., "MSAI")
+      from this value, matching the CDK naming conventions in bin/app.ts.
+
+  VisibilityGroupMap:
+    Type: String
+    Default: ''
+    Description: >
+      Optional JSON map of ingest source name to Mimir visibility group, with
+      '*' as fallback (e.g., {"reuters":"agency-content","*":null}). Leave
+      blank to use the tenant default visibility for all sources.
+
+  RepoUrl:
+    Type: String
+    Default: https://github.com/aws-samples/sample-mimir-saga-ai-media-pipelines.git
+    Description: HTTPS URL of the Git repository to deploy from.
+
+  GitBranch:
+    Type: String
+    Default: main
+    Description: Git branch to deploy.
+
+  GitHubTokenSecretName:
+    Type: String
+    Default: ''
+    Description: >
+      (Optional) Secrets Manager secret name containing a GitHub personal
+      access token. Required only for private forks.
+
+Conditions:
+  HasGitHubToken: !Not [!Equals [!Ref GitHubTokenSecretName, '']]
+
+Resources:
+
+  # =========================================================================
+  # IAM Role for CodeBuild - needs broad permissions for CDK deployment
+  # =========================================================================
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-codebuild-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+        # NOTE: AdministratorAccess is used because CDK deployment creates
+        # resources across many services (Lambda, Step Functions, S3, ECR,
+        # Bedrock AgentCore, Cognito, API Gateway, EventBridge, Secrets
+        # Manager, etc.). For production, scope this down to the specific
+        # services used.
+    Metadata:
+      cdk_nag:
+        rules_to_suppress:
+          - id: AwsSolutions-IAM4
+            reason: >-
+              CDK deployment requires broad permissions across many services.
+              AdministratorAccess is intentional for the deployment role.
+
+  # =========================================================================
+  # CodeBuild Project
+  # =========================================================================
+  DeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${AWS::StackName}-build
+      Description: !Sub Deploys ${ProductName} CDK stacks
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      TimeoutInMinutes: 120
+      EncryptionKey: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3'
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: REPO_URL
+            Value: !Ref RepoUrl
+          - Name: GIT_BRANCH
+            Value: !Ref GitBranch
+          - Name: GITHUB_TOKEN_SECRET
+            Value: !If [HasGitHubToken, !Ref GitHubTokenSecretName, '']
+          - Name: MSAI_MIMIR_API_KEY
+            Value: !Ref MimirApiKey
+          - Name: MSAI_SAGA_API_KEY
+            Value: !Ref SagaApiKey
+          - Name: MSAI_MIMIR_INSTANCE
+            Value: !Ref MimirInstance
+          - Name: MSAI_SAGA_API_URL
+            Value: !Ref SagaApiUrl
+          - Name: MSAI_SUMMARY_FIELD
+            Value: !Ref SummaryFieldName
+          - Name: MSAI_TRANSCRIBE_FALLBACK
+            Value: !Ref EnableTranscribeFallback
+          - Name: MSAI_ALLOWED_ISSUER
+            Value: !Ref MimirAllowedIssuer
+          - Name: MSAI_PRODUCT_NAME
+            Value: !Ref ProductName
+          - Name: MSAI_VISIBILITY_GROUP_MAP
+            Value: !Ref VisibilityGroupMap
+          - Name: MSAI_PARAM_OVERRIDES
+            Value: '{}'
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+
+          env:
+            variables:
+              PROJECT_DIR: /codebuild/output/src/sample-mimir-saga-ai-media-pipelines
+
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 20
+              commands:
+                - echo "=== Deployment Started ==="
+                - node --version && npm --version && aws --version
+                # Make 'aws configure get region' work inside deploy.sh
+                - aws configure set region "$AWS_DEFAULT_REGION"
+
+                # Derive naming conventions from ProductName. Must match
+                # createNamingConventions() in bin/app.ts: words that are
+                # already all-uppercase are kept whole ("AI" -> "AI"), others
+                # contribute their first letter. "Mimir Saga AI" -> "MSAI".
+                - |
+                  export PASCAL_CASE=$(node -p "process.env.MSAI_PRODUCT_NAME.trim().split(/\s+/).map(w => w[0].toUpperCase() + w.slice(1)).join('').replace(/[^a-zA-Z0-9]/g, '')")
+                  export ACRONYM=$(node -p "process.env.MSAI_PRODUCT_NAME.trim().split(/\s+/).map(w => w === w.toUpperCase() ? w : w[0].toUpperCase()).join('')")
+                  export SSM_CONFIG_PARAM="/${PASCAL_CASE}/DeploymentConfig/parameters"
+                  echo "ProductName: $MSAI_PRODUCT_NAME"
+                  echo "PascalCase:  $PASCAL_CASE"
+                  echo "Acronym:     $ACRONYM"
+                  echo "SSM config:  $SSM_CONFIG_PARAM"
+
+            pre_build:
+              commands:
+                # Clone the repository (public by default, token for private forks)
+                - |
+                  if [ -n "$GITHUB_TOKEN_SECRET" ]; then
+                    GITHUB_TOKEN=$(aws secretsmanager get-secret-value --secret-id "$GITHUB_TOKEN_SECRET" --query SecretString --output text)
+                    CLONE_URL=$(echo "$REPO_URL" | sed "s|https://|https://${GITHUB_TOKEN}@|")
+                    git clone --depth 1 --branch "$GIT_BRANCH" "$CLONE_URL" "$PROJECT_DIR"
+                  else
+                    git clone --depth 1 --branch "$GIT_BRANCH" "$REPO_URL" "$PROJECT_DIR"
+                  fi
+
+                # Set productName / visibilityGroupMap context in cdk.json
+                - |
+                  cd "$PROJECT_DIR"
+                  node -e "
+                    const fs = require('fs');
+                    const cdk = JSON.parse(fs.readFileSync('cdk.json'));
+                    cdk.context = cdk.context || {};
+                    cdk.context.productName = process.env.MSAI_PRODUCT_NAME;
+                    if (process.env.MSAI_VISIBILITY_GROUP_MAP) {
+                      cdk.context.visibilityGroupMap = JSON.parse(process.env.MSAI_VISIBILITY_GROUP_MAP);
+                    }
+                    fs.writeFileSync('cdk.json', JSON.stringify(cdk, null, 2));
+                  "
+
+                # Restore parameters.json from SSM (SecureString), or seed it
+                # from the CloudFormation parameters on first run.
+                - |
+                  cd "$PROJECT_DIR"
+                  SAVED_PARAMS=$(aws ssm get-parameter --name "$SSM_CONFIG_PARAM" --with-decryption --query "Parameter.Value" --output text 2>/dev/null || echo "")
+                  if [ -n "$SAVED_PARAMS" ] && [ "$SAVED_PARAMS" != "None" ]; then
+                    echo "$SAVED_PARAMS" > parameters.json
+                    echo "Restored parameters.json from SSM"
+                  else
+                    echo "No SSM config found, seeding from CloudFormation parameters"
+                    if [ -z "$MSAI_MIMIR_API_KEY" ] || [ -z "$MSAI_SAGA_API_KEY" ]; then
+                      echo "ERROR: First deploy requires MimirApiKey and SagaApiKey."
+                      echo "Either update the pipeline stack with both values, or pre-create"
+                      echo "the SSM parameter $SSM_CONFIG_PARAM (SecureString) containing a"
+                      echo "completed parameters.json, then start a new build."
+                      exit 1
+                    fi
+                    cp parameters.example.json parameters.json
+                    node -e "
+                      const fs = require('fs');
+                      const params = JSON.parse(fs.readFileSync('parameters.json'));
+                      const values = {
+                        MimirApiKey: process.env.MSAI_MIMIR_API_KEY,
+                        SagaApiKey: process.env.MSAI_SAGA_API_KEY,
+                        SagaApiUrl: process.env.MSAI_SAGA_API_URL,
+                        MimirInstance: process.env.MSAI_MIMIR_INSTANCE,
+                        SummaryFieldName: process.env.MSAI_SUMMARY_FIELD,
+                        MimirAllowedIssuer: process.env.MSAI_ALLOWED_ISSUER || '',
+                        EnableTranscribeFallback: process.env.MSAI_TRANSCRIBE_FALLBACK || 'true'
+                      };
+                      for (const [key, value] of Object.entries(values)) {
+                        const p = params.find(p => p.ParameterKey === key);
+                        if (p) p.ParameterValue = value;
+                      }
+                      fs.writeFileSync('parameters.json', JSON.stringify(params, null, 2));
+                    "
+                    aws ssm put-parameter --name "$SSM_CONFIG_PARAM" --type SecureString \
+                      --value "$(cat parameters.json)" --overwrite \
+                      --description "Deployment parameters - seeded by CodeBuild first run"
+                    echo "Configuration seeded to SSM (SecureString)"
+                  fi
+
+                # Apply runtime parameter overrides. Two ways to override:
+                #
+                # 1. JSON overrides for a single build:
+                #    aws codebuild start-build --project-name <name> \
+                #      --environment-variables-override \
+                #        name=MSAI_PARAM_OVERRIDES,value='{"SummaryFieldName":"ai_summary"}',type=PLAINTEXT
+                #
+                # 2. Update the pipeline stack parameters in the CloudFormation
+                #    console, then start a new build. Non-empty values that
+                #    differ from the SSM config are applied and persisted.
+                - |
+                  cd "$PROJECT_DIR"
+                  node -e "
+                    const fs = require('fs');
+                    const params = JSON.parse(fs.readFileSync('parameters.json'));
+                    let changed = false;
+                    const apply = (paramKey, val, source) => {
+                      if (!val) return;
+                      const p = params.find(p => p.ParameterKey === paramKey);
+                      if (p && p.ParameterValue !== val) {
+                        console.log('Override (' + source + '): ' + paramKey + ' = ' + (paramKey.includes('Key') ? '***' : val));
+                        p.ParameterValue = val;
+                        changed = true;
+                      } else if (!p) {
+                        console.log('Adding parameter (' + source + '): ' + paramKey);
+                        params.push({ ParameterKey: paramKey, ParameterValue: val });
+                        changed = true;
+                      }
+                    };
+                    const overrides = JSON.parse(process.env.MSAI_PARAM_OVERRIDES || '{}');
+                    for (const [k, v] of Object.entries(overrides)) apply(k, v, 'JSON');
+                    const envMap = {
+                      MSAI_MIMIR_API_KEY: 'MimirApiKey',
+                      MSAI_SAGA_API_KEY: 'SagaApiKey',
+                      MSAI_SAGA_API_URL: 'SagaApiUrl',
+                      MSAI_MIMIR_INSTANCE: 'MimirInstance',
+                      MSAI_SUMMARY_FIELD: 'SummaryFieldName',
+                      MSAI_ALLOWED_ISSUER: 'MimirAllowedIssuer',
+                      MSAI_TRANSCRIBE_FALLBACK: 'EnableTranscribeFallback'
+                    };
+                    for (const [envVar, paramKey] of Object.entries(envMap)) apply(paramKey, process.env[envVar], 'env');
+                    if (changed) {
+                      fs.writeFileSync('parameters.json', JSON.stringify(params, null, 2));
+                      console.log('parameters.json updated with overrides');
+                    } else {
+                      console.log('No overrides to apply');
+                    }
+                  "
+
+            build:
+              commands:
+                - cd "$PROJECT_DIR" && chmod +x deploy.sh && ./deploy.sh
+
+            post_build:
+              commands:
+                - |
+                  cd "$PROJECT_DIR"
+                  if [ -f parameters.json ]; then
+                    aws ssm put-parameter --name "$SSM_CONFIG_PARAM" --type SecureString \
+                      --value "$(cat parameters.json)" --overwrite \
+                      --description "Deployment parameters - updated by deploy"
+                    echo "Configuration saved to SSM"
+                  fi
+                  echo "=== Deployment Complete ==="
+                  echo "Custom action webhook URLs are in the ${ACRONYM}-CoreStack outputs:"
+                  aws cloudformation describe-stacks --stack-name "${ACRONYM}-CoreStack" \
+                    --query "Stacks[0].Outputs[].{Key:OutputKey,Value:OutputValue}" --output table 2>/dev/null || true
+
+  # =========================================================================
+  # Auto-trigger: starts the first build automatically on stack creation
+  # =========================================================================
+  BuildTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-build-trigger-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: StartBuild
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: codebuild:StartBuild
+                Resource: !GetAtt DeployProject.Arn
+
+  BuildTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-build-trigger
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt BuildTriggerRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] in ('Create', 'Update'):
+                      project = event['ResourceProperties']['ProjectName']
+                      boto3.client('codebuild').start_build(projectName=project)
+                      print(f"Started build for project: {project}")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  BuildTrigger:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt BuildTriggerFunction.Arn
+      ProjectName: !Ref DeployProject
+      # Changing these forces a new build on stack update
+      RepoUrl: !Ref RepoUrl
+      GitBranch: !Ref GitBranch
+
+Outputs:
+  CodeBuildProjectName:
+    Description: CodeBuild project name - trigger builds from console or CLI
+    Value: !Ref DeployProject
+
+  BuildConsoleUrl:
+    Description: Link to the CodeBuild project in the AWS Console
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/codesuite/codebuild/${AWS::AccountId}/projects/${DeployProject}/history
+
+  StartBuildCommand:
+    Description: CLI command to trigger a re-deployment
+    Value: !Sub >
+      aws codebuild start-build --project-name ${DeployProject}
+      --region ${AWS::Region}
+
+  ConfigParameterName:
+    Description: >
+      SSM SecureString parameter holding parameters.json. To update config,
+      fetch it with --with-decryption, edit, put it back, then start a new build.
+    Value: /MimirSagaAI/DeploymentConfig/parameters

@@ -1,0 +1,9 @@
+{
+  "name": "graphics-overlay-renderer",
+  "version": "1.0.0",
+  "description": "Lottie animation renderer using Puppeteer + lottie-web",
+  "dependencies": {
+    "puppeteer": "^22.0.0",
+    "lottie-web": "^5.12.0"
+  }
+}

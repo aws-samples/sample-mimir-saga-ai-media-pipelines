@@ -1,0 +1,8 @@
+{
+  "name": "reframe-custom-stitch-handler",
+  "version": "1.0.0",
+  "description": "Stitches per-scene clips into a single final video using FFmpeg",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.0.0"
+  }
+}

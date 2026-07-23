@@ -1,0 +1,9 @@
+{
+  "name": "mimir-logging-handler",
+  "version": "1.0.0",
+  "description": "Lambda function to update Mimir with chapter logging data",
+  "main": "index.js",
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.0.0"
+  }
+}

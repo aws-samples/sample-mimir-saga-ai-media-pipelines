@@ -1,0 +1,11 @@
+{
+  "name": "vertical-reframe-handler",
+  "version": "1.0.0",
+  "description": "Lambda function for vertical video reframing using MediaConvert Smart Cropping with Elemental Inference",
+  "main": "index.js",
+  "dependencies": {
+    "@aws-sdk/client-mediaconvert": "^3.0.0",
+    "@aws-sdk/client-secrets-manager": "^3.0.0",
+    "@aws-sdk/client-s3": "^3.0.0"
+  }
+}

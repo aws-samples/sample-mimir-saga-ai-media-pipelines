@@ -1,0 +1,9 @@
+{
+  "name": "story-context-handler",
+  "version": "1.0.0",
+  "description": "Lambda handler for fetching story context and evaluating asset readiness",
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.0.0",
+    "@aws-sdk/client-s3vectors": "^3.0.0"
+  }
+}

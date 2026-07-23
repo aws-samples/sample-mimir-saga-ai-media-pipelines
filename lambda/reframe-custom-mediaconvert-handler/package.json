@@ -1,0 +1,8 @@
+{
+  "name": "reframe-custom-mediaconvert-handler",
+  "version": "1.0.0",
+  "description": "Creates per-scene MediaConvert jobs (CROP or TILE) and polls for completion",
+  "dependencies": {
+    "@aws-sdk/client-mediaconvert": "^3.0.0"
+  }
+}

@@ -1,0 +1,80 @@
+{
+  "Comment": "Story Research pipeline — gathers story context, generates research items via Bedrock, writes back to Saga",
+  "QueryLanguage": "JSONata",
+  "StartAt": "GatherStoryContext",
+  "States": {
+    "GatherStoryContext": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": {
+        "FunctionName": "${StoryContextHandlerArn}",
+        "Payload": "{% $states.input %}"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Assign": {
+        "storyContext": "{% $states.result.Payload %}",
+        "storyId": "{% $states.input.storyId %}",
+        "customPrompts": "{% $states.input.customPrompts ? $states.input.customPrompts : [] %}"
+      },
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "Assign": {
+            "errorMessage": "{% $states.error.Cause %}"
+          }
+        }
+      ],
+      "Next": "GenerateResearch"
+    },
+
+    "GenerateResearch": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": {
+        "FunctionName": "${StoryResearchHandlerArn}",
+        "Payload": {
+          "storyId": "{% $storyId %}",
+          "storyContext": "{% $storyContext %}",
+          "customPrompts": "{% $customPrompts %}"
+        }
+      },
+      "TimeoutSeconds": 300,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleFailure",
+          "Assign": {
+            "errorMessage": "{% $states.error.Cause %}"
+          }
+        }
+      ],
+      "Next": "HandleSuccess"
+    },
+
+    "HandleSuccess": {
+      "Type": "Succeed"
+    },
+
+    "HandleFailure": {
+      "Type": "Fail",
+      "Error": "StoryResearchError",
+      "Cause": "{% $errorMessage ? $errorMessage : 'Story research generation failed' %}"
+    }
+  }
+}

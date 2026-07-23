@@ -1,0 +1,37 @@
+[
+  {
+    "ParameterKey": "MimirApiKey",
+    "ParameterValue": "",
+    "Description": "Mimir API key for authenticating with the Mimir MAM platform. Format: sakm.<identifier>.<secret>"
+  },
+  {
+    "ParameterKey": "SagaApiKey",
+    "ParameterValue": "",
+    "Description": "Saga API key for authenticating with the Saga editorial platform."
+  },
+  {
+    "ParameterKey": "SagaApiUrl",
+    "ParameterValue": "https://us.mjoll.no",
+    "Description": "Base URL for the Saga API (e.g., https://pnqrxq1y5l.execute-api.us-east-1.amazonaws.com/v1)."
+  },
+  {
+    "ParameterKey": "MimirInstance",
+    "ParameterValue": "us",
+    "Description": "Mimir instance region identifier. Used to construct the Mimir API base URL (https://<instance>.mjoll.no)."
+  },
+  {
+    "ParameterKey": "SummaryFieldName",
+    "ParameterValue": "description",
+    "Description": "Mimir metadata field name where the AI-generated summary is written. Must be a valid field in the tenant's MDF. Common values: 'description', 'summary', 'ai_summary'."
+  },
+  {
+    "ParameterKey": "MimirAllowedIssuer",
+    "ParameterValue": "",
+    "Description": "Optional. Pin the Cognito issuer URL allowed to invoke custom actions (e.g. https://cognito-idp.us-east-1.amazonaws.com/us-east-1_XXXXXXXXX). Leave blank to accept any valid AWS Cognito issuer — tokens must still be signature-valid, unexpired Cognito ID tokens. Set this to lock the API to your specific Mimir tenant."
+  },
+  {
+    "ParameterKey": "EnableTranscribeFallback",
+    "ParameterValue": "true",
+    "Description": "When 'true', the Summarize action runs AWS Transcribe on items that have no Mimir transcript, publishes the transcript back to Mimir, and includes it in the summary. Set to 'false' to keep summaries visual-only and avoid Transcribe costs."
+  }
+]
