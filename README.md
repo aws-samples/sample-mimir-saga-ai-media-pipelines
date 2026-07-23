@@ -154,12 +154,13 @@ Copy the JSON output into `.kiro/settings/mcp.json`. Note: the token expires in 
 
 Deploy without a local development environment. A small CloudFormation stack creates a CodeBuild project that clones this repository, seeds your configuration, and runs `deploy.sh` automatically.
 
-1. Launch the pipeline stack:
+1. Launch the pipeline stack. No clone required — fetch the template straight from GitHub:
 
    ```bash
+   curl -fsSL https://raw.githubusercontent.com/aws-samples/sample-mimir-saga-ai-media-pipelines/main/scripts/deploy-pipeline.yaml -o deploy-pipeline.yaml && \
    aws cloudformation create-stack \
      --stack-name MSAI-DeployPipeline \
-     --template-body file://scripts/deploy-pipeline.yaml \
+     --template-body file://deploy-pipeline.yaml \
      --capabilities CAPABILITY_NAMED_IAM \
      --parameters \
        ParameterKey=MimirApiKey,ParameterValue='sakm....' \
