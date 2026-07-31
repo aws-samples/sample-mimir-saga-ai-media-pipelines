@@ -551,7 +551,9 @@ def handler(event, context):
     const runtimeRefresher = new lambda.Function(this, 'RuntimeRefresher', {
       runtime: lambda.Runtime.PYTHON_3_14,
       handler: 'index.handler',
-      timeout: cdk.Duration.minutes(10),
+      // Must exceed the ECR wait loop (~8 min) + runtime update wait, with margin,
+      // so the function always reaches send_response before being killed.
+      timeout: cdk.Duration.minutes(14),
       code: lambda.Code.fromInline(`
 import json
 import boto3
@@ -575,31 +577,40 @@ def handler(event, context):
         
         print(f"Refreshing runtime {runtime_id} to image {container_uri}")
         
-        # Step 1: Wait for the EXACT image (tagged with this deploy's source hash)
-        # to be present in ECR. This is deterministic: we wait for the specific
-        # image this deploy builds, not the "latest CodeBuild status". The old
-        # logic matched the previous SUCCEEDED build and refreshed the runtime
-        # before the new image was pushed (a ~40s race on every redeploy).
+        # Step 1: Prefer the EXACT image tagged with this deploy's source hash.
+        # This is deterministic: the runtime moves to the specific image built
+        # for this source, avoiding the old "latest CodeBuild" race. If that tag
+        # isn't present (e.g. a construct-only deploy that triggered no build, or
+        # first rollout before the tag exists), fall back to :latest so the
+        # refresh ALWAYS completes and responds to CloudFormation.
+        # IMPORTANT: this loop must finish well within the Lambda timeout, or the
+        # function is killed before send_response and CloudFormation reports
+        # "did not receive a response" (which fails/rolls back the stack).
         if image_tag and ecr_repo:
             ecr_client = boto3.client('ecr', region_name=region)
-            print(f"Waiting for image {ecr_repo}:{image_tag} to appear in ECR...")
+            print(f"Waiting for image {ecr_repo}:{image_tag} in ECR...")
             found = False
-            for i in range(90):  # up to ~15 min
+            for i in range(48):  # ~8 min max, safely under the 14 min timeout
                 try:
                     ecr_client.describe_images(
                         repositoryName=ecr_repo,
                         imageIds=[{'imageTag': image_tag}]
                     )
-                    print(f"Image {image_tag} present in ECR, proceeding with refresh")
+                    print(f"Image {image_tag} present; using hash-tagged image")
                     found = True
                     break
                 except ecr_client.exceptions.ImageNotFoundException:
                     print(f"  Image {image_tag} not yet pushed (attempt {i+1})")
                     time.sleep(10)
+                except Exception as e:
+                    print(f"  describe_images error ({e}); falling back to :latest")
+                    break
             if not found:
-                print(f"Timed out waiting for image {image_tag}; proceeding anyway")
+                # Fall back to :latest (always present, current image).
+                container_uri = container_uri.rsplit(':', 1)[0] + ':latest'
+                print(f"Hash image not found; falling back to {container_uri}")
         else:
-            print("No ImageTag/EcrRepositoryName provided, skipping ECR wait")
+            print("No ImageTag/EcrRepositoryName provided; using provided ContainerUri")
         
         client = boto3.client('bedrock-agentcore-control', region_name=region)
         
