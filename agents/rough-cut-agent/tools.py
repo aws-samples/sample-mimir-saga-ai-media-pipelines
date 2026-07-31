@@ -943,9 +943,10 @@ def _build_linear_instance_slate(script_sections: list) -> dict:
             display_text = text.upper()
             color = "#ffffff"
         else:
-            # Package script: green
+            # Package script: green. Saga only accepts a fixed enum of text
+            # colors — use its green (#74db63); #00ff00 is rejected with a 400.
             display_text = text
-            color = "#00ff00"
+            color = "#74db63"
 
         # Build children array — label in bold if present, then text
         children = []
@@ -1003,6 +1004,9 @@ def create_or_update_linear_instance(story_id: str, script_sections_json: str) -
 
     logger.info(f"create_or_update_linear_instance: story={story_id}, sections={len(script_sections)}")
 
+    # Build the Slate document once — reused for both create and update paths.
+    slate_doc = _build_linear_instance_slate(script_sections)
+
     # Step 1: Get existing instances for the story
     instances_url = f"{saga_url}/stories/{story_id}/instances"
     resp = requests.get(instances_url, headers=_saga_auth_headers(), timeout=30)
@@ -1010,57 +1014,96 @@ def create_or_update_linear_instance(story_id: str, script_sections_json: str) -
     instances_data = resp.json()
     instances = instances_data.get("instances", instances_data if isinstance(instances_data, list) else [])
 
-    # Step 2: Find an unassigned linear instance
-    # An unassigned instance has no assignedUserId (or it is null/empty)
-    # and instanceType contains "linear"
+    # Step 2: Find an existing UNASSIGNED, ORG-SCOPED linear instance.
+    # Real Saga API shape (verified against live API):
+    #   - platform is on platformInfo.platform (or platformType), NOT instanceType
+    #   - "unassigned" == platformInfo.account.accountId is null / empty
+    #     (an assigned instance has a rundown accountId + accountTitle)
+    #   - org-scoped instances have ids shaped "<orgId>-INS-...". Bare instances
+    #     ("INS-...") were created by a tenant-scoped key and are INVISIBLE in the
+    #     org's Instances pane. We must NOT reuse a bare instance — otherwise the
+    #     script write lands on a hidden instance. By requiring an org-scoped id
+    #     here, we fall through to CREATE a fresh org-scoped instance instead.
+    def _is_org_scoped(inst_id):
+        return isinstance(inst_id, str) and "-INS-" in inst_id
+
     target_instance_id = None
     for inst in instances:
-        inst_type = inst.get("instanceType", inst.get("type", "")).lower()
-        assigned = inst.get("assignedUserId") or inst.get("assignedUser")
-        if "linear" in inst_type and not assigned:
-            target_instance_id = inst.get("id")
-            logger.info(f"Found existing unassigned linear instance: {target_instance_id}")
+        platform = (
+            (inst.get("platformInfo") or {}).get("platform")
+            or inst.get("platformType")
+            or ""
+        ).lower()
+        account = (inst.get("platformInfo") or {}).get("account") or {}
+        is_unassigned = not account.get("accountId")
+        inst_id = inst.get("id") or inst.get("mId")
+        if platform == "linear" and is_unassigned and _is_org_scoped(inst_id):
+            target_instance_id = inst_id
+            logger.info(f"Found existing unassigned org-scoped linear instance: {target_instance_id}")
             break
 
-    # Step 3: Create a new unassigned linear instance if none found
-    if not target_instance_id:
-        logger.info("No unassigned linear instance found — creating one")
-        create_url = f"{saga_url}/stories/{story_id}/instances"
-        create_payload = {
-            "instanceType": "linear",
-        }
-        create_resp = requests.post(
-            create_url, headers=headers, json=create_payload, timeout=30
+    if target_instance_id:
+        # Step 3a: Update the existing instance's content via PATCH.
+        patch_url = f"{saga_url}/instances/{target_instance_id}"
+        patch_resp = requests.patch(
+            patch_url, headers=headers, json={"content": slate_doc}, timeout=30
         )
-        create_resp.raise_for_status()
-        created = create_resp.json()
-        target_instance_id = (
-            created.get("id")
-            or created.get("instance", {}).get("id")
+        patch_resp.raise_for_status()
+        logger.info(
+            f"Updated existing linear instance {target_instance_id} with "
+            f"{len(script_sections)} script sections"
         )
-        logger.info(f"Created new linear instance: {target_instance_id}")
+        return json.dumps({
+            "instanceId": target_instance_id,
+            "sectionsWritten": len(script_sections),
+            "created": False,
+            "status": "success",
+        })
 
+    # Step 3b: No unassigned linear instance — create one WITH the script content
+    # in a single POST. The Saga create endpoint accepts inline content, so no
+    # follow-up PATCH is needed. The instance inherits the org of the API key,
+    # so an org-scoped key produces an org-stamped instance visible in that
+    # org's Instances pane.
+    logger.info("No unassigned linear instance found — creating one with script content")
+    story_title = ""
+    try:
+        story_resp = requests.get(
+            f"{saga_url}/stories/{story_id}", headers=_saga_auth_headers(), timeout=30
+        )
+        if story_resp.ok:
+            story_json = story_resp.json()
+            story_title = story_json.get("mTitle") or story_json.get("title") or ""
+    except Exception as e:
+        logger.warning(f"Could not fetch story title for instance: {e}")
+
+    create_url = f"{saga_url}/stories/{story_id}/instances"
+    create_payload = {
+        "title": story_title or "Rough Cut",
+        "state": "todo",
+        "platformInfo": {
+            "platform": "linear",
+            "account": {"accountId": None, "accountTitle": "Unassigned"},
+        },
+        "content": slate_doc,
+    }
+    create_resp = requests.post(
+        create_url, headers=headers, json=create_payload, timeout=30
+    )
+    create_resp.raise_for_status()
+    created = create_resp.json()
+    target_instance_id = (
+        created.get("id")
+        or created.get("mId")
+        or (created.get("instance", {}) or {}).get("id")
+    )
     if not target_instance_id:
-        return json.dumps({"error": "Failed to find or create a linear instance"})
+        return json.dumps({"error": "Failed to create a linear instance"})
 
-    # Step 4: Build the Slate document
-    slate_doc = _build_linear_instance_slate(script_sections)
-
-    # Step 5: PATCH the instance content
-    patch_url = f"{saga_url}/instances/{target_instance_id}"
-    patch_payload = {"content": slate_doc}
-    patch_resp = requests.patch(
-        patch_url, headers=headers, json=patch_payload, timeout=30
-    )
-    patch_resp.raise_for_status()
-
-    logger.info(
-        f"Linear instance {target_instance_id} updated with "
-        f"{len(script_sections)} script sections"
-    )
-
+    logger.info(f"Created new unassigned linear instance: {target_instance_id}")
     return json.dumps({
         "instanceId": target_instance_id,
         "sectionsWritten": len(script_sections),
+        "created": True,
         "status": "success",
     })

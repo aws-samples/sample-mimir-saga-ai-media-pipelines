@@ -2323,14 +2323,30 @@ def invoke(payload):
         # over unassigned ones. Skip instances with no content.
         script_text = ""
         script_source = "none"
-        linear_instances = [
-            inst for inst in instances
-            if "linear" in inst.get("instanceType", inst.get("type", "")).lower()
-        ]
-        # Sort: assigned first, then unassigned
-        linear_instances.sort(
-            key=lambda i: 0 if (i.get("assignedUserId") or i.get("assignedUser")) else 1
-        )
+
+        def _is_linear(inst: dict) -> bool:
+            platform = (
+                (inst.get("platformInfo") or {}).get("platform")
+                or inst.get("platformType")
+                or ""
+            ).lower()
+            return platform == "linear"
+
+        def _is_assigned(inst: dict) -> bool:
+            # Real Saga API: an instance is "assigned" when its platformInfo
+            # account has a rundown accountId. Fall back to legacy fields.
+            account = (inst.get("platformInfo") or {}).get("account") or {}
+            return bool(
+                account.get("accountId")
+                or inst.get("assignedUserId")
+                or inst.get("assignedUser")
+            )
+
+        linear_instances = [inst for inst in instances if _is_linear(inst)]
+        # Prefer an assigned instance (a producer has claimed it and written a
+        # script) over an unassigned one, so a reporter's existing script is
+        # used as context when present.
+        linear_instances.sort(key=lambda i: 0 if _is_assigned(i) else 1)
         for inst in linear_instances:
             inst_text = _slate_to_text(inst.get("content", {}))
             if inst_text.strip():
