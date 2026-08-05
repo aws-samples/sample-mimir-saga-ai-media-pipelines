@@ -2,6 +2,7 @@ from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands import Agent
 from strands.models import BedrockModel
 from prompts import SCRIPT_ANALYSIS_PROMPT, SOURCE_MATERIAL_PROMPT, TIMELINE_ASSEMBLY_PROMPT
+from profiles import get_profile, DEFAULT_ROUGH_CUT_TYPE
 from tools import get_transcript, get_generated_transcript, query_embeddings, get_mimir_item_details, create_timeline, update_story_status, get_word_timing, generate_voiceover, upload_voiceover_to_mimir, create_or_update_linear_instance, _build_linear_instance_slate
 import json
 import logging
@@ -145,7 +146,7 @@ def _validate_script_analysis(data: dict) -> None:
             raise ValueError(f"{key} must be an array")
 
 
-def run_script_analysis(story_context: dict) -> dict:
+def run_script_analysis(story_context: dict, profile_directive: str = "") -> dict:
     """Analyze a story script and return a structured ScriptAnalysis dict.
 
     This function creates a Strands Agent with the SCRIPT_ANALYSIS_PROMPT,
@@ -214,7 +215,7 @@ def run_script_analysis(story_context: dict) -> dict:
 
     agent = Agent(
         model=bedrock_model,
-        system_prompt=SCRIPT_ANALYSIS_PROMPT,
+        system_prompt=SCRIPT_ANALYSIS_PROMPT + (profile_directive or ""),
     )
 
     # Invoke the agent
@@ -1841,6 +1842,7 @@ def run_timeline_assembly(
     vo_clips: dict = None,
     run_id: str = "",
     folder_id: str = None,
+    profile_directive: str = "",
 ) -> dict:
     """Assemble a rough cut timeline and create it in Mimir.
 
@@ -1889,7 +1891,7 @@ def run_timeline_assembly(
     # Zero-tool agent — only produces sequenceDetails JSON
     agent = Agent(
         model=bedrock_model,
-        system_prompt=TIMELINE_ASSEMBLY_PROMPT,
+        system_prompt=TIMELINE_ASSEMBLY_PROMPT + (profile_directive or ""),
         tools=[],
     )
 
@@ -2266,6 +2268,11 @@ def invoke(payload):
     try:
         logger.info(f"Rough Cut Agent invoked with payload keys: {list(payload.keys())}")
 
+        # Select the rough-cut profile (prompt/constraint overrides) by type.
+        rough_cut_type = payload.get("roughCutType") or DEFAULT_ROUGH_CUT_TYPE
+        profile = get_profile(rough_cut_type)
+        logger.info(f"Rough cut type: {rough_cut_type} ({profile['label']})")
+
         # Extract payload fields — storyContext comes from the story-context-handler Lambda
         # which fetches and enriches the story data from Saga API
         story_context_data = payload.get("storyContext", {})
@@ -2467,7 +2474,9 @@ def invoke(payload):
                 "notes": notes,
             }
             logger.info("Stage 1: Running Script Analysis Agent")
-            script_analysis = run_script_analysis(story_context)
+            script_analysis = run_script_analysis(
+                story_context, profile_directive=profile["script_directive"]
+            )
             _save_artifact(story_id, "01-script-analysis", script_analysis, run_id)
             logger.info("Stage 1: Script Analysis complete")
         except Exception as e:
@@ -2551,6 +2560,7 @@ def invoke(payload):
             vo_clips=vo_clips,
             run_id=run_id,
             folder_id=mimir_folder_id,
+            profile_directive=profile["timeline_directive"],
         )
 
         # --- Stage 4: Write script to Saga linear instance ---

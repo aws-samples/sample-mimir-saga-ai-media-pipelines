@@ -831,6 +831,12 @@ export class InfrastructureStack extends cdk.Stack {
     const roughCutResource = actionsResource.addResource('rough-cut');
     roughCutResource.addMethod('POST', new apigateway.LambdaIntegration(sagaActionHandler));
 
+    // POST /actions/rough-cut-simple-vo endpoint — a rough-cut VARIANT that runs
+    // the same rough-cut state machine/agent but with a stripped-down VO-only
+    // profile. saga-action-handler maps this path to roughCutType="simple-vo".
+    const roughCutSimpleVoResource = actionsResource.addResource('rough-cut-simple-vo');
+    roughCutSimpleVoResource.addMethod('POST', new apigateway.LambdaIntegration(sagaActionHandler));
+
     // Mimir Webhooks API Gateway
     const webhookApiLogGroup = new logs.LogGroup(this, 'MimirWebhooksApiLogs', { retention: logs.RetentionDays.ONE_MONTH });
     const webhookApi = new apigateway.RestApi(this, 'ItemChangeWebhookApi', {
@@ -1030,7 +1036,8 @@ export class InfrastructureStack extends cdk.Stack {
             "storyId": "{% $states.input.storyId %}",
             "story": "{% $states.input.story %}",
             "triggeredByUserId": "{% $states.input.triggeredByUserId %}",
-            "mimirApiKey": "{% $states.input.mimirApiKey %}"
+            "mimirApiKey": "{% $states.input.mimirApiKey %}",
+            "roughCutType": "{% $states.input.roughCutType ? $states.input.roughCutType : 'full' %}"
           },
           "Catch": [
             {
@@ -1649,7 +1656,8 @@ export class InfrastructureStack extends cdk.Stack {
               "storyId": "{% $storyId %}",
               "story": "{% $story %}",
               "triggeredByUserId": "{% $triggeredByUserId %}",
-              "mimirApiKey": "{% $mimirApiKey %}"
+              "mimirApiKey": "{% $mimirApiKey %}",
+              "roughCutType": "{% $roughCutType %}"
             }
           },
           "TimeoutSeconds": 1800,
@@ -2774,11 +2782,19 @@ export class InfrastructureStack extends cdk.Stack {
     const reframeGraphicsResource = actionsResource.addResource('reframe-with-graphics');
     reframeGraphicsResource.addMethod('POST', new apigateway.LambdaIntegration(mimirHandler));
 
-    // Upload Lottie templates to S3 on deploy
+    // Upload Lottie templates to S3 on deploy.
+    //
+    // prune: false is deliberate. Customer templates are per-deployment content
+    // rather than infrastructure, and `graphics/templates/*.json` is git-ignored
+    // because the files embed station logos and licensed font outlines. With the
+    // default prune: true, deploying from a fresh checkout syncs an empty
+    // directory and deletes every template in the bucket, breaking the
+    // ReframeWithGraphics pipeline with NoSuchKey at the RenderOverlay step.
     new s3deploy.BucketDeployment(this, 'LottieTemplatesDeployment', {
       sources: [s3deploy.Source.asset('graphics/templates')],
       destinationBucket: lottieTemplatesBucket,
       destinationKeyPrefix: 'templates',
+      prune: false,
     });
 
     // ---------------------------------------------------------------------------

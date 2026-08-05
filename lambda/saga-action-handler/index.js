@@ -94,20 +94,28 @@ exports.handler = async (event) => {
 
     const mimirApiKey = await getMimirApiKey();
 
+    // Rough-cut variants all run the SAME rough-cut state machine/agent; the
+    // action only changes the "roughCutType", which the agent uses to select a
+    // prompt/constraint profile (e.g. a stripped-down VO-only cut).
+    // Map: action path -> rough cut type.
+    const ROUGH_CUT_TYPES = {
+      'rough-cut': 'full',
+      'rough-cut-simple-vo': 'simple-vo',
+    };
+
     let stateMachineArn;
-    switch (actionType) {
-      case 'rough-cut':
-        stateMachineArn = process.env.ROUGH_CUT_STATE_MACHINE_ARN;
-        break;
-      case 'story-research':
-        stateMachineArn = process.env.STORY_RESEARCH_STATE_MACHINE_ARN;
-        break;
-      default:
-        return {
-          statusCode: 400,
-          headers: corsHeaders,
-          body: JSON.stringify({ message: `Unknown saga action: ${actionType}`, status: 'error' }),
-        };
+    let roughCutType;
+    if (actionType in ROUGH_CUT_TYPES) {
+      stateMachineArn = process.env.ROUGH_CUT_STATE_MACHINE_ARN;
+      roughCutType = ROUGH_CUT_TYPES[actionType];
+    } else if (actionType === 'story-research') {
+      stateMachineArn = process.env.STORY_RESEARCH_STATE_MACHINE_ARN;
+    } else {
+      return {
+        statusCode: 400,
+        headers: corsHeaders,
+        body: JSON.stringify({ message: `Unknown saga action: ${actionType}`, status: 'error' }),
+      };
     }
 
     const executionName = `${actionType}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -119,6 +127,8 @@ exports.handler = async (event) => {
       story: body.story,
       triggeredByUserId: body.triggeredByUserId,
       actionType,
+      // Only set for rough-cut actions; selects the agent's prompt/constraint profile.
+      ...(roughCutType ? { roughCutType } : {}),
     };
 
     const result = await sfnClient.send(new StartExecutionCommand({
