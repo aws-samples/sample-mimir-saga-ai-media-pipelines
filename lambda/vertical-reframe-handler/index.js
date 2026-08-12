@@ -340,10 +340,14 @@ async function createCompositedJob(croppedVideoUri, overlayS3Uri, outputBucket, 
                   ShadowXOffset: 2,
                   ShadowYOffset: 2,
                   TeletextSpacing: 'AUTO',
-                  // Position at bottom — YPosition is % from top, use high value
-                  // XPosition/YPosition are in pixels from top-left
-                  XPosition: 0,
-                  YPosition: 85,  // 85% from top = near bottom
+                  // Deliberately no XPosition/YPosition. Both are measured in
+                  // PIXELS from the top-left of the output frame, not percent.
+                  // Omitting them makes MediaConvert place the captions at the
+                  // bottom centre (per Alignment above), which is what we want
+                  // and stays correct across every output size this function
+                  // renders (1080x1920, 1080x1080, 1080x1350, 1920x1080).
+                  // Setting YPosition: 85 here previously pinned the captions
+                  // 85px from the TOP of the frame, over the location bug.
                   StylePassthrough: 'DISABLED',
                 },
               },
