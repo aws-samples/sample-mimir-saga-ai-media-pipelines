@@ -12,6 +12,7 @@ AWS CDK project that integrates Mimir (media asset management) and Saga (editori
 - [One-Click Deployment (CloudFormation + CodeBuild)](#one-click-deployment-cloudformation--codebuild)
 - [Local Deployment (for developers)](#local-deployment-for-developers)
 - [Configuration](#configuration)
+- [Graphics Templates (Bodymovin Export)](#graphics-templates-bodymovin-export)
 - [Scripts](#scripts)
 - [Cost](#cost)
 - [Cleanup](#cleanup)
@@ -261,10 +262,68 @@ The McpGatewayStack creates:
 
 Run `scripts/get-mcp-config.sh` to retrieve all connection details.
 
+## Graphics Templates (Bodymovin Export)
+
+The Reframe + Graphics pipeline renders [Lottie](https://airbnb.io/lottie/) motion-graphics overlays exported from Adobe After Effects. Templates live in `graphics/templates/` and are uploaded to S3 on deploy — see [graphics/README.md](graphics/README.md) for layer-naming conventions and template requirements.
+
+### Installing the Bodymovin plugin
+
+Bodymovin is the free After Effects extension that exports compositions as Lottie JSON.
+
+**Option A — Adobe Exchange (recommended):**
+1. Install from the [Bodymovin page on Adobe Exchange](https://exchange.adobe.com/apps/cc/12557) (Creative Cloud handles the install)
+2. Restart After Effects
+
+**Option B — Manual ZXP install:**
+1. Download the `.zxp` from [aescripts.com/bodymovin](https://aescripts.com/bodymovin/) (free, "name your own price" at $0) or from the [lottie-web GitHub repo](https://github.com/airbnb/lottie-web) (`build/extension/bodymovin.zip`)
+2. Install it with [ZXP Installer](https://aescripts.com/learn/zxp-installer/)
+3. Restart After Effects
+
+**Then, in After Effects:**
+1. Enable **Preferences → Scripting & Expressions → "Allow Scripts to Write Files and Access Network"** (required — the export silently fails without it)
+2. Open the plugin via **Window → Extensions → Bodymovin**
+
+### Export settings
+
+Several Bodymovin settings are not optional for this pipeline — the wrong value
+produces a JSON that exports without error and then renders incorrectly. Glyphs
+must be on (the server-side text fitting measures glyph widths), asset
+compression must be off (it can drop the logo's alpha channel), and expressions
+must not be converted to keyframes (it freezes the headline line-count control).
+
+The full table, with the reason behind each, is in
+**[graphics/README.md → Bodymovin export settings that matter](graphics/README.md#bodymovin-export-settings-that-matter)**.
+
+After exporting, name the files per the convention in
+[graphics/README.md](graphics/README.md), drop them in `graphics/templates/`,
+and deploy.
+
+### Authoring guidelines
+
+Start from `graphics/reframe-graphics-overlay-template.aep` rather than a blank
+project — it already meets the renderer's layer-name contract and the export
+constraints. See
+[graphics/README.md → Template anatomy](graphics/README.md#template-anatomy) for
+which layers are structural, which are placeholders, and what a customer is
+expected to rebrand.
+
+Two constraints worth knowing before you design anything:
+
+- **Text is replaced at render time, geometry is not.** Auto-sizing rigs that
+  measure text bounds with `sourceRectAtTime()` cannot run in lottie-web. Bake
+  such expressions before export and let the handler resize label backgrounds
+  instead — see
+  [Text background fitting](graphics/README.md#text-background-fitting).
+- **Only the first ~15s renders.** The pipeline caps the overlay at `maxFrames`
+  and loops it, so put the entrance animation at the start and hold. See
+  [Render duration and looping](graphics/README.md#render-duration-and-looping).
+
 ## Scripts
 
 | Script | Purpose |
 |---|---|
+| `ae-audit-project.jsx` | After Effects: read-only audit of a graphics template project — font inventory, brand-string leak scan, Lottie compatibility warnings, renderer layer-name contract check. Run via File > Scripts > Run Script File... |
+| `ae-sanitize-template.jsx` | After Effects: automates the mechanical sanitization of a template — reduce to delivery comps, delete guide layers, remap fonts, swap logos for a placeholder, trim durations, rename comps. Defaults to a dry run |
 | `get-mcp-config.sh` | Get MCP Gateway connection details for Quick Suite / Kiro |
 | `retrigger-embeddings.sh` | Re-trigger failed embedding jobs by story ID or all timed-out |
 | `backfill-stability.sh` | Run camera-stability analysis for clips ingested before the feature existed |
