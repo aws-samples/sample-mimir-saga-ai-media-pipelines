@@ -81,6 +81,13 @@ CATEGORY_COLORS = {
 
 DEFAULT_CATEGORY = 'BREAKING NEWS'
 
+# Layer names accepted for the category label — the text layer whose content is
+# replaced with the current category. 'BREAKING NEWS' is historical: templates
+# derived from the original station project name the layer after the default
+# category even though it carries any category. 'Category Label' is the
+# preferred name for new templates.
+CATEGORY_LABEL_LAYER_NAMES = ('BREAKING NEWS', 'Category Label')
+
 # Fake font origin served by render_lottie.js request interception
 FONT_ORIGIN = 'http://lottie.render'
 
@@ -331,6 +338,302 @@ def set_category_dropdown(data: dict, category: str) -> None:
     logger.warning("Could not find 'sidebar control' / 'Choose News Type' effect")
 
 
+# ---------------------------------------------------------------------------
+# Text background fitting
+#
+# After Effects auto-sizing text box rigs measure the text layer with
+# sourceRectAtTime(). lottie-web does not implement that function, so the
+# expression fails at render time and the box falls back to whatever static
+# value Bodymovin exported — often a stub a few dozen pixels wide.
+#
+# Since this handler already rewrites the text, it can also resize the
+# background to match. Glyph advance widths are available in the exported
+# `chars` array, so the string can be measured properly rather than estimated.
+# ---------------------------------------------------------------------------
+
+# Fallback horizontal padding (total, both sides) when it cannot be derived
+# from the template.
+DEFAULT_BOX_PADDING_X = 24.0
+
+# A derived padding outside this range means the template's exported box size
+# was not a valid measurement of its placeholder text — usually because the
+# auto-size expression was captured mid-animation.
+PADDING_SANITY_RANGE = (0.0, 200.0)
+
+
+def _build_char_index(data: dict) -> dict:
+    """Index exported glyphs by (character, font family, font style).
+
+    Bodymovin exports each glyph once with `w` as the advance width at font
+    size 100, so the advance at an arbitrary size is `w * size / 100`.
+    """
+    idx = {}
+    for c in data.get('chars', []) or []:
+        idx[(c.get('ch'), c.get('fFamily'), c.get('style'))] = c
+    return idx
+
+
+def _font_family_style(data: dict, font_name: str):
+    """Map a PostScript font name to the (fFamily, fStyle) used in `chars`."""
+    for f in data.get('fonts', {}).get('list', []) or []:
+        if f.get('fName') == font_name:
+            return f.get('fFamily'), f.get('fStyle')
+    return None, None
+
+
+def measure_text_width(data: dict, char_index: dict, text: str,
+                       font_name: str, font_size: float,
+                       tracking: float = 0.0) -> float:
+    """Measure a string's rendered width in pixels from the exported glyphs.
+
+    Returns 0.0 when the font or its glyphs are not present in the template.
+    """
+    if not text:
+        return 0.0
+
+    family, style = _font_family_style(data, font_name)
+    if family is None:
+        logger.warning(f"measure_text_width: font {font_name!r} not in template")
+        return 0.0
+
+    total = 0.0
+    missing = []
+    for ch in text:
+        c = char_index.get((ch, family, style))
+        if c is None:
+            missing.append(ch)
+            continue
+        total += float(c.get('w', 0)) * font_size / 100.0
+
+    # Tracking is expressed in 1/1000 em.
+    total += (float(tracking) / 1000.0) * font_size * len(text)
+
+    if missing:
+        logger.warning(
+            f"measure_text_width: {len(missing)} glyph(s) missing from the "
+            f"template for {font_name}: {''.join(sorted(set(missing)))!r}. "
+            f"Width will be under-estimated — re-export with Glyphs enabled "
+            f"and a character-set specimen layer covering these characters."
+        )
+
+    return max(total, 0.0)
+
+
+def _find_rect_shapes(shapes: list) -> list:
+    """Collect every rectangle ('rc') item in a shape layer, at any depth."""
+    found = []
+
+    def walk(items):
+        for it in items or []:
+            ty = it.get('ty')
+            if ty == 'rc':
+                found.append(it)
+            elif ty == 'gr':
+                walk(it.get('it'))
+
+    walk(shapes)
+    return found
+
+
+def _static(prop: dict):
+    """Read a static property value, ignoring any expression attached to it."""
+    if not isinstance(prop, dict):
+        return None
+    return prop.get('k')
+
+
+def _set_static(prop: dict, value) -> None:
+    """Set a static property value and drop any expression on it.
+
+    The expression must go: lottie-web would otherwise try to evaluate it and
+    override the value we just wrote.
+    """
+    prop['k'] = value
+    prop['a'] = 0
+    prop.pop('x', None)
+
+
+def fit_text_backgrounds(data: dict, text_by_layer: dict) -> None:
+    """Resize each label background to fit the text that was patched into it.
+
+    Pairing is by name: a shape layer called '{name}-TextBox' is treated as the
+    background for the text layer called '{name}'. Matching ignores case and
+    surrounding whitespace.
+
+    The box's left edge is preserved: a rectangle is centred on its own
+    position, so growing the width by d moves the centre by d/2.
+
+    Horizontal padding is derived per box as
+        exported_box_width - measured_width_of_placeholder_text
+    which keeps each template's own design spacing without configuration. When
+    that yields an implausible number — typically because the auto-size
+    expression was captured mid-animation — DEFAULT_BOX_PADDING_X is used.
+    """
+    char_index = _build_char_index(data)
+    if not char_index:
+        logger.warning("fit_text_backgrounds: template has no `chars` array; "
+                       "cannot measure text. Re-export with Glyphs enabled.")
+        return
+
+    layer_sets = [data.get('layers', [])]
+    for asset in data.get('assets', []):
+        if 'layers' in asset:
+            layer_sets.append(asset['layers'])
+
+    fitted = 0
+
+    for layers in layer_sets:
+        # index shape layers by normalised name
+        boxes = {}
+        for layer in layers:
+            if layer.get('ty') == 4:
+                boxes[layer.get('nm', '').strip().lower()] = layer
+
+        for layer in layers:
+            if layer.get('ty') != 5:
+                continue
+
+            base = layer.get('nm', '').strip()
+            box = boxes.get((base + '-textbox').lower())
+            if box is None:
+                continue
+
+            try:
+                doc = layer['t']['d']['k'][0]['s']
+            except (KeyError, IndexError, TypeError):
+                continue
+
+            new_text = doc.get('t', '')
+            font_name = doc.get('f')
+            font_size = float(doc.get('s', 0) or 0)
+            tracking = float(doc.get('tr', 0) or 0)
+            if not font_name or not font_size:
+                continue
+
+            original_text = text_by_layer.get(base)
+            rects = _find_rect_shapes(box.get('shapes', []))
+            if not rects:
+                continue
+
+            new_w = measure_text_width(data, char_index, new_text,
+                                       font_name, font_size, tracking)
+            if new_w <= 0:
+                continue
+
+            # An auto-sizing rig typically leaves several rectangles on the
+            # layer — a fill, a stroke, sometimes a line — where only one holds
+            # a real measurement and the others mirror it through expressions.
+            # Bodymovin exports the mirrored ones at whatever the expression
+            # happened to evaluate to on frame 0, which is usually a stub.
+            #
+            # Pick the widest rectangle without an expression as the reference:
+            # that is the one whose exported geometry actually described the
+            # placeholder text.
+            reference = None
+            ref_w = -1.0
+            for rect in rects:
+                size_prop = rect.get('s')
+                if not isinstance(size_prop, dict):
+                    continue
+                val = _static(size_prop)
+                if not (isinstance(val, list) and len(val) >= 2):
+                    continue
+                has_expr = 'x' in size_prop
+                width = float(val[0])
+                # prefer expression-free; among those, prefer the widest
+                score = (0 if has_expr else 1, width)
+                if reference is None or score > (0 if 'x' in reference.get('s', {}) else 1, ref_w):
+                    reference = rect
+                    ref_w = width
+            if reference is None:
+                continue
+
+            ref_size = _static(reference['s'])
+            ref_w = float(ref_size[0])
+            ref_h = float(ref_size[1])
+
+            # Derive this box's padding from its own exported geometry.
+            padding = DEFAULT_BOX_PADDING_X
+            if original_text:
+                old_w = measure_text_width(data, char_index, original_text,
+                                           font_name, font_size, tracking)
+                if old_w > 0:
+                    derived = ref_w - old_w
+                    lo, hi = PADDING_SANITY_RANGE
+                    if lo <= derived <= hi:
+                        padding = derived
+                        logger.info(
+                            f"fit_text_backgrounds: {base}: padding {padding:.1f}px "
+                            f"derived from template (box {ref_w:.1f}px, "
+                            f"placeholder text {old_w:.1f}px)"
+                        )
+                    else:
+                        logger.info(
+                            f"fit_text_backgrounds: {base}: derived padding "
+                            f"{derived:.1f}px out of range, using default "
+                            f"{DEFAULT_BOX_PADDING_X}px (reference box "
+                            f"{ref_w:.1f}px vs placeholder text {old_w:.1f}px)"
+                        )
+
+            target_w = new_w + padding
+
+            # Growing the width by d moves a centred rectangle's centre by d/2,
+            # which keeps its left edge fixed. Apply the same size and shift to
+            # every rectangle so fill and stroke stay aligned.
+            shift = (target_w - ref_w) / 2.0
+
+            for rect in rects:
+                size_prop = rect.get('s')
+                pos_prop = rect.get('p')
+                if not isinstance(size_prop, dict):
+                    continue
+
+                _set_static(size_prop, [target_w, ref_h])
+
+                if isinstance(pos_prop, dict):
+                    old_pos = _static(pos_prop)
+                    if isinstance(old_pos, list) and len(old_pos) >= 2:
+                        _set_static(pos_prop,
+                                    [float(old_pos[0]) + shift, float(old_pos[1])])
+
+            # The layer position may also carry a failed auto-size expression.
+            try:
+                _set_static(box['ks']['p'], _static(box['ks']['p']))
+            except (KeyError, TypeError):
+                pass
+
+            fitted += 1
+            logger.info(
+                f"fit_text_backgrounds: {base}-TextBox -> {target_w:.1f}px "
+                f"(text {new_w:.1f}px + padding {padding:.1f}px) for {new_text!r}"
+            )
+
+    logger.info(f"fit_text_backgrounds: resized {fitted} background(s)")
+
+
+def collect_placeholder_text(data: dict) -> dict:
+    """Snapshot each text layer's placeholder content, keyed by layer name.
+
+    Must be called BEFORE patch_lottie, so fit_text_backgrounds can derive each
+    box's design padding from the text it was originally sized around.
+    """
+    out = {}
+    layer_sets = [data.get('layers', [])]
+    for asset in data.get('assets', []):
+        if 'layers' in asset:
+            layer_sets.append(asset['layers'])
+
+    for layers in layer_sets:
+        for layer in layers:
+            if layer.get('ty') != 5:
+                continue
+            try:
+                out[layer.get('nm', '').strip()] = layer['t']['d']['k'][0]['s'].get('t', '')
+            except (KeyError, IndexError, TypeError):
+                continue
+    return out
+
+
 def patch_lottie(data: dict, category: str, line1: str, line2: str,
                  line3: str, location: str, headline: str = '') -> None:
     """Patch text layers and color fills in-place.
@@ -373,13 +676,18 @@ def patch_lottie(data: dict, category: str, line1: str, line2: str,
             if ty == 5:  # text layer
                 doc = layer.get('t', {}).get('d', {}).get('k', [{}])[0].get('s', {})
                 nm_lower = nm.lower()
-                if nm == 'Line 1':
+                # Normalise for exact-name comparisons: several templates carry
+                # trailing spaces on layer names (e.g. 'BREAKING NEWS '), which
+                # silently skipped the category-label patch on the 1:1 and 4:5
+                # aspect ratios.
+                nm_exact = nm.strip()
+                if nm_exact == 'Line 1':
                     doc['t'] = line1
-                elif nm == 'Line 2':
+                elif nm_exact == 'Line 2':
                     doc['t'] = line2
-                elif nm == 'Line 3':
+                elif nm_exact == 'Line 3':
                     doc['t'] = line3
-                elif nm == 'BREAKING NEWS' and 'TextBox' not in nm:
+                elif nm_exact in CATEGORY_LABEL_LAYER_NAMES and 'TextBox' not in nm:
                     doc['t'] = category.upper()
                 elif 'location' in nm_lower or 'courtesy' in nm_lower:
                     doc['t'] = location
@@ -580,12 +888,23 @@ def handler(event, context):
         logger.info(f"Setting category: {category}")
         set_category_dropdown(lottie_data, category)
 
-        # Step 5: Patch text layers and color fills
+        # Step 5: Patch text layers and color fills.
+        #
+        # Snapshot the placeholder copy first: fit_text_backgrounds derives each
+        # label background's design padding from the text it was sized around in
+        # After Effects, which is gone once the text has been replaced.
+        placeholder_text = collect_placeholder_text(lottie_data)
+
         logger.info(
             f"Patching text: line1={line1!r}, line2={line2!r}, line3={line3!r}, "
             f"location={location!r}, headline={headline!r}"
         )
         patch_lottie(lottie_data, category, line1, line2, line3, location, headline)
+
+        # Step 5b: Resize label backgrounds to fit the text just patched in.
+        # The auto-sizing expressions authored in AE cannot run in lottie-web,
+        # so the fit happens here instead.
+        fit_text_backgrounds(lottie_data, placeholder_text)
 
         w = lottie_data['w']
         h = lottie_data['h']
