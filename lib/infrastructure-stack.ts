@@ -3073,7 +3073,7 @@ export class InfrastructureStack extends cdk.Stack {
       lambdaFunction: graphicsOverlayHandler,
       payload: stepfunctions.TaskInput.fromObject({
         'templateBucket': lottieTemplatesBucket.bucketName,
-        'templateKey': 'templates/IG-Story-1080x1920-9:16.json',
+        'templateKey': 'templates/graphics-overlay-1080x1920-9x16.json',
         'outputBucket': outputBucket.bucketName,
         'itemId.$': '$$.Execution.Input.itemId',
         'baseFilename.$': '$$.Execution.Input.baseFilename',

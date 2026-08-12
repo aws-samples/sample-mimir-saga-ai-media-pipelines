@@ -8,17 +8,25 @@ Pipeline:
   1. Load Lottie template JSON from S3
   2. Fix asset deduplication (Bodymovin exports numeric + named comp IDs)
   3. Fix font paths (add fPath/fOrigin so lottie-web DOMLoaded fires)
-  4. Set category dropdown on 'sidebar control' layer
-  5. Patch text layers (headline lines, category label, location, body text)
-  6. Patch color fills (category accent color)
-  7. Render frames via Puppeteer + lottie-web → FFmpeg → qtrle MOV with alpha
-  8. Upload MOV to S3, return the S3 URI
+  4. Patch text layers (headline lines, category label, location, body text)
+  5. Resize text background boxes to fit the patched text (fit_text_backgrounds)
+  6. Render frames via Puppeteer + lottie-web → FFmpeg → qtrle MOV with alpha
+  7. Upload MOV to S3, return the S3 URI
 
-Template: IG-Story-1080x1920-9:16.json
-  - Single JSON handles all categories via 'sidebar control' dropdown
-  - Already 1080x1920 — no sub-comp extraction needed
-  - Dropdown values: 1=local-news, 2=breaking-news, 3=entertainment,
-                     4=national, 5=politics, 6=sports, 7=worldnews, 8=weather
+Templates: one Lottie JSON per aspect ratio, in the LOTTIE_TEMPLATES_BUCKET
+under templates/ —
+  - graphics-overlay-1080x1920-9x16.json   (9:16)
+  - graphics-overlay-1080x1080-1x1.json    (1:1)
+  - graphics-overlay-1080x1350-4x5.json    (4:5)
+
+Each JSON is already at its target resolution, so no sub-comp extraction is
+needed. Text boxes are fixed-size in the template and resized at render time
+to fit the supplied strings, because lottie-web has no sourceRectAtTime.
+
+Note: set_category_dropdown() and fix_lottie_gradients() support optional
+branded layers ('sidebar control' null with a category dropdown, per-category
+gradient fills). The reference template ships without those layers, so both
+steps log a warning and no-op. They are retained for templates that add them.
 """
 
 import json

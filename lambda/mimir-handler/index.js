@@ -215,9 +215,9 @@ exports.handler = async (event) => {
             transcript: '',
             // Per-aspect-ratio template keys — each size has its own Lottie JSON
             lottieTemplates: {
-              '9:16': 'templates/IG-Story-1080x1920-9:16.json',
-              '1:1':  'templates/IG-Square-1080x1080-1:1.json',
-              '4:5':  'templates/Twitter-portrait-1080x1350-4:5.json',
+              '9:16': 'templates/graphics-overlay-1080x1920-9x16.json',
+              '1:1':  'templates/graphics-overlay-1080x1080-1x1.json',
+              '4:5':  'templates/graphics-overlay-1080x1350-4x5.json',
             },
             aspectRatios: ['9:16', '1:1', '4:5'],
             outputPrefix: `reframe-with-graphics/${item.id}/${Date.now()}`,
@@ -280,9 +280,9 @@ exports.handler = async (event) => {
             description: itemDesc,
             transcript: '',
             lottieTemplates: {
-              '9:16': 'templates/IG-Story-1080x1920-9:16.json',
-              '1:1':  'templates/IG-Square-1080x1080-1:1.json',
-              '4:5':  'templates/Twitter-portrait-1080x1350-4:5.json',
+              '9:16': 'templates/graphics-overlay-1080x1920-9x16.json',
+              '1:1':  'templates/graphics-overlay-1080x1080-1x1.json',
+              '4:5':  'templates/graphics-overlay-1080x1350-4x5.json',
             },
             aspectRatios: ['9:16'],
             varianceThreshold: 5000,
