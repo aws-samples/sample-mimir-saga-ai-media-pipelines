@@ -99,7 +99,19 @@ exports.handler = async (event) => {
     // prompt/constraint profile (e.g. a stripped-down VO-only cut).
     // Map: action path -> rough cut type.
     const ROUGH_CUT_TYPES = {
+      // Legacy full rough cut (unchanged behavior; synthesizes an AI voice).
       'rough-cut': 'full',
+      // Generate VO — script + B-roll for linear TV; anchor reads live. NEVER
+      // synthesizes an AI voice.
+      'rough-cut-vo': 'vo',
+      // Generate VOSOT — VO plus sound-on-tape interview clips + nat sound.
+      // Anchor reads the VO live (no AI voice).
+      'rough-cut-vosot': 'vosot',
+      // Generate AI VO — reporter-driven digital/social; DOES synthesize
+      // narration. The only VO-family action that creates an AI voice.
+      'rough-cut-ai-vo': 'ai-vo',
+      // Backward-compatibility alias: the original "Simple VO" action
+      // synthesized an AI voice, i.e. it behaved as Generate AI VO.
       'rough-cut-simple-vo': 'simple-vo',
     };
 

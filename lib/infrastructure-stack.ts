@@ -849,9 +849,29 @@ export class InfrastructureStack extends cdk.Stack {
     const roughCutResource = actionsResource.addResource('rough-cut');
     roughCutResource.addMethod('POST', new apigateway.LambdaIntegration(sagaActionHandler));
 
-    // POST /actions/rough-cut-simple-vo endpoint — a rough-cut VARIANT that runs
-    // the same rough-cut state machine/agent but with a stripped-down VO-only
-    // profile. saga-action-handler maps this path to roughCutType="simple-vo".
+    // The rough-cut VARIANTS below all run the SAME rough-cut state machine and
+    // agent; saga-action-handler maps each path to a distinct roughCutType,
+    // which selects the agent's prompt/constraint profile. Keeping them as
+    // separate routes lets Saga expose them as distinct custom actions.
+    //
+    // POST /actions/rough-cut-vo — Generate VO: script + B-roll for linear TV,
+    // where an anchor reads the script live. NEVER synthesizes an AI voice.
+    const roughCutVoResource = actionsResource.addResource('rough-cut-vo');
+    roughCutVoResource.addMethod('POST', new apigateway.LambdaIntegration(sagaActionHandler));
+
+    // POST /actions/rough-cut-vosot — Generate VOSOT: VO plus sound-on-tape
+    // interview clips and preserved natural sound (anchor reads VO live).
+    const roughCutVosotResource = actionsResource.addResource('rough-cut-vosot');
+    roughCutVosotResource.addMethod('POST', new apigateway.LambdaIntegration(sagaActionHandler));
+
+    // POST /actions/rough-cut-ai-vo — Generate AI VO: reporter-driven
+    // digital/social workflow that DOES synthesize narration (Polly).
+    const roughCutAiVoResource = actionsResource.addResource('rough-cut-ai-vo');
+    roughCutAiVoResource.addMethod('POST', new apigateway.LambdaIntegration(sagaActionHandler));
+
+    // POST /actions/rough-cut-simple-vo endpoint — BACKWARD-COMPAT alias for the
+    // original "Simple VO" action, which synthesized an AI voice (i.e. it maps
+    // to roughCutType="simple-vo", now equivalent to Generate AI VO).
     const roughCutSimpleVoResource = actionsResource.addResource('rough-cut-simple-vo');
     roughCutSimpleVoResource.addMethod('POST', new apigateway.LambdaIntegration(sagaActionHandler));
 
@@ -3641,6 +3661,21 @@ export class InfrastructureStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'RoughCutEndpoint', {
       value: api.url + 'actions/rough-cut',
       description: 'Mimir Rough Cut Custom Action Endpoint URL',
+    });
+
+    new cdk.CfnOutput(this, 'GenerateVoEndpoint', {
+      value: api.url + 'actions/rough-cut-vo',
+      description: 'Generate VO custom action (script + B-roll, no AI voice)',
+    });
+
+    new cdk.CfnOutput(this, 'GenerateVosotEndpoint', {
+      value: api.url + 'actions/rough-cut-vosot',
+      description: 'Generate VOSOT custom action (VO + SOT interview clips + nat sound)',
+    });
+
+    new cdk.CfnOutput(this, 'GenerateAiVoEndpoint', {
+      value: api.url + 'actions/rough-cut-ai-vo',
+      description: 'Generate AI VO custom action (synthesized narration)',
     });
 
     new cdk.CfnOutput(this, 'SagaFeedItemsTableName', {
