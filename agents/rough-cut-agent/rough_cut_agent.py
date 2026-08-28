@@ -8,11 +8,21 @@ import json
 import logging
 import os
 import re
+import sys
 import boto3
 
-# Configure logging
+# Configure logging so the agent's own INFO logs reach stdout (and therefore the
+# AgentCore CloudWatch runtime logs). Without an explicit handler, the root
+# logger only emits WARNING+ via Python's lastResort handler, which silently
+# dropped every INFO diagnostic (stage progress, "Loaded stability maps",
+# "B-roll candidate pool: N stable segments", etc.) — making runs impossible to
+# audit even though the code was executing.
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _log_handler = logging.StreamHandler(sys.stdout)
+    _log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    logger.addHandler(_log_handler)
 
 app = BedrockAgentCoreApp()
 
