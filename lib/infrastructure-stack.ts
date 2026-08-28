@@ -119,9 +119,27 @@ export class InfrastructureStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
       enforceSSL: true,
+      // Transient staging: staged video copies and embedding intermediates are
+      // large and short-lived, so expire everything here after 7 days. Durable
+      // derived metadata (e.g. camera-stability maps) must NOT live here — it
+      // goes in the mediaAnalysisBucket below.
       lifecycleRules: [{
         expiration: cdk.Duration.days(7),
       }],
+    });
+
+    // Durable derived-metadata bucket. Analysis outputs like camera-stability
+    // maps are small but must persist for the life of the clip — the rough cut
+    // agent reads them at generation time to keep shaky footage out of B-roll.
+    // They intentionally do NOT live in the transient staging bucket (7-day
+    // expiry), which may also be barely used in customer-account deployments
+    // that read source video directly from S3. Layout mirrors the Mimir item
+    // id: stability/{itemId}/segments.json.
+    const mediaAnalysisBucket = new s3.Bucket(this, 'MediaAnalysisBucket', {
+      bucketName: `${resourcePrefix}-media-analysis-${this.account}-${this.region}`,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      autoDeleteObjects: true,
+      enforceSSL: true,
     });
 
     // Lambda function for Bedrock summarization
@@ -1920,11 +1938,14 @@ export class InfrastructureStack extends cdk.Stack {
       layers: [ffmpegLayer],
       environment: {
         VIDEO_STAGING_BUCKET: videoStagingBucket.bucketName,
+        // Durable store for the stability maps this handler writes.
+        STABILITY_BUCKET: mediaAnalysisBucket.bucketName,
         FFMPEG_PATH: '/opt/bin/ffmpeg',
         FFPROBE_PATH: '/opt/bin/ffprobe',
       },
     });
     videoStagingBucket.grantReadWrite(stabilityAnalysisHandler);
+    mediaAnalysisBucket.grantReadWrite(stabilityAnalysisHandler);
     // Read access to arbitrary customer ingest buckets (named at runtime via
     // Mimir's ingestSourceS3Bucket) — used to analyze the source object directly
     // when deployed in the customer's account, instead of the pre-signed proxy.
@@ -3580,6 +3601,13 @@ export class InfrastructureStack extends cdk.Stack {
       parameterName: '/infrastructure/video-staging-bucket-name',
       stringValue: videoStagingBucket.bucketName,
       description: 'Video staging bucket name (for cross-stack reference)',
+    });
+
+    // Export durable media-analysis bucket name (stability maps, etc.)
+    new ssm.StringParameter(this, 'MediaAnalysisBucketNameParameter', {
+      parameterName: '/infrastructure/media-analysis-bucket-name',
+      stringValue: mediaAnalysisBucket.bucketName,
+      description: 'Durable media-analysis bucket name (camera-stability maps, etc.)',
     });
 
     // Store webhook API base URL in Parameter Store for scripts

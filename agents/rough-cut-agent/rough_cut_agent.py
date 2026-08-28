@@ -551,8 +551,11 @@ def _precompute_candidates(parsed_sections: list, enriched_assets: list, top_k: 
                 pass
         logger.info(f"Loaded {len(transcript_cache)} transcripts for SOT matching")
 
-    # Camera-stability maps: used to keep shaky/hunting footage out of B-roll picks
-    stability_cache = _load_stability_cache(enriched_assets, staging_bucket)
+    # Camera-stability maps: used to keep shaky/hunting footage out of B-roll
+    # picks. These live in the durable media-analysis bucket (STABILITY_BUCKET),
+    # not the transient staging bucket, so they persist beyond staging's expiry.
+    stability_bucket = os.environ.get("STABILITY_BUCKET") or staging_bucket
+    stability_cache = _load_stability_cache(enriched_assets, stability_bucket)
 
     candidates_by_section = {}
 
@@ -1773,7 +1776,9 @@ def _rebuild_broll_tracks(assembly: dict, enriched_assets: list, script_analysis
     # span maps from the per-second metrics (pans/"move" seconds excluded — they
     # read as jerky in cover footage), discarding spans shorter than 3s.
     raw_stability = _load_stability_cache(
-        enriched_assets, os.environ.get("TRANSCRIPT_STAGING_BUCKET", ""), raw=True)
+        enriched_assets,
+        os.environ.get("STABILITY_BUCKET") or os.environ.get("TRANSCRIPT_STAGING_BUCKET", ""),
+        raw=True)
     stability_cache = {mid: _stable_only_segments(data) for mid, data in raw_stability.items()}
 
     # Build candidate pool, sorted by relevance. Candidates trimmed below 3s of
