@@ -1684,6 +1684,144 @@ def _fill_spans(spans: list, candidate_pool: list, used_segments: set,
     return filled
 
 
+def _query_broll_candidates(bedrock, s3vectors_client, vector_bucket, index_name,
+                            item_ids, query_text, strict_cache, usable_cache,
+                            min_shot_s, top_k=12):
+    """Embedding-query the vector index for *query_text* and return a
+    stability-trimmed candidate pool sorted by relevance (nearest first).
+
+    Tries the strict locked-off stability map first; if that yields nothing for
+    this query, falls back to the looser usable-labeled map, then to no filter —
+    so a section always gets *some* cover rather than a gap.
+    Pool items: {itemId, segmentIndex, startTimeSeconds, endTimeSeconds, distance}.
+    """
+    text = (query_text or "").strip() or "B-roll cover footage"
+    try:
+        embed_resp = bedrock.invoke_model(
+            modelId="amazon.nova-2-multimodal-embeddings-v1:0",
+            contentType="application/json", accept="application/json",
+            body=json.dumps({
+                "taskType": "SINGLE_EMBEDDING",
+                "singleEmbeddingParams": {
+                    "embeddingPurpose": "VIDEO_RETRIEVAL",
+                    "embeddingDimension": 1024,
+                    "text": {"truncationMode": "END", "value": text[:2000]},
+                },
+            }),
+        )
+        qv = json.loads(embed_resp["body"].read())["embeddings"][0]["embedding"]
+        resp = s3vectors_client.query_vectors(
+            vectorBucketName=vector_bucket, indexName=index_name,
+            queryVector={"float32": qv}, topK=top_k,
+            returnMetadata=True, returnDistance=True,
+            filter={"itemId": {"$in": item_ids}})
+    except Exception as e:
+        logger.warning(f"Per-section B-roll query failed: {e}")
+        return []
+
+    def _build(cache):
+        pool = []
+        for v in resp.get("vectors", []):
+            m = v.get("metadata", {})
+            cid = m.get("itemId")
+            tr = _stability_trim(cid, m.get("startTimeSeconds", 0),
+                                 m.get("endTimeSeconds", 15), cache,
+                                 min_clip_s=float(min_shot_s))
+            if tr is None:
+                continue
+            pool.append({
+                "itemId": cid, "segmentIndex": m.get("segmentIndex"),
+                "startTimeSeconds": tr[0], "endTimeSeconds": tr[1],
+                "distance": v.get("distance", 1.0),
+            })
+        return pool
+
+    return _build(strict_cache) or _build(usable_cache) or _build({})
+
+
+def _fill_v1_per_section(script_analysis, total_ms, enriched_assets, shot_config):
+    """Place B-roll cover ALIGNED to each VO section across *total_ms*.
+
+    Each pkg_vo/pkg_nats section gets a time slice proportional to its estimated
+    duration; that slice is filled with the section's OWN best-matching stable
+    clips (a per-section embedding query), so cover footage tracks the script
+    line-by-line instead of by whole-story relevance. A shared used-set prevents
+    repeating a clip across sections (avoids repetitive coverage), and a
+    global-relevance fallback pool keeps V1 gapless when a section's own matches
+    run short.
+
+    Returns a list of V1 clip dicts, or None to signal the caller to fall back
+    to the global fill (missing vector config / assets / sections).
+    """
+    sections = [s for s in sorted(script_analysis.get("parsedSections", []),
+                                  key=lambda x: x.get("orderIndex", 0))
+                if s.get("sectionType") in ("pkg_vo", "pkg_nats")]
+    if not sections:
+        return None
+    vector_bucket = os.environ.get("VECTOR_BUCKET_NAME", "")
+    index_name = os.environ.get("VECTOR_INDEX_NAME", "")
+    if not vector_bucket or not index_name:
+        return None
+    item_ids = [a["mimirItemId"] for a in enriched_assets if a.get("hasEmbeddings")]
+    if not item_ids:
+        return None
+
+    bedrock = boto3.client("bedrock-runtime")
+    s3vectors_client = boto3.client("s3vectors")
+
+    raw_stab = _load_stability_cache(
+        enriched_assets,
+        os.environ.get("STABILITY_BUCKET") or os.environ.get("TRANSCRIPT_STAGING_BUCKET", ""),
+        raw=True)
+    strict_cache = {mid: _stable_only_segments(d) for mid, d in raw_stab.items()}
+    usable_cache = {mid: (d.get("segments") or []) for mid, d in raw_stab.items()}
+
+    shot = shot_config or {}
+    min_shot_s = shot.get("min_shot_duration_s", 3)
+    target_clip_ms = int(shot.get("target_shot_duration_s", 4) * 1000)
+    min_clip_ms = int(min_shot_s * 1000)
+    max_clip_ms = int(shot["max_shot_duration_s"] * 1000) if shot.get("max_shot_duration_s") else None
+
+    # Whole-script relevance pool as a gap-filling fallback for any slice whose
+    # own section matches run short.
+    global_pool = _query_broll_candidates(
+        bedrock, s3vectors_client, vector_bucket, index_name, item_ids,
+        " ".join(s.get("content", "") for s in sections),
+        strict_cache, usable_cache, min_shot_s, top_k=50)
+
+    weights = [max(1, int(s.get("estimatedDurationMs", 4000) or 4000)) for s in sections]
+    wsum = sum(weights) or 1
+
+    used = set()
+    fillers = []
+    pos = 0
+    for i, sec in enumerate(sections):
+        # Last section absorbs any rounding remainder so V1 reaches total_ms.
+        slice_end = total_ms if i == len(sections) - 1 else min(
+            total_ms, pos + int(round(total_ms * weights[i] / wsum)))
+        if slice_end <= pos:
+            continue
+        sec_pool = _query_broll_candidates(
+            bedrock, s3vectors_client, vector_bucket, index_name, item_ids,
+            sec.get("content", ""), strict_cache, usable_cache, min_shot_s, top_k=12)
+        # Prefer this section's matches; append global candidates (deduped) so a
+        # short section pool still fills its slice without leaving a V1 gap.
+        sec_keys = {(c["itemId"], c["segmentIndex"]) for c in sec_pool}
+        combined = sec_pool + [c for c in global_pool
+                               if (c["itemId"], c["segmentIndex"]) not in sec_keys]
+        seg = _fill_spans([(pos, slice_end)], combined, used, broll_cover=True,
+                          min_clip_ms=min_clip_ms, target_clip_ms=target_clip_ms,
+                          max_clip_ms=max_clip_ms)
+        logger.info(
+            f"Per-section cover: {sec.get('sectionType')}_{sec.get('orderIndex')} "
+            f"[{pos}-{slice_end}ms] -> {len(seg)} clip(s) "
+            f"({len(sec_pool)} section-specific matches)"
+        )
+        fillers.extend(seg)
+        pos = slice_end
+    return fillers
+
+
 def _rebuild_broll_tracks(assembly: dict, enriched_assets: list, script_analysis: dict,
                           shot_config: dict = None) -> None:
     """Rebuild B-roll placement across V1 and V2 (broadcast track layout).
@@ -1750,6 +1888,26 @@ def _rebuild_broll_tracks(assembly: dict, enriched_assets: list, script_analysis
             f"B-roll cover across V1 (hard-capped to the ~"
             f"{target_ms // 1000}s target video duration)"
         )
+
+        # Per-section aligned B-roll: place each VO section's own best-matching
+        # stable clips over its slice of the span, so cover tracks the script
+        # line-by-line (rather than one whole-story relevance ranking). Falls
+        # back to the global fill below if config/assets are missing.
+        per_section = _fill_v1_per_section(
+            script_analysis, narrative_end, enriched_assets, shot_config)
+        if per_section is not None:
+            v1_track["clips"] = sorted(per_section, key=lambda c: c.get("start", 0))
+            v2_track["clips"] = []
+            cursor = 0
+            for c in v1_track["clips"]:
+                if c.get("start", 0) > cursor:
+                    logger.warning(
+                        f"V1 gap remains at {cursor}-{c['start']}ms after per-section fill")
+                cursor = max(cursor, c.get("end", 0))
+            logger.info(
+                f"Rebuilt B-roll (per-section aligned): V1 {len(v1_track['clips'])} "
+                f"cover clips gapless to {narrative_end}ms, V2 empty")
+            return
 
     # V1 gaps to fill with B-roll cover: leading, inter-SOT, and trailing.
     v1_gaps = []
