@@ -41,8 +41,28 @@ const corsHeaders = {
   'Access-Control-Allow-Methods': 'POST,OPTIONS',
 };
 
+// Redact the shared auth key before logging. Saga sends it either as an
+// `x-api-key` header or an `?apiKey=`/`?api-key=` query-string parameter, so
+// logging the raw API Gateway event would leak the credential to CloudWatch.
+function redactEventForLog(event) {
+  const redacted = { ...event };
+  if (event.headers) {
+    redacted.headers = {};
+    for (const [k, v] of Object.entries(event.headers)) {
+      redacted.headers[k] = k.toLowerCase() === 'x-api-key' ? '***REDACTED***' : v;
+    }
+  }
+  if (event.queryStringParameters) {
+    redacted.queryStringParameters = { ...event.queryStringParameters };
+    for (const k of ['apiKey', 'api-key']) {
+      if (k in redacted.queryStringParameters) redacted.queryStringParameters[k] = '***REDACTED***';
+    }
+  }
+  return redacted;
+}
+
 exports.handler = async (event) => {
-  console.log('Saga action request:', JSON.stringify(event, null, 2));
+  console.log('Saga action request:', JSON.stringify(redactEventForLog(event), null, 2));
 
   try {
     // Authenticate the request via the shared x-api-key that Saga sends.
