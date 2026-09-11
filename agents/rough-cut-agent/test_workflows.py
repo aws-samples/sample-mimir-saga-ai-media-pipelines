@@ -640,3 +640,65 @@ class TestNatSoundGain:
         assert dens, "expected some audio gains"
         assert 5 not in dens, "nat sound must no longer be 1/5 (20%)"
         assert 10 in dens, "nat sound cover should be 1/10 (10%)"
+
+
+# ---------------------------------------------------------------------------
+# Idempotent, title-aware instance find-or-create (P1.1 prerequisite)
+# ---------------------------------------------------------------------------
+
+class TestInstanceIdempotency:
+    def _inst(self, title, iid="OVkHBAPs-INS-1", account_id=None):
+        return {"id": iid, "title": title,
+                "platformInfo": {"platform": "linear",
+                                 "account": {"accountId": account_id}}}
+
+    def _run(self, existing_instances, instance_title):
+        calls = {"patched": [], "created_titles": []}
+
+        def fake_get(url, **k):
+            if url.endswith("/instances"):
+                return _Resp(200, {"instances": existing_instances})
+            return _Resp(200, {"mTitle": "Car Racing"})
+
+        def fake_post(url, **k):
+            if url.endswith("/instances"):
+                calls["created_titles"].append((k.get("json") or {}).get("title"))
+                return _Resp(200, {"id": "OVkHBAPs-INS-NEW"})
+            return _Resp(200, {})
+
+        def fake_patch(url, **k):
+            calls["patched"].append(url)
+            return _Resp(200, {})
+
+        fr = MagicMock()
+        fr.get.side_effect = fake_get
+        fr.post.side_effect = fake_post
+        fr.patch.side_effect = fake_patch
+        with patch.object(tools, "requests", fr), \
+             patch.object(tools, "_get_saga_api_url", return_value="https://saga.test"), \
+             patch.object(tools, "_saga_auth_headers", return_value={}):
+            out = json.loads(tools.create_or_update_linear_instance(
+                story_id="STR-1",
+                script_sections_json=json.dumps([{"type": "vo", "label": "PKG VO:", "text": "hi"}]),
+                instance_title=instance_title,
+            ))
+        return out, calls
+
+    def test_rerun_reuses_same_titled_instance(self):
+        # Re-running the same action updates its own instance — no duplicate.
+        out, calls = self._run([self._inst("Car Racing - VO")], "Car Racing - VO")
+        assert calls["patched"], "should PATCH the existing same-titled instance"
+        assert not calls["created_titles"], "should NOT create a duplicate"
+        assert out["created"] is False
+
+    def test_does_not_clobber_a_different_actions_instance(self):
+        # A VO run must not reuse the AI-VO instance — it creates its own.
+        out, calls = self._run([self._inst("Car Racing - AI VO")], "Car Racing - VO")
+        assert not calls["patched"]
+        assert calls["created_titles"] == ["Car Racing - VO"]
+        assert out["created"] is True
+
+    def test_creates_titled_instance_when_none_exist(self):
+        out, calls = self._run([], "Car Racing - VOSOT")
+        assert calls["created_titles"] == ["Car Racing - VOSOT"]
+        assert out["created"] is True
