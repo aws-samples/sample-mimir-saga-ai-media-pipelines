@@ -2966,18 +2966,20 @@ def invoke(payload):
                 "clipsAssociated": instance_result.get("clipsAssociated"),
                 "clipAssociationError": instance_result.get("clipAssociationError"),
             }
+            # Log only untainted locals (story id + counts). The per-clip
+            # associated count and error live in result.summary.instance above;
+            # they are NOT logged because they are parsed from the tool return,
+            # which carries the (secret-tainted) instance id.
             if instance_status == "partial_success":
                 logger.warning(
-                    f"Stage 4 PARTIAL for story {story_id}: instance created "
-                    f"and script written, but clip association failed "
-                    f"({instance_result.get('clipsAssociated', 0)}/{len(clip_item_ids)} associated): "
-                    f"{instance_result.get('clipAssociationError')}"
+                    f"Stage 4 PARTIAL for story {story_id}: script written to instance, "
+                    f"but clip association incomplete for {len(clip_item_ids)} requested "
+                    f"clip(s) — see result.summary.instance for details"
                 )
             else:
                 logger.info(
                     f"Stage 4: Script written to instance for story {story_id} "
-                    f"({len(script_sections)} sections, "
-                    f"{instance_result.get('clipsAssociated', 0)}/{len(clip_item_ids)} clips associated)"
+                    f"({len(script_sections)} sections, {len(clip_item_ids)} clips requested)"
                 )
         except Exception as e:
             logger.warning(f"Stage 4 (Write Script to Linear Instance) failed non-fatally: {e}")
