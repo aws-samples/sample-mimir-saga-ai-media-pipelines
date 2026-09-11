@@ -2700,8 +2700,10 @@ export class InfrastructureStack extends cdk.Stack {
         'overlayS3Uri.$': '$.overlayResult.Payload.overlayS3Uri',
         'aspectRatio.$': '$.aspectRatio',
         'title.$': '$.smartCropPoll.Payload.title',
-        // Pass Mimir VTT URL so captions can be staged and burned in
-        'vttUrl.$': '$.mimirDetails.vttUrl',
+        // Pass the (optional) Mimir VTT URL so captions can be staged and
+        // burned in. Resolved to "" upstream when the item has no VTT, so a
+        // caption-less item doesn't fail this state with States.Runtime.
+        'vttUrl.$': '$.vttUrlResolved',
       }),
       resultPath: '$.compositedResult',
     });
@@ -2753,8 +2755,27 @@ export class InfrastructureStack extends cdk.Stack {
     // startCompositedJob enters the composited poll loop on completion
     startCompositedJob.next(compositedWait);
 
+    // Resolve the optional VTT URL before the overlay/composite job. Items
+    // without captions have no `$.mimirDetails.vttUrl`; referencing it directly
+    // in a `.$` field fails the execution with States.Runtime. Normalize it to
+    // `$.vttUrlResolved` (the URL when present, "" otherwise) so caption-less
+    // videos still get graphics + smart-crop, just without burned captions.
+    const setVttFromMimir = new stepfunctions.Pass(this, 'SetVttFromMimir', {
+      inputPath: '$.mimirDetails.vttUrl',
+      resultPath: '$.vttUrlResolved',
+    });
+    const setVttEmpty = new stepfunctions.Pass(this, 'SetVttEmpty', {
+      result: stepfunctions.Result.fromString(''),
+      resultPath: '$.vttUrlResolved',
+    });
+    const resolveVtt = new stepfunctions.Choice(this, 'ResolveVttUrl')
+      .when(stepfunctions.Condition.isPresent('$.mimirDetails.vttUrl'), setVttFromMimir)
+      .otherwise(setVttEmpty);
+    setVttFromMimir.next(startCompositedJob);
+    setVttEmpty.next(startCompositedJob);
+
     const checkSmartCropStatus = new stepfunctions.Choice(this, 'CheckSmartCropStatus')
-      .when(stepfunctions.Condition.stringEquals('$.smartCropPoll.Payload.status', 'COMPLETE'), startCompositedJob)
+      .when(stepfunctions.Condition.stringEquals('$.smartCropPoll.Payload.status', 'COMPLETE'), resolveVtt)
       .when(stepfunctions.Condition.stringEquals('$.smartCropPoll.Payload.status', 'ERROR'), smartCropFailed)
       .when(stepfunctions.Condition.stringEquals('$.smartCropPoll.Payload.status', 'error'), smartCropFailed)
       .otherwise(smartCropWait);
