@@ -169,6 +169,18 @@ def _vo_timeline_directive(shot: dict, with_sot: bool, synth: bool = True) -> st
 
 
 ROUGH_CUT_PROFILES = {
+    # Generate Package — the full rough cut: script + B-roll + SOT + AI voice,
+    # unconstrained (no VO-only / 30s-cap directives). This is the "Package"
+    # custom action (the original full rough-cut behavior).
+    "package": {
+        "label": "Generate Package",
+        "timeline_suffix": "Package",
+        "synthesize_voiceover": True,
+        "include_sot": True,
+        "shot": _shot_config(),
+        "script_directive": "",
+        "timeline_directive": "",
+    },
     # Generate VO — script + supporting B-roll rough cut for LINEAR TV, where an
     # anchor reads the script live. NEVER synthesizes an AI voice.
     "vo": {

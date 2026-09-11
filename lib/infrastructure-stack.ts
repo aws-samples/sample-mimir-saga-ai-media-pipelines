@@ -866,6 +866,11 @@ export class InfrastructureStack extends cdk.Stack {
     const generateAiVoResource = actionsResource.addResource('generate-ai-vo');
     generateAiVoResource.addMethod('POST', new apigateway.LambdaIntegration(sagaActionHandler));
 
+    // POST /actions/generate-package — Generate Package: the full rough cut
+    // (script + B-roll + SOT + AI voice), unconstrained.
+    const generatePackageResource = actionsResource.addResource('generate-package');
+    generatePackageResource.addMethod('POST', new apigateway.LambdaIntegration(sagaActionHandler));
+
     // Mimir Webhooks API Gateway
     const webhookApiLogGroup = new logs.LogGroup(this, 'MimirWebhooksApiLogs', { retention: logs.RetentionDays.ONE_MONTH });
     const webhookApi = new apigateway.RestApi(this, 'ItemChangeWebhookApi', {
@@ -3683,6 +3688,11 @@ export class InfrastructureStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'GenerateAiVoEndpoint', {
       value: api.url + 'actions/generate-ai-vo',
       description: 'Generate AI VO custom action (synthesized narration)',
+    });
+
+    new cdk.CfnOutput(this, 'GeneratePackageEndpoint', {
+      value: api.url + 'actions/generate-package',
+      description: 'Generate Package custom action (full rough cut: B-roll + SOT + AI voice)',
     });
 
     new cdk.CfnOutput(this, 'SagaFeedItemsTableName', {

@@ -128,6 +128,8 @@ exports.handler = async (event) => {
       // Generate AI VO — reporter-driven digital/social; DOES synthesize
       // narration. The only VO-family action that creates an AI voice.
       'generate-ai-vo': 'ai-vo',
+      // Generate Package — the full rough cut (script + B-roll + SOT + AI voice).
+      'generate-package': 'package',
     };
 
     let stateMachineArn;
