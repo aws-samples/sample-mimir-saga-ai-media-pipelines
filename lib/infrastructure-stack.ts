@@ -119,9 +119,27 @@ export class InfrastructureStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
       enforceSSL: true,
+      // Transient staging: staged video copies and embedding intermediates are
+      // large and short-lived, so expire everything here after 7 days. Durable
+      // derived metadata (e.g. camera-stability maps) must NOT live here — it
+      // goes in the mediaAnalysisBucket below.
       lifecycleRules: [{
         expiration: cdk.Duration.days(7),
       }],
+    });
+
+    // Durable derived-metadata bucket. Analysis outputs like camera-stability
+    // maps are small but must persist for the life of the clip — the rough cut
+    // agent reads them at generation time to keep shaky footage out of B-roll.
+    // They intentionally do NOT live in the transient staging bucket (7-day
+    // expiry), which may also be barely used in customer-account deployments
+    // that read source video directly from S3. Layout mirrors the Mimir item
+    // id: stability/{itemId}/segments.json.
+    const mediaAnalysisBucket = new s3.Bucket(this, 'MediaAnalysisBucket', {
+      bucketName: `${resourcePrefix}-media-analysis-${this.account}-${this.region}`,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      autoDeleteObjects: true,
+      enforceSSL: true,
     });
 
     // Lambda function for Bedrock summarization
@@ -831,6 +849,32 @@ export class InfrastructureStack extends cdk.Stack {
     const roughCutResource = actionsResource.addResource('rough-cut');
     roughCutResource.addMethod('POST', new apigateway.LambdaIntegration(sagaActionHandler));
 
+    // The rough-cut VARIANTS below all run the SAME rough-cut state machine and
+    // agent; saga-action-handler maps each path to a distinct roughCutType,
+    // which selects the agent's prompt/constraint profile. Keeping them as
+    // separate routes lets Saga expose them as distinct custom actions.
+    //
+    // POST /actions/rough-cut-vo — Generate VO: script + B-roll for linear TV,
+    // where an anchor reads the script live. NEVER synthesizes an AI voice.
+    const roughCutVoResource = actionsResource.addResource('rough-cut-vo');
+    roughCutVoResource.addMethod('POST', new apigateway.LambdaIntegration(sagaActionHandler));
+
+    // POST /actions/rough-cut-vosot — Generate VOSOT: VO plus sound-on-tape
+    // interview clips and preserved natural sound (anchor reads VO live).
+    const roughCutVosotResource = actionsResource.addResource('rough-cut-vosot');
+    roughCutVosotResource.addMethod('POST', new apigateway.LambdaIntegration(sagaActionHandler));
+
+    // POST /actions/rough-cut-ai-vo — Generate AI VO: reporter-driven
+    // digital/social workflow that DOES synthesize narration (Polly).
+    const roughCutAiVoResource = actionsResource.addResource('rough-cut-ai-vo');
+    roughCutAiVoResource.addMethod('POST', new apigateway.LambdaIntegration(sagaActionHandler));
+
+    // POST /actions/rough-cut-simple-vo endpoint — BACKWARD-COMPAT alias for the
+    // original "Simple VO" action, which synthesized an AI voice (i.e. it maps
+    // to roughCutType="simple-vo", now equivalent to Generate AI VO).
+    const roughCutSimpleVoResource = actionsResource.addResource('rough-cut-simple-vo');
+    roughCutSimpleVoResource.addMethod('POST', new apigateway.LambdaIntegration(sagaActionHandler));
+
     // Mimir Webhooks API Gateway
     const webhookApiLogGroup = new logs.LogGroup(this, 'MimirWebhooksApiLogs', { retention: logs.RetentionDays.ONE_MONTH });
     const webhookApi = new apigateway.RestApi(this, 'ItemChangeWebhookApi', {
@@ -1030,7 +1074,8 @@ export class InfrastructureStack extends cdk.Stack {
             "storyId": "{% $states.input.storyId %}",
             "story": "{% $states.input.story %}",
             "triggeredByUserId": "{% $states.input.triggeredByUserId %}",
-            "mimirApiKey": "{% $states.input.mimirApiKey %}"
+            "mimirApiKey": "{% $states.input.mimirApiKey %}",
+            "roughCutType": "{% $states.input.roughCutType ? $states.input.roughCutType : 'full' %}"
           },
           "Catch": [
             {
@@ -1649,7 +1694,8 @@ export class InfrastructureStack extends cdk.Stack {
               "storyId": "{% $storyId %}",
               "story": "{% $story %}",
               "triggeredByUserId": "{% $triggeredByUserId %}",
-              "mimirApiKey": "{% $mimirApiKey %}"
+              "mimirApiKey": "{% $mimirApiKey %}",
+              "roughCutType": "{% $roughCutType %}"
             }
           },
           "TimeoutSeconds": 1800,
@@ -1912,11 +1958,14 @@ export class InfrastructureStack extends cdk.Stack {
       layers: [ffmpegLayer],
       environment: {
         VIDEO_STAGING_BUCKET: videoStagingBucket.bucketName,
+        // Durable store for the stability maps this handler writes.
+        STABILITY_BUCKET: mediaAnalysisBucket.bucketName,
         FFMPEG_PATH: '/opt/bin/ffmpeg',
         FFPROBE_PATH: '/opt/bin/ffprobe',
       },
     });
     videoStagingBucket.grantReadWrite(stabilityAnalysisHandler);
+    mediaAnalysisBucket.grantReadWrite(stabilityAnalysisHandler);
     // Read access to arbitrary customer ingest buckets (named at runtime via
     // Mimir's ingestSourceS3Bucket) — used to analyze the source object directly
     // when deployed in the customer's account, instead of the pre-signed proxy.
@@ -2651,8 +2700,10 @@ export class InfrastructureStack extends cdk.Stack {
         'overlayS3Uri.$': '$.overlayResult.Payload.overlayS3Uri',
         'aspectRatio.$': '$.aspectRatio',
         'title.$': '$.smartCropPoll.Payload.title',
-        // Pass Mimir VTT URL so captions can be staged and burned in
-        'vttUrl.$': '$.mimirDetails.vttUrl',
+        // Pass the (optional) Mimir VTT URL so captions can be staged and
+        // burned in. Resolved to "" upstream when the item has no VTT, so a
+        // caption-less item doesn't fail this state with States.Runtime.
+        'vttUrl.$': '$.vttUrlResolved',
       }),
       resultPath: '$.compositedResult',
     });
@@ -2704,8 +2755,27 @@ export class InfrastructureStack extends cdk.Stack {
     // startCompositedJob enters the composited poll loop on completion
     startCompositedJob.next(compositedWait);
 
+    // Resolve the optional VTT URL before the overlay/composite job. Items
+    // without captions have no `$.mimirDetails.vttUrl`; referencing it directly
+    // in a `.$` field fails the execution with States.Runtime. Normalize it to
+    // `$.vttUrlResolved` (the URL when present, "" otherwise) so caption-less
+    // videos still get graphics + smart-crop, just without burned captions.
+    const setVttFromMimir = new stepfunctions.Pass(this, 'SetVttFromMimir', {
+      inputPath: '$.mimirDetails.vttUrl',
+      resultPath: '$.vttUrlResolved',
+    });
+    const setVttEmpty = new stepfunctions.Pass(this, 'SetVttEmpty', {
+      result: stepfunctions.Result.fromString(''),
+      resultPath: '$.vttUrlResolved',
+    });
+    const resolveVtt = new stepfunctions.Choice(this, 'ResolveVttUrl')
+      .when(stepfunctions.Condition.isPresent('$.mimirDetails.vttUrl'), setVttFromMimir)
+      .otherwise(setVttEmpty);
+    setVttFromMimir.next(startCompositedJob);
+    setVttEmpty.next(startCompositedJob);
+
     const checkSmartCropStatus = new stepfunctions.Choice(this, 'CheckSmartCropStatus')
-      .when(stepfunctions.Condition.stringEquals('$.smartCropPoll.Payload.status', 'COMPLETE'), startCompositedJob)
+      .when(stepfunctions.Condition.stringEquals('$.smartCropPoll.Payload.status', 'COMPLETE'), resolveVtt)
       .when(stepfunctions.Condition.stringEquals('$.smartCropPoll.Payload.status', 'ERROR'), smartCropFailed)
       .when(stepfunctions.Condition.stringEquals('$.smartCropPoll.Payload.status', 'error'), smartCropFailed)
       .otherwise(smartCropWait);
@@ -2774,11 +2844,19 @@ export class InfrastructureStack extends cdk.Stack {
     const reframeGraphicsResource = actionsResource.addResource('reframe-with-graphics');
     reframeGraphicsResource.addMethod('POST', new apigateway.LambdaIntegration(mimirHandler));
 
-    // Upload Lottie templates to S3 on deploy
+    // Upload Lottie templates to S3 on deploy.
+    //
+    // prune: false is deliberate. Customer templates are per-deployment content
+    // rather than infrastructure, and `graphics/templates/*.json` is git-ignored
+    // because the files embed station logos and licensed font outlines. With the
+    // default prune: true, deploying from a fresh checkout syncs an empty
+    // directory and deletes every template in the bucket, breaking the
+    // ReframeWithGraphics pipeline with NoSuchKey at the RenderOverlay step.
     new s3deploy.BucketDeployment(this, 'LottieTemplatesDeployment', {
       sources: [s3deploy.Source.asset('graphics/templates')],
       destinationBucket: lottieTemplatesBucket,
       destinationKeyPrefix: 'templates',
+      prune: false,
     });
 
     // ---------------------------------------------------------------------------
@@ -3057,7 +3135,7 @@ export class InfrastructureStack extends cdk.Stack {
       lambdaFunction: graphicsOverlayHandler,
       payload: stepfunctions.TaskInput.fromObject({
         'templateBucket': lottieTemplatesBucket.bucketName,
-        'templateKey': 'templates/IG-Story-1080x1920-9:16.json',
+        'templateKey': 'templates/graphics-overlay-1080x1920-9x16.json',
         'outputBucket': outputBucket.bucketName,
         'itemId.$': '$$.Execution.Input.itemId',
         'baseFilename.$': '$$.Execution.Input.baseFilename',
@@ -3566,6 +3644,13 @@ export class InfrastructureStack extends cdk.Stack {
       description: 'Video staging bucket name (for cross-stack reference)',
     });
 
+    // Export durable media-analysis bucket name (stability maps, etc.)
+    new ssm.StringParameter(this, 'MediaAnalysisBucketNameParameter', {
+      parameterName: '/infrastructure/media-analysis-bucket-name',
+      stringValue: mediaAnalysisBucket.bucketName,
+      description: 'Durable media-analysis bucket name (camera-stability maps, etc.)',
+    });
+
     // Store webhook API base URL in Parameter Store for scripts
     new ssm.StringParameter(this, 'WebhookApiBaseUrlParameter', {
       parameterName: '/infrastructure/webhook-api-base-url',
@@ -3597,6 +3682,21 @@ export class InfrastructureStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'RoughCutEndpoint', {
       value: api.url + 'actions/rough-cut',
       description: 'Mimir Rough Cut Custom Action Endpoint URL',
+    });
+
+    new cdk.CfnOutput(this, 'GenerateVoEndpoint', {
+      value: api.url + 'actions/rough-cut-vo',
+      description: 'Generate VO custom action (script + B-roll, no AI voice)',
+    });
+
+    new cdk.CfnOutput(this, 'GenerateVosotEndpoint', {
+      value: api.url + 'actions/rough-cut-vosot',
+      description: 'Generate VOSOT custom action (VO + SOT interview clips + nat sound)',
+    });
+
+    new cdk.CfnOutput(this, 'GenerateAiVoEndpoint', {
+      value: api.url + 'actions/rough-cut-ai-vo',
+      description: 'Generate AI VO custom action (synthesized narration)',
     });
 
     new cdk.CfnOutput(this, 'SagaFeedItemsTableName', {

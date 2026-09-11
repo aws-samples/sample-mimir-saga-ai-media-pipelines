@@ -41,8 +41,28 @@ const corsHeaders = {
   'Access-Control-Allow-Methods': 'POST,OPTIONS',
 };
 
+// Redact the shared auth key before logging. Saga sends it either as an
+// `x-api-key` header or an `?apiKey=`/`?api-key=` query-string parameter, so
+// logging the raw API Gateway event would leak the credential to CloudWatch.
+function redactEventForLog(event) {
+  const redacted = { ...event };
+  if (event.headers) {
+    redacted.headers = {};
+    for (const [k, v] of Object.entries(event.headers)) {
+      redacted.headers[k] = k.toLowerCase() === 'x-api-key' ? '***REDACTED***' : v;
+    }
+  }
+  if (event.queryStringParameters) {
+    redacted.queryStringParameters = { ...event.queryStringParameters };
+    for (const k of ['apiKey', 'api-key']) {
+      if (k in redacted.queryStringParameters) redacted.queryStringParameters[k] = '***REDACTED***';
+    }
+  }
+  return redacted;
+}
+
 exports.handler = async (event) => {
-  console.log('Saga action request:', JSON.stringify(event, null, 2));
+  console.log('Saga action request:', JSON.stringify(redactEventForLog(event), null, 2));
 
   try {
     // Authenticate the request via the shared x-api-key that Saga sends.
@@ -94,20 +114,40 @@ exports.handler = async (event) => {
 
     const mimirApiKey = await getMimirApiKey();
 
+    // Rough-cut variants all run the SAME rough-cut state machine/agent; the
+    // action only changes the "roughCutType", which the agent uses to select a
+    // prompt/constraint profile (e.g. a stripped-down VO-only cut).
+    // Map: action path -> rough cut type.
+    const ROUGH_CUT_TYPES = {
+      // Legacy full rough cut (unchanged behavior; synthesizes an AI voice).
+      'rough-cut': 'full',
+      // Generate VO — script + B-roll for linear TV; anchor reads live. NEVER
+      // synthesizes an AI voice.
+      'rough-cut-vo': 'vo',
+      // Generate VOSOT — VO plus sound-on-tape interview clips + nat sound.
+      // Anchor reads the VO live (no AI voice).
+      'rough-cut-vosot': 'vosot',
+      // Generate AI VO — reporter-driven digital/social; DOES synthesize
+      // narration. The only VO-family action that creates an AI voice.
+      'rough-cut-ai-vo': 'ai-vo',
+      // Backward-compatibility alias: the original "Simple VO" action
+      // synthesized an AI voice, i.e. it behaved as Generate AI VO.
+      'rough-cut-simple-vo': 'simple-vo',
+    };
+
     let stateMachineArn;
-    switch (actionType) {
-      case 'rough-cut':
-        stateMachineArn = process.env.ROUGH_CUT_STATE_MACHINE_ARN;
-        break;
-      case 'story-research':
-        stateMachineArn = process.env.STORY_RESEARCH_STATE_MACHINE_ARN;
-        break;
-      default:
-        return {
-          statusCode: 400,
-          headers: corsHeaders,
-          body: JSON.stringify({ message: `Unknown saga action: ${actionType}`, status: 'error' }),
-        };
+    let roughCutType;
+    if (actionType in ROUGH_CUT_TYPES) {
+      stateMachineArn = process.env.ROUGH_CUT_STATE_MACHINE_ARN;
+      roughCutType = ROUGH_CUT_TYPES[actionType];
+    } else if (actionType === 'story-research') {
+      stateMachineArn = process.env.STORY_RESEARCH_STATE_MACHINE_ARN;
+    } else {
+      return {
+        statusCode: 400,
+        headers: corsHeaders,
+        body: JSON.stringify({ message: `Unknown saga action: ${actionType}`, status: 'error' }),
+      };
     }
 
     const executionName = `${actionType}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -119,6 +159,8 @@ exports.handler = async (event) => {
       story: body.story,
       triggeredByUserId: body.triggeredByUserId,
       actionType,
+      // Only set for rough-cut actions; selects the agent's prompt/constraint profile.
+      ...(roughCutType ? { roughCutType } : {}),
     };
 
     const result = await sfnClient.send(new StartExecutionCommand({

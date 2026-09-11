@@ -41,7 +41,11 @@ const s3Client = new S3Client();
 
 const FFMPEG = process.env.FFMPEG_PATH || '/opt/bin/ffmpeg';
 const FFPROBE = process.env.FFPROBE_PATH || '/opt/bin/ffprobe';
-const STAGING_BUCKET = process.env.VIDEO_STAGING_BUCKET;
+// Durable store for stability maps. Falls back to the staging bucket only if
+// STABILITY_BUCKET is unset (older deploys). The staging bucket has a 7-day
+// expiry, so stability data written there would silently disappear — the
+// dedicated bucket is where these belong long-term.
+const STABILITY_BUCKET = process.env.STABILITY_BUCKET || process.env.VIDEO_STAGING_BUCKET;
 
 // Classification thresholds (pixels of global motion per frame at 480px width).
 // Tuned against real field footage (news B-roll): tripod noise stays well under
@@ -321,7 +325,7 @@ function buildSegments(rows, durationMs, minUsableMs = 2000) {
 async function handleAnalyze(event) {
   const { itemId } = event;
   if (!itemId) throw new Error('itemId is required');
-  if (!STAGING_BUCKET) throw new Error('VIDEO_STAGING_BUCKET environment variable is not set');
+  if (!STABILITY_BUCKET) throw new Error('STABILITY_BUCKET (or VIDEO_STAGING_BUCKET) environment variable is not set');
 
   const { url, source } = await resolveVideoUrl(event);
   console.log(`Analyzing stability for ${itemId} (source: ${source})`);
@@ -360,17 +364,17 @@ async function handleAnalyze(event) {
 
   const key = `stability/${itemId}/segments.json`;
   await s3Client.send(new PutObjectCommand({
-    Bucket: STAGING_BUCKET,
+    Bucket: STABILITY_BUCKET,
     Key: key,
     Body: JSON.stringify(result),
     ContentType: 'application/json',
   }));
 
-  console.log(`Stability written: s3://${STAGING_BUCKET}/${key} ` +
+  console.log(`Stability written: s3://${STABILITY_BUCKET}/${key} ` +
     `(${segments.length} segments, ${Math.round(unusableMs / 1000)}s unusable of ${Math.round(durationMs / 1000)}s)`);
   return {
     itemId,
-    stabilityS3Uri: `s3://${STAGING_BUCKET}/${key}`,
+    stabilityS3Uri: `s3://${STABILITY_BUCKET}/${key}`,
     segmentCount: segments.length,
     unusableMs,
     durationMs,
@@ -382,8 +386,8 @@ async function handleCheckStability(event) {
   if (!itemId) throw new Error('itemId is required');
   const key = `stability/${itemId}/segments.json`;
   try {
-    await s3Client.send(new HeadObjectCommand({ Bucket: STAGING_BUCKET, Key: key }));
-    return { exists: true, stabilityS3Uri: `s3://${STAGING_BUCKET}/${key}` };
+    await s3Client.send(new HeadObjectCommand({ Bucket: STABILITY_BUCKET, Key: key }));
+    return { exists: true, stabilityS3Uri: `s3://${STABILITY_BUCKET}/${key}` };
   } catch (err) {
     if (err.name === 'NotFound' || err.$metadata?.httpStatusCode === 404) {
       return { exists: false };

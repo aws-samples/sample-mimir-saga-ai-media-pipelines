@@ -2,16 +2,27 @@ from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands import Agent
 from strands.models import BedrockModel
 from prompts import SCRIPT_ANALYSIS_PROMPT, SOURCE_MATERIAL_PROMPT, TIMELINE_ASSEMBLY_PROMPT
+from profiles import get_profile, DEFAULT_ROUGH_CUT_TYPE
 from tools import get_transcript, get_generated_transcript, query_embeddings, get_mimir_item_details, create_timeline, update_story_status, get_word_timing, generate_voiceover, upload_voiceover_to_mimir, create_or_update_linear_instance, _build_linear_instance_slate
 import json
 import logging
 import os
 import re
+import sys
 import boto3
 
-# Configure logging
+# Configure logging so the agent's own INFO logs reach stdout (and therefore the
+# AgentCore CloudWatch runtime logs). Without an explicit handler, the root
+# logger only emits WARNING+ via Python's lastResort handler, which silently
+# dropped every INFO diagnostic (stage progress, "Loaded stability maps",
+# "B-roll candidate pool: N stable segments", etc.) — making runs impossible to
+# audit even though the code was executing.
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _log_handler = logging.StreamHandler(sys.stdout)
+    _log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    logger.addHandler(_log_handler)
 
 app = BedrockAgentCoreApp()
 
@@ -145,7 +156,7 @@ def _validate_script_analysis(data: dict) -> None:
             raise ValueError(f"{key} must be an array")
 
 
-def run_script_analysis(story_context: dict) -> dict:
+def run_script_analysis(story_context: dict, profile_directive: str = "") -> dict:
     """Analyze a story script and return a structured ScriptAnalysis dict.
 
     This function creates a Strands Agent with the SCRIPT_ANALYSIS_PROMPT,
@@ -214,7 +225,7 @@ def run_script_analysis(story_context: dict) -> dict:
 
     agent = Agent(
         model=bedrock_model,
-        system_prompt=SCRIPT_ANALYSIS_PROMPT,
+        system_prompt=SCRIPT_ANALYSIS_PROMPT + (profile_directive or ""),
     )
 
     # Invoke the agent
@@ -550,8 +561,11 @@ def _precompute_candidates(parsed_sections: list, enriched_assets: list, top_k: 
                 pass
         logger.info(f"Loaded {len(transcript_cache)} transcripts for SOT matching")
 
-    # Camera-stability maps: used to keep shaky/hunting footage out of B-roll picks
-    stability_cache = _load_stability_cache(enriched_assets, staging_bucket)
+    # Camera-stability maps: used to keep shaky/hunting footage out of B-roll
+    # picks. These live in the durable media-analysis bucket (STABILITY_BUCKET),
+    # not the transient staging bucket, so they persist beyond staging's expiry.
+    stability_bucket = os.environ.get("STABILITY_BUCKET") or staging_bucket
+    stability_cache = _load_stability_cache(enriched_assets, stability_bucket)
 
     candidates_by_section = {}
 
@@ -1583,19 +1597,26 @@ def _stable_only_segments(stability_data: dict, min_span_ms: int = 3000,
 
 
 def _fill_spans(spans: list, candidate_pool: list, used_segments: set,
-                broll_cover: bool = False, min_clip_ms: int = 3000) -> list:
+                broll_cover: bool = False, min_clip_ms: int = 3000,
+                target_clip_ms: int = 6000, max_clip_ms: int = None) -> list:
     """Fills each (start, end) span with clips from the candidate pool.
 
     Picks unused candidates (deduped on itemId+segmentIndex across both video
-    tracks via the shared ``used_segments`` set), targeting ~6s clips and
-    avoiding clips shorter than ``min_clip_ms`` (short slivers read as jumpy) —
-    except when a smaller remainder must be filled to keep a V1 span complete,
-    since a V1 remainder would be an (unsupported) gap on a video track.
+    tracks via the shared ``used_segments`` set), targeting ``target_clip_ms``
+    clips and avoiding clips shorter than ``min_clip_ms`` (short slivers read as
+    jumpy) — except when a smaller remainder must be filled to keep a V1 span
+    complete, since a V1 remainder would be an (unsupported) gap on a video
+    track.
+
+    ``max_clip_ms`` (when set) is a hard ceiling on any single shot's on-screen
+    duration, so editorial "shots stay within N seconds" rules are enforced in
+    code rather than left to the LLM. Defaults preserve the original ~6s target
+    with no ceiling (legacy "full" behavior).
 
     When ``broll_cover`` is True the clips are flagged so the payload builder
     emits their audio at reduced gain (nat sound under voice-over).
     """
-    TARGET_CLIP_MS = 6000
+    TARGET_CLIP_MS = target_clip_ms
     filled = []
     for span_start, span_end in spans:
         position = span_start
@@ -1609,9 +1630,13 @@ def _fill_spans(spans: list, candidate_pool: list, used_segments: set,
 
             # Closing move: when one clip can finish the span (remainder within
             # target + min), prefer the most relevant candidate long enough to
-            # cover it exactly — avoids manufacturing short tail clips.
+            # cover it exactly — avoids manufacturing short tail clips. Skipped
+            # when the remainder would exceed the max shot ceiling, so we never
+            # emit an over-length shot just to close a span.
             best, clip_dur = None, 0
-            if remaining <= TARGET_CLIP_MS + min_clip_ms:
+            if remaining <= TARGET_CLIP_MS + min_clip_ms and (
+                max_clip_ms is None or remaining <= max_clip_ms
+            ):
                 for c, cand_dur in unused():
                     if cand_dur >= remaining:
                         best, clip_dur = c, remaining
@@ -1628,6 +1653,10 @@ def _fill_spans(spans: list, candidate_pool: list, used_segments: set,
                         tail = remaining - clip_dur
                         if 0 < tail < min_clip_ms:
                             clip_dur = min(remaining, source_dur)
+                        # Enforce the hard shot ceiling (never over-length),
+                        # even if that re-introduces a small tail to fill next.
+                        if max_clip_ms is not None:
+                            clip_dur = min(clip_dur, max_clip_ms)
                         break
             if not best:
                 logger.warning(f"B-roll pool exhausted; span covered only to {position}ms of {span_end}ms")
@@ -1655,7 +1684,193 @@ def _fill_spans(spans: list, candidate_pool: list, used_segments: set,
     return filled
 
 
-def _rebuild_broll_tracks(assembly: dict, enriched_assets: list, script_analysis: dict) -> None:
+def _broll_eligible_item_ids(enriched_assets, max_words=50):
+    """Return the item IDs that are true B-roll cover — clips with little or no
+    speech — excluding interview / standup / soundbite footage whose audio (and
+    on-camera talking head) doesn't belong under a live-read voice-over.
+
+    Classification uses the generated transcript word count in the staging
+    bucket: a clip with fewer than *max_words* words (or no transcript at all)
+    is cover-eligible; anything wordier is treated as a talking-head/interview
+    clip and excluded. Returns None when transcripts can't be read (no staging
+    bucket), signalling the caller to fall back to all clips.
+    """
+    staging = os.environ.get("TRANSCRIPT_STAGING_BUCKET", "")
+    if not staging:
+        return None
+    s3 = boto3.client("s3")
+    eligible = []
+    for a in enriched_assets:
+        mid = a.get("mimirItemId", "")
+        if not mid or not a.get("hasEmbeddings"):
+            continue
+        try:
+            resp = s3.get_object(Bucket=staging, Key=f"transcripts/{mid}/transcript.json")
+            word_count = len(json.loads(resp["Body"].read()).get("fullTranscript", "").split())
+            if word_count < max_words:
+                eligible.append(mid)
+        except Exception:
+            # No transcript on file → almost certainly B-roll cover.
+            eligible.append(mid)
+    return eligible
+
+
+def _query_broll_candidates(bedrock, s3vectors_client, vector_bucket, index_name,
+                            item_ids, query_text, strict_cache, usable_cache,
+                            min_shot_s, top_k=12):
+    """Embedding-query the vector index for *query_text* and return a
+    stability-trimmed candidate pool sorted by relevance (nearest first).
+
+    Tries the strict locked-off stability map first; if that yields nothing for
+    this query, falls back to the looser usable-labeled map, then to no filter —
+    so a section always gets *some* cover rather than a gap.
+    Pool items: {itemId, segmentIndex, startTimeSeconds, endTimeSeconds, distance}.
+    """
+    text = (query_text or "").strip() or "B-roll cover footage"
+    try:
+        embed_resp = bedrock.invoke_model(
+            modelId="amazon.nova-2-multimodal-embeddings-v1:0",
+            contentType="application/json", accept="application/json",
+            body=json.dumps({
+                "taskType": "SINGLE_EMBEDDING",
+                "singleEmbeddingParams": {
+                    "embeddingPurpose": "VIDEO_RETRIEVAL",
+                    "embeddingDimension": 1024,
+                    "text": {"truncationMode": "END", "value": text[:2000]},
+                },
+            }),
+        )
+        qv = json.loads(embed_resp["body"].read())["embeddings"][0]["embedding"]
+        resp = s3vectors_client.query_vectors(
+            vectorBucketName=vector_bucket, indexName=index_name,
+            queryVector={"float32": qv}, topK=top_k,
+            returnMetadata=True, returnDistance=True,
+            filter={"itemId": {"$in": item_ids}})
+    except Exception as e:
+        logger.warning(f"Per-section B-roll query failed: {e}")
+        return []
+
+    def _build(cache):
+        pool = []
+        for v in resp.get("vectors", []):
+            m = v.get("metadata", {})
+            cid = m.get("itemId")
+            tr = _stability_trim(cid, m.get("startTimeSeconds", 0),
+                                 m.get("endTimeSeconds", 15), cache,
+                                 min_clip_s=float(min_shot_s))
+            if tr is None:
+                continue
+            pool.append({
+                "itemId": cid, "segmentIndex": m.get("segmentIndex"),
+                "startTimeSeconds": tr[0], "endTimeSeconds": tr[1],
+                "distance": v.get("distance", 1.0),
+            })
+        return pool
+
+    return _build(strict_cache) or _build(usable_cache) or _build({})
+
+
+def _fill_v1_per_section(script_analysis, total_ms, enriched_assets, shot_config):
+    """Place B-roll cover ALIGNED to each VO section across *total_ms*.
+
+    Each pkg_vo/pkg_nats section gets a time slice proportional to its estimated
+    duration; that slice is filled with the section's OWN best-matching stable
+    clips (a per-section embedding query), so cover footage tracks the script
+    line-by-line instead of by whole-story relevance. A shared used-set prevents
+    repeating a clip across sections (avoids repetitive coverage), and a
+    global-relevance fallback pool keeps V1 gapless when a section's own matches
+    run short.
+
+    Returns a list of V1 clip dicts, or None to signal the caller to fall back
+    to the global fill (missing vector config / assets / sections).
+    """
+    sections = [s for s in sorted(script_analysis.get("parsedSections", []),
+                                  key=lambda x: x.get("orderIndex", 0))
+                if s.get("sectionType") in ("pkg_vo", "pkg_nats")]
+    if not sections:
+        return None
+    vector_bucket = os.environ.get("VECTOR_BUCKET_NAME", "")
+    index_name = os.environ.get("VECTOR_INDEX_NAME", "")
+    if not vector_bucket or not index_name:
+        return None
+    all_item_ids = [a["mimirItemId"] for a in enriched_assets if a.get("hasEmbeddings")]
+    if not all_item_ids:
+        return None
+
+    # Restrict cover to true B-roll (low/no speech) so a live-read VO never gets
+    # an interview/standup "talking head" as cover. Fall back to all clips when
+    # classification is unavailable or leaves too few options.
+    broll_ids = _broll_eligible_item_ids(enriched_assets)
+    if broll_ids is not None and len(broll_ids) >= 3:
+        item_ids = broll_ids
+        logger.info(
+            f"VO cover pool restricted to {len(item_ids)}/{len(all_item_ids)} "
+            f"B-roll-eligible clips (excluding interview/standup footage)")
+    else:
+        item_ids = all_item_ids
+        if broll_ids is not None:
+            logger.info(
+                f"Only {len(broll_ids)} B-roll-eligible clip(s) (<3) — using all "
+                f"{len(all_item_ids)} clips for VO cover")
+
+    bedrock = boto3.client("bedrock-runtime")
+    s3vectors_client = boto3.client("s3vectors")
+
+    raw_stab = _load_stability_cache(
+        enriched_assets,
+        os.environ.get("STABILITY_BUCKET") or os.environ.get("TRANSCRIPT_STAGING_BUCKET", ""),
+        raw=True)
+    strict_cache = {mid: _stable_only_segments(d) for mid, d in raw_stab.items()}
+    usable_cache = {mid: (d.get("segments") or []) for mid, d in raw_stab.items()}
+
+    shot = shot_config or {}
+    min_shot_s = shot.get("min_shot_duration_s", 3)
+    target_clip_ms = int(shot.get("target_shot_duration_s", 4) * 1000)
+    min_clip_ms = int(min_shot_s * 1000)
+    max_clip_ms = int(shot["max_shot_duration_s"] * 1000) if shot.get("max_shot_duration_s") else None
+
+    # Whole-script relevance pool as a gap-filling fallback for any slice whose
+    # own section matches run short.
+    global_pool = _query_broll_candidates(
+        bedrock, s3vectors_client, vector_bucket, index_name, item_ids,
+        " ".join(s.get("content", "") for s in sections),
+        strict_cache, usable_cache, min_shot_s, top_k=50)
+
+    weights = [max(1, int(s.get("estimatedDurationMs", 4000) or 4000)) for s in sections]
+    wsum = sum(weights) or 1
+
+    used = set()
+    fillers = []
+    pos = 0
+    for i, sec in enumerate(sections):
+        # Last section absorbs any rounding remainder so V1 reaches total_ms.
+        slice_end = total_ms if i == len(sections) - 1 else min(
+            total_ms, pos + int(round(total_ms * weights[i] / wsum)))
+        if slice_end <= pos:
+            continue
+        sec_pool = _query_broll_candidates(
+            bedrock, s3vectors_client, vector_bucket, index_name, item_ids,
+            sec.get("content", ""), strict_cache, usable_cache, min_shot_s, top_k=12)
+        # Prefer this section's matches; append global candidates (deduped) so a
+        # short section pool still fills its slice without leaving a V1 gap.
+        sec_keys = {(c["itemId"], c["segmentIndex"]) for c in sec_pool}
+        combined = sec_pool + [c for c in global_pool
+                               if (c["itemId"], c["segmentIndex"]) not in sec_keys]
+        seg = _fill_spans([(pos, slice_end)], combined, used, broll_cover=True,
+                          min_clip_ms=min_clip_ms, target_clip_ms=target_clip_ms,
+                          max_clip_ms=max_clip_ms)
+        logger.info(
+            f"Per-section cover: {sec.get('sectionType')}_{sec.get('orderIndex')} "
+            f"[{pos}-{slice_end}ms] -> {len(seg)} clip(s) "
+            f"({len(sec_pool)} section-specific matches)"
+        )
+        fillers.extend(seg)
+        pos = slice_end
+    return fillers
+
+
+def _rebuild_broll_tracks(assembly: dict, enriched_assets: list, script_analysis: dict,
+                          shot_config: dict = None) -> None:
     """Rebuild B-roll placement across V1 and V2 (broadcast track layout).
 
     Cutter constraint: V1 must be GAPLESS (a leading gap snaps the track to
@@ -1703,7 +1918,43 @@ def _rebuild_broll_tracks(assembly: dict, enriched_assets: list, script_analysis
     narrative_end = max(
         [c.get("end", 0) for c in sot_clips + vo_clips_placed] or [0])
     if narrative_end <= 0:
-        return
+        # Live-read VO cut: no SOT clips and no VO audio on the timeline (the
+        # anchor reads the script live). Cover a FIXED target span with B-roll,
+        # HARD-CAPPED to the profile's target video duration (~30s) so the cut
+        # never runs long — even when the source script is a full package. This
+        # keeps the video short and, because fewer cover clips are needed, lets
+        # the strict locked-off stability pool suffice (avoiding the fallback to
+        # shakier "usable" footage). Without this the rebuild would bail and
+        # leave the program track empty.
+        target_ms = int((shot_config or {}).get("target_video_duration_s", 30) * 1000)
+        narrative_end = target_ms
+        if narrative_end <= 0:
+            return
+        logger.info(
+            f"Live-read VO cut (no anchor clips): filling {narrative_end}ms of "
+            f"B-roll cover across V1 (hard-capped to the ~"
+            f"{target_ms // 1000}s target video duration)"
+        )
+
+        # Per-section aligned B-roll: place each VO section's own best-matching
+        # stable clips over its slice of the span, so cover tracks the script
+        # line-by-line (rather than one whole-story relevance ranking). Falls
+        # back to the global fill below if config/assets are missing.
+        per_section = _fill_v1_per_section(
+            script_analysis, narrative_end, enriched_assets, shot_config)
+        if per_section is not None:
+            v1_track["clips"] = sorted(per_section, key=lambda c: c.get("start", 0))
+            v2_track["clips"] = []
+            cursor = 0
+            for c in v1_track["clips"]:
+                if c.get("start", 0) > cursor:
+                    logger.warning(
+                        f"V1 gap remains at {cursor}-{c['start']}ms after per-section fill")
+                cursor = max(cursor, c.get("end", 0))
+            logger.info(
+                f"Rebuilt B-roll (per-section aligned): V1 {len(v1_track['clips'])} "
+                f"cover clips gapless to {narrative_end}ms, V2 empty")
+            return
 
     # V1 gaps to fill with B-roll cover: leading, inter-SOT, and trailing.
     v1_gaps = []
@@ -1768,39 +2019,79 @@ def _rebuild_broll_tracks(assembly: dict, enriched_assets: list, script_analysis
         logger.warning(f"B-roll vector query failed: {e}")
         return
 
-    # Camera-stability: B-roll must be LOCKED-OFF footage. Build stable-only
-    # span maps from the per-second metrics (pans/"move" seconds excluded — they
-    # read as jerky in cover footage), discarding spans shorter than 3s.
+    # Shot-duration config (editorial defaults) — drives min stable-span length
+    # and the clip lengths in _fill_spans. Falls back to the legacy ~6s target
+    # with a 3s floor and no ceiling when no profile config is supplied.
+    shot = shot_config or {}
+    min_shot_s = shot.get("min_shot_duration_s", 3)
+    target_clip_ms = int(shot.get("target_shot_duration_s", 6) * 1000)
+    min_clip_ms = int(min_shot_s * 1000)
+    max_clip_ms = int(shot["max_shot_duration_s"] * 1000) if shot.get("max_shot_duration_s") else None
+
+    # Camera-stability: prefer LOCKED-OFF footage. Build stable-only span maps
+    # from the per-second metrics (pans/"move" seconds excluded — they read as
+    # jerky in cover footage), discarding spans shorter than the min shot.
     raw_stability = _load_stability_cache(
-        enriched_assets, os.environ.get("TRANSCRIPT_STAGING_BUCKET", ""), raw=True)
-    stability_cache = {mid: _stable_only_segments(data) for mid, data in raw_stability.items()}
+        enriched_assets,
+        os.environ.get("STABILITY_BUCKET") or os.environ.get("TRANSCRIPT_STAGING_BUCKET", ""),
+        raw=True)
 
-    # Build candidate pool, sorted by relevance. Candidates trimmed below 3s of
-    # stable footage are dropped entirely — short slivers make useless B-roll.
-    candidate_pool = []
-    for v in query_resp.get("vectors", []):
-        meta = v.get("metadata", {})
-        cand_item = meta.get("itemId")
-        trimmed = _stability_trim(
-            cand_item, meta.get("startTimeSeconds", 0), meta.get("endTimeSeconds", 15),
-            stability_cache, min_clip_s=3.0)
-        if trimmed is None:
-            continue
-        candidate_pool.append({
-            "itemId": cand_item,
-            "segmentIndex": meta.get("segmentIndex"),
-            "startTimeSeconds": trimmed[0],
-            "endTimeSeconds": trimmed[1],
-            "distance": v.get("distance", 1.0),
-        })
+    def _build_pool(cache):
+        """Build the candidate pool trimmed against *cache* (empty = no trim)."""
+        pool = []
+        for v in query_resp.get("vectors", []):
+            meta = v.get("metadata", {})
+            cand_item = meta.get("itemId")
+            trimmed = _stability_trim(
+                cand_item, meta.get("startTimeSeconds", 0), meta.get("endTimeSeconds", 15),
+                cache, min_clip_s=float(min_shot_s))
+            if trimmed is None:
+                continue
+            pool.append({
+                "itemId": cand_item,
+                "segmentIndex": meta.get("segmentIndex"),
+                "startTimeSeconds": trimmed[0],
+                "endTimeSeconds": trimmed[1],
+                "distance": v.get("distance", 1.0),
+            })
+        return pool
 
-    logger.info(f"B-roll candidate pool: {len(candidate_pool)} stable segments from vector index")
+    # How much B-roll cover do we actually need to fill (V1 VO-led gaps)?
+    needed_ms = sum(max(0, hi - lo) for lo, hi in v1_gaps)
+    needed_clips = max(1, needed_ms // max(1, target_clip_ms))
+
+    # Tier 1: strict locked-off footage.
+    strict_cache = {mid: _stable_only_segments(data) for mid, data in raw_stability.items()}
+    candidate_pool = _build_pool(strict_cache)
+
+    # Graceful degradation: breaking-news/handheld stories may have little or no
+    # truly locked-off footage. Rather than reject everything (which leaves the
+    # program track with gaps), relax progressively so mildly unstable footage
+    # is used — only genuinely unusable frames are ever excluded.
+    if len(candidate_pool) < needed_clips:
+        logger.warning(
+            f"Strict locked-off B-roll pool too small "
+            f"({len(candidate_pool)} < ~{needed_clips} needed) — relaxing to "
+            f"usable-labeled footage (handheld/breaking-news tolerant)")
+        usable_cache = {mid: (data.get("segments") or []) for mid, data in raw_stability.items()}
+        candidate_pool = _build_pool(usable_cache)
+    if len(candidate_pool) < needed_clips:
+        logger.warning(
+            f"Relaxed B-roll pool still small ({len(candidate_pool)} < "
+            f"~{needed_clips} needed) — using unfiltered candidates so shots are "
+            f"not dropped for lack of stability data")
+        candidate_pool = _build_pool({})
+
+    logger.info(f"B-roll candidate pool: {len(candidate_pool)} segments from vector index "
+                f"(need ~{needed_clips} clips for {needed_ms}ms of cover)")
 
     # Shared dedup set across both tracks: never place the same segment twice.
     used_segments = set()
 
     # V1: fill the VO-led gaps with B-roll cover (nat sound at reduced gain).
-    v1_fillers = _fill_spans(v1_gaps, candidate_pool, used_segments, broll_cover=True)
+    v1_fillers = _fill_spans(v1_gaps, candidate_pool, used_segments, broll_cover=True,
+                             min_clip_ms=min_clip_ms, target_clip_ms=target_clip_ms,
+                             max_clip_ms=max_clip_ms)
     v1_track["clips"] = sorted(sot_clips + v1_fillers, key=lambda c: c.get("start", 0))
 
     # V2: cutaways ONLY over jump cuts (joins between adjacent soundbite clips)
@@ -1816,7 +2107,9 @@ def _rebuild_broll_tracks(assembly: dict, enriched_assets: list, script_analysis
             hi = min(nxt.get("end", join), join + 1500)
             if hi > lo:
                 jump_cut_spans.append((lo, hi))
-    v2_track["clips"] = _fill_spans(jump_cut_spans, candidate_pool, used_segments)
+    v2_track["clips"] = _fill_spans(jump_cut_spans, candidate_pool, used_segments,
+                                    min_clip_ms=min_clip_ms, target_clip_ms=target_clip_ms,
+                                    max_clip_ms=max_clip_ms)
 
     # Sanity: warn if V1 still has a gap (pool exhaustion) — Cutter can't edit it.
     cursor = 0
@@ -1841,6 +2134,10 @@ def run_timeline_assembly(
     vo_clips: dict = None,
     run_id: str = "",
     folder_id: str = None,
+    profile_directive: str = "",
+    shot_config: dict = None,
+    synthesize_voiceover: bool = True,
+    timeline_label: str = "Rough Cut",
 ) -> dict:
     """Assemble a rough cut timeline and create it in Mimir.
 
@@ -1889,7 +2186,7 @@ def run_timeline_assembly(
     # Zero-tool agent — only produces sequenceDetails JSON
     agent = Agent(
         model=bedrock_model,
-        system_prompt=TIMELINE_ASSEMBLY_PROMPT,
+        system_prompt=TIMELINE_ASSEMBLY_PROMPT + (profile_directive or ""),
         tools=[],
     )
 
@@ -1934,6 +2231,25 @@ def run_timeline_assembly(
         if "sequenceDetails" not in assembly or not isinstance(assembly.get("sequenceDetails"), dict):
             raise ValueError("Timeline Assembly Agent output missing 'sequenceDetails' object")
 
+        # No-AI-voice profiles (Generate VO / VOSOT): the anchor reads the
+        # script live, so there must be NO voice-over audio on A1 (track id 3).
+        # The assembly agent can hallucinate placeholder VO items (e.g.
+        # "vo_section_0") when no real synthesized clips are supplied; those
+        # items don't exist in Mimir and 404 in Cutter ("getPlayableItem").
+        # Clear the VO track deterministically when synthesis is off.
+        if not synthesize_voiceover:
+            for track in assembly.get("sequenceDetails", {}).get("tracks", []):
+                is_vo_track = track.get("id") == 3 or (
+                    track.get("mediaType") == "audio"
+                    and "voice" in str(track.get("name", "")).lower()
+                )
+                if is_vo_track and track.get("clips"):
+                    logger.info(
+                        f"Clearing {len(track['clips'])} VO audio clip(s) from A1 — "
+                        f"profile reads the script live (no AI voice)"
+                    )
+                    track["clips"] = []
+
         # Audio channel mapping is now handled in _build_multitrack_timeline_payload:
         # V1 clips → audioTracks[0,1], V2 clips → audioTracks[2,3], VO → audioTracks[4]
         # No need to rebuild A2 from V1 in post-processing.
@@ -1952,7 +2268,7 @@ def run_timeline_assembly(
         # track to 0; mid-track gaps aren't editable). V2 carries cutaway cover
         # over the SOT ranges only; V2 gaps are fine.
         try:
-            _rebuild_broll_tracks(assembly, enriched_assets, script_analysis)
+            _rebuild_broll_tracks(assembly, enriched_assets, script_analysis, shot_config)
         except Exception as e:
             logger.warning(f"B-roll rebuild failed, using agent's original tracks: {e}")
 
@@ -1975,7 +2291,7 @@ def run_timeline_assembly(
         # sequenceDetails itemRefs directly.
 
         timeline_result_json = create_timeline(
-            title=f"{story_title} - Rough Cut",
+            title=f"{story_title} - {timeline_label}",
             sequence_details_json=json.dumps(assembly.get("sequenceDetails", {})),
             parent_item_ids=parent_ids,
             folder_id=folder_id,
@@ -2266,6 +2582,11 @@ def invoke(payload):
     try:
         logger.info(f"Rough Cut Agent invoked with payload keys: {list(payload.keys())}")
 
+        # Select the rough-cut profile (prompt/constraint overrides) by type.
+        rough_cut_type = payload.get("roughCutType") or DEFAULT_ROUGH_CUT_TYPE
+        profile = get_profile(rough_cut_type)
+        logger.info(f"Rough cut type: {rough_cut_type} ({profile['label']})")
+
         # Extract payload fields — storyContext comes from the story-context-handler Lambda
         # which fetches and enriches the story data from Saga API
         story_context_data = payload.get("storyContext", {})
@@ -2323,14 +2644,30 @@ def invoke(payload):
         # over unassigned ones. Skip instances with no content.
         script_text = ""
         script_source = "none"
-        linear_instances = [
-            inst for inst in instances
-            if "linear" in inst.get("instanceType", inst.get("type", "")).lower()
-        ]
-        # Sort: assigned first, then unassigned
-        linear_instances.sort(
-            key=lambda i: 0 if (i.get("assignedUserId") or i.get("assignedUser")) else 1
-        )
+
+        def _is_linear(inst: dict) -> bool:
+            platform = (
+                (inst.get("platformInfo") or {}).get("platform")
+                or inst.get("platformType")
+                or ""
+            ).lower()
+            return platform == "linear"
+
+        def _is_assigned(inst: dict) -> bool:
+            # Real Saga API: an instance is "assigned" when its platformInfo
+            # account has a rundown accountId. Fall back to legacy fields.
+            account = (inst.get("platformInfo") or {}).get("account") or {}
+            return bool(
+                account.get("accountId")
+                or inst.get("assignedUserId")
+                or inst.get("assignedUser")
+            )
+
+        linear_instances = [inst for inst in instances if _is_linear(inst)]
+        # Prefer an assigned instance (a producer has claimed it and written a
+        # script) over an unassigned one, so a reporter's existing script is
+        # used as context when present.
+        linear_instances.sort(key=lambda i: 0 if _is_assigned(i) else 1)
         for inst in linear_instances:
             inst_text = _slate_to_text(inst.get("content", {}))
             if inst_text.strip():
@@ -2451,9 +2788,37 @@ def invoke(payload):
                 "notes": notes,
             }
             logger.info("Stage 1: Running Script Analysis Agent")
-            script_analysis = run_script_analysis(story_context)
+            script_analysis = run_script_analysis(
+                story_context, profile_directive=profile["script_directive"]
+            )
             _save_artifact(story_id, "01-script-analysis", script_analysis, run_id)
             logger.info("Stage 1: Script Analysis complete")
+
+            # Enforce VO-only structure deterministically for profiles that
+            # exclude SOT (Generate VO / AI VO). The script-analysis directive
+            # asks for VO-only, but when the SOURCE script already contains
+            # soundbites the model can still (non-deterministically) emit
+            # pkg_sot / interview sections. If those slip through they become V1
+            # anchor clips, which makes the cut run to the full script length
+            # and defeats the ~30s VO target. Strip them here so a VO cut is
+            # always VO/nats only, regardless of model variance or source-script
+            # content.
+            if not profile.get("include_sot", True):
+                _VO_KEEP = {"pkg_vo", "pkg_nats"}
+                _orig_sections = script_analysis.get("parsedSections", [])
+                _kept = [s for s in _orig_sections if s.get("sectionType") in _VO_KEEP]
+                if len(_kept) != len(_orig_sections):
+                    logger.info(
+                        f"VO-only profile '{rough_cut_type}': dropped "
+                        f"{len(_orig_sections) - len(_kept)} non-VO section(s) "
+                        f"(e.g. SOT/interview) — keeping {len(_kept)} VO/nats sections"
+                    )
+                # Re-index so section order keys stay contiguous downstream.
+                for _i, _s in enumerate(_kept):
+                    _s["orderIndex"] = _i
+                script_analysis["parsedSections"] = _kept
+                script_analysis["soundbites"] = []
+                script_analysis["interviewSegments"] = []
         except Exception as e:
             logger.error(f"Stage 1 (Script Analysis) failed: {e}")
             if task_token:
@@ -2494,7 +2859,20 @@ def invoke(payload):
             raise
 
         # --- Stage 2.5: Detect Reporter VO + Synthesize Voice-Overs ---
-        try:
+        # GATED on the profile's synthesize_voiceover flag. This is the single
+        # switch that separates "Generate VO"/"Generate VOSOT" (anchor reads the
+        # script live on linear TV — NO AI voice is ever created) from "Generate
+        # AI VO" (reporter-driven digital/social, which does synthesize
+        # narration). When off, no VO audio is produced and A1 stays empty.
+        if not profile.get("synthesize_voiceover", True):
+            logger.info(
+                f"Stage 2.5: SKIPPED — profile '{rough_cut_type}' ({profile['label']}) "
+                f"does not synthesize an AI voice-over (script is read live). "
+                f"No Polly narration will be created."
+            )
+            vo_clips = {}
+        else:
+          try:
             all_item_ids = [a.get("mimirItemId") for a in assets if a.get("mimirItemId")]
 
             # Detect reporter-provided VO by checking transcript word overlap
@@ -2518,7 +2896,7 @@ def invoke(payload):
             )
             logger.info(f"Stage 2.5b: Synthesized {len(vo_clips)} VO clips")
             _save_artifact(story_id, "04-vo-clips", vo_clips, run_id)
-        except Exception as e:
+          except Exception as e:
             logger.warning(f"Stage 2.5 (VO Detection/Synthesis) failed non-fatally: {e} — continuing without VO clips")
             vo_clips = {}
 
@@ -2535,23 +2913,80 @@ def invoke(payload):
             vo_clips=vo_clips,
             run_id=run_id,
             folder_id=mimir_folder_id,
+            profile_directive=profile["timeline_directive"],
+            shot_config=profile["shot"],
+            synthesize_voiceover=profile.get("synthesize_voiceover", True),
+            timeline_label=profile.get("timeline_suffix", profile["label"]),
         )
 
-        # --- Stage 4: Write script to Saga linear instance ---
-        # Non-fatal — timeline is already created; script write is best-effort.
+        # --- Stage 4: Write script to a new unassigned Saga linear instance ---
+        # The script is written to a fresh unassigned linear instance for human
+        # review — NOT back into the story's Content or Research fields (those
+        # are only read as context). The selected rendered clips are associated
+        # so a producer sees the media backing the script.
+        #
+        # Failure handling is explicit: creating the instance and associating
+        # clips are distinct steps. If the instance is created but clip
+        # association fails, we surface a partial-failure status rather than
+        # silently reporting success.
         try:
-            logger.info("Stage 4: Writing script to Saga linear instance")
+            logger.info("Stage 4: Writing script to a new unassigned Saga linear instance")
             script_sections = _build_script_sections_from_analysis(script_analysis)
             _save_artifact(story_id, "05-script-sections", script_sections, run_id)
 
+            # Collect the selected rendered clips (video-track items placed on
+            # the timeline) to associate with the instance. Audio-only VO items
+            # are excluded — they are not source media the producer reviews.
+            clip_item_ids = []
+            seen_clip_ids = set()
+            for track in result.get("sequenceDetails", {}).get("tracks", []):
+                if track.get("mediaType") != "video":
+                    continue
+                for clip in track.get("clips", []):
+                    cid = clip.get("mimirItemId")
+                    if cid and cid not in seen_clip_ids:
+                        seen_clip_ids.add(cid)
+                        clip_item_ids.append(cid)
+
             import json as _json
-            create_or_update_linear_instance(
+            instance_result_json = create_or_update_linear_instance(
                 story_id=story_id,
                 script_sections_json=_json.dumps(script_sections),
+                clip_item_ids_json=_json.dumps(clip_item_ids),
             )
-            logger.info(f"Stage 4: Script written to linear instance ({len(script_sections)} sections)")
+            instance_result = json.loads(instance_result_json)
+            instance_status = instance_result.get("status", "unknown")
+
+            # Surface the instance outcome (incl. partial failure) on the result.
+            result.setdefault("summary", {})["instance"] = {
+                "instanceId": instance_result.get("instanceId"),
+                "status": instance_status,
+                "sectionsWritten": instance_result.get("sectionsWritten"),
+                "clipsRequested": len(clip_item_ids),
+                "clipsAssociated": instance_result.get("clipsAssociated"),
+                "clipAssociationError": instance_result.get("clipAssociationError"),
+            }
+            # Log only untainted locals (story id + counts). The per-clip
+            # associated count and error live in result.summary.instance above;
+            # they are NOT logged because they are parsed from the tool return,
+            # which carries the (secret-tainted) instance id.
+            if instance_status == "partial_success":
+                logger.warning(
+                    f"Stage 4 PARTIAL for story {story_id}: script written to instance, "
+                    f"but clip association incomplete for {len(clip_item_ids)} requested "
+                    f"clip(s) — see result.summary.instance for details"
+                )
+            else:
+                logger.info(
+                    f"Stage 4: Script written to instance for story {story_id} "
+                    f"({len(script_sections)} sections, {len(clip_item_ids)} clips requested)"
+                )
         except Exception as e:
             logger.warning(f"Stage 4 (Write Script to Linear Instance) failed non-fatally: {e}")
+            result.setdefault("summary", {})["instance"] = {
+                "status": "error",
+                "error": str(e),
+            }
 
         return result
 

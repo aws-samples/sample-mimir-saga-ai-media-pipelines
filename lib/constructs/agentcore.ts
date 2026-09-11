@@ -294,23 +294,33 @@ export class AgentCore extends Construct {
         computeType: codebuild.ComputeType.SMALL,
         privileged: true
       },
+      // IMAGE_TAG = source asset hash. Each source change produces a unique tag,
+      // so the runtime can be pointed at the EXACT image built for this deploy
+      // (see RuntimeRefresher) instead of the mutable :latest — which eliminates
+      // the redeploy race where the runtime refreshed before the new :latest was
+      // pushed. Defaults to "latest" if not set.
+      environmentVariables: {
+        IMAGE_TAG: { value: sourceAsset.assetHash },
+      },
       buildSpec: codebuild.BuildSpec.fromObject({
         version: '0.2',
         phases: {
           build: {
             commands: [
-              'echo "Building Docker image..."',
+              'echo "Building Docker image (tag: $IMAGE_TAG)..."',
               'docker build -t bedrock-agentcore-arm64 .',
               'echo "Authenticating with ECR..."',
               `aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin ${account}.dkr.ecr.${region}.amazonaws.com/${this.ecrRepository.repositoryName}`,
               'echo "Tagging image..."',
-              `docker tag bedrock-agentcore-arm64:latest ${this.ecrRepository.repositoryUri}:latest`
+              `docker tag bedrock-agentcore-arm64:latest ${this.ecrRepository.repositoryUri}:latest`,
+              `docker tag bedrock-agentcore-arm64:latest ${this.ecrRepository.repositoryUri}:$IMAGE_TAG`
             ]
           },
           post_build: {
             commands: [
               'echo "Pushing image to ECR..."',
               `docker push ${this.ecrRepository.repositoryUri}:latest`,
+              `docker push ${this.ecrRepository.repositoryUri}:$IMAGE_TAG`,
               'echo "Build completed at $(date)"'
             ]
           }
@@ -541,7 +551,9 @@ def handler(event, context):
     const runtimeRefresher = new lambda.Function(this, 'RuntimeRefresher', {
       runtime: lambda.Runtime.PYTHON_3_14,
       handler: 'index.handler',
-      timeout: cdk.Duration.minutes(10),
+      // Must exceed the ECR wait loop (~8 min) + runtime update wait, with margin,
+      // so the function always reaches send_response before being killed.
+      timeout: cdk.Duration.minutes(14),
       code: lambda.Code.fromInline(`
 import json
 import boto3
@@ -559,35 +571,46 @@ def handler(event, context):
         role_arn = event['ResourceProperties']['RoleArn']
         region = event['ResourceProperties']['Region']
         env_vars = event['ResourceProperties'].get('EnvironmentVariables', {})
-        codebuild_project = event['ResourceProperties'].get('CodeBuildProject', '')
+        image_tag = event['ResourceProperties'].get('ImageTag', '')
+        ecr_repo = event['ResourceProperties'].get('EcrRepositoryName', '')
         protocol_config = event['ResourceProperties'].get('ProtocolConfiguration', 'HTTP')
         
-        print(f"Refreshing runtime {runtime_id} to pull latest image from {container_uri}")
+        print(f"Refreshing runtime {runtime_id} to image {container_uri}")
         
-        # Step 1: Wait for CodeBuild to finish pushing the image
-        if codebuild_project:
-            codebuild_client = boto3.client('codebuild', region_name=region)
-            print(f"Waiting for CodeBuild project {codebuild_project} to complete...")
-            for i in range(60):
-                builds = codebuild_client.list_builds_for_project(
-                    projectName=codebuild_project, sortOrder='DESCENDING'
-                )
-                if builds.get('ids'):
-                    build_detail = codebuild_client.batch_get_builds(ids=[builds['ids'][0]])
-                    build = build_detail['builds'][0]
-                    build_status = build['buildStatus']
-                    print(f"  Latest build status: {build_status} (attempt {i+1})")
-                    if build_status == 'SUCCEEDED':
-                        print("CodeBuild completed successfully, proceeding with refresh")
-                        break
-                    elif build_status in ['FAILED', 'FAULT', 'STOPPED', 'TIMED_OUT']:
-                        print(f"CodeBuild failed with {build_status}, proceeding anyway")
-                        break
-                    # IN_PROGRESS - keep waiting
-                    time.sleep(10)
-                else:
-                    print("No builds found, proceeding")
+        # Step 1: Prefer the EXACT image tagged with this deploy's source hash.
+        # This is deterministic: the runtime moves to the specific image built
+        # for this source, avoiding the old "latest CodeBuild" race. If that tag
+        # isn't present (e.g. a construct-only deploy that triggered no build, or
+        # first rollout before the tag exists), fall back to :latest so the
+        # refresh ALWAYS completes and responds to CloudFormation.
+        # IMPORTANT: this loop must finish well within the Lambda timeout, or the
+        # function is killed before send_response and CloudFormation reports
+        # "did not receive a response" (which fails/rolls back the stack).
+        if image_tag and ecr_repo:
+            ecr_client = boto3.client('ecr', region_name=region)
+            print(f"Waiting for image {ecr_repo}:{image_tag} in ECR...")
+            found = False
+            for i in range(48):  # ~8 min max, safely under the 14 min timeout
+                try:
+                    ecr_client.describe_images(
+                        repositoryName=ecr_repo,
+                        imageIds=[{'imageTag': image_tag}]
+                    )
+                    print(f"Image {image_tag} present; using hash-tagged image")
+                    found = True
                     break
+                except ecr_client.exceptions.ImageNotFoundException:
+                    print(f"  Image {image_tag} not yet pushed (attempt {i+1})")
+                    time.sleep(10)
+                except Exception as e:
+                    print(f"  describe_images error ({e}); falling back to :latest")
+                    break
+            if not found:
+                # Fall back to :latest (always present, current image).
+                container_uri = container_uri.rsplit(':', 1)[0] + ':latest'
+                print(f"Hash image not found; falling back to {container_uri}")
+        else:
+            print("No ImageTag/EcrRepositoryName provided; using provided ContainerUri")
         
         client = boto3.client('bedrock-agentcore-control', region_name=region)
         
@@ -673,8 +696,8 @@ def send_response(event, context, status, reason):
 
     runtimeRefresher.addToRolePolicy(new iam.PolicyStatement({
       effect: iam.Effect.ALLOW,
-      actions: ['codebuild:ListBuildsForProject', 'codebuild:BatchGetBuilds'],
-      resources: [codeBuildProject.projectArn]
+      actions: ['ecr:DescribeImages'],
+      resources: [this.ecrRepository.repositoryArn]
     }));
 
     // Hash environment variables to detect config changes
@@ -687,10 +710,13 @@ def send_response(event, context, status, reason):
       serviceToken: runtimeRefresher.functionArn,
       properties: {
         RuntimeId: runtimeId,
-        ContainerUri: `${this.ecrRepository.repositoryUri}:latest`,
+        // Point the runtime at the EXACT image built for this source, not :latest.
+        ContainerUri: `${this.ecrRepository.repositoryUri}:${sourceAsset.assetHash}`,
         RoleArn: memoryExecutionRole.roleArn,
         Region: region,
-        CodeBuildProject: codeBuildProject.projectName,
+        // Wait for this specific image tag to exist in ECR before refreshing.
+        ImageTag: sourceAsset.assetHash,
+        EcrRepositoryName: this.ecrRepository.repositoryName,
         ProtocolConfiguration: props.protocolConfiguration || 'HTTP',
         EnvironmentVariables: {
           AGENTCORE_MEMORY_ARN: this.memoryId,

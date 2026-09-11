@@ -19,9 +19,17 @@ keys.txt
 *.mp4
 sample media/
 
-# Graphics templates contain embedded station logos — keep directory, ignore content
+# Lottie templates embed station logos and licensed font outlines, so customer
+# templates are not committed. The sanitized reference templates are: they carry
+# only an openly licensed font (Roboto) and a neutral logo placeholder, and
+# committing them means a fresh clone + deploy produces a working pipeline.
 graphics/templates/*.json
-graphics/README.md
+!graphics/templates/graphics-overlay-*.json
+
+# AE audit / sanitize reports contain local paths and usernames
+*-audit.txt
+*-sanitize.txt
+*-sanitize-dryrun.txt
 
 # Exclude reference API specs (third-party, not our code)
 reference/

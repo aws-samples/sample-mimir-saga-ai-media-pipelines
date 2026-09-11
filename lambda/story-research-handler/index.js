@@ -239,10 +239,18 @@ async function writeResearchToSaga(storyId, researchItems, sagaApiUrl, sagaApiKe
   const notesData = await notesResp.json();
   const existingNotes = notesData.notes || notesData || [];
 
-  // Build a lookup map: lowercase title → note id
+  // Build a lookup map: lowercase title → note id.
+  // IMPORTANT: only match ORG-SCOPED notes (id shaped "<orgId>-NTE-...").
+  // Notes created by a tenant-scoped key are bare ("NTE-...") and are invisible
+  // in the org's Research pane. If we matched those by title on a re-run, we'd
+  // patch the hidden bare note and the research would never appear. By ignoring
+  // bare notes here, an org-scoped key creates fresh, org-visible notes instead.
+  const isOrgScoped = (id) => typeof id === 'string' && id.includes('-NTE-');
   const notesByTitle = {};
   for (const note of existingNotes) {
-    if (note.title) notesByTitle[note.title.toLowerCase()] = note.id;
+    if (note.title && isOrgScoped(note.id)) {
+      notesByTitle[note.title.toLowerCase()] = note.id;
+    }
   }
 
   const noteIds = [];

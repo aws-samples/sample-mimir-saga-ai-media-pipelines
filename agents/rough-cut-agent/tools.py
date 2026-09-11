@@ -943,9 +943,10 @@ def _build_linear_instance_slate(script_sections: list) -> dict:
             display_text = text.upper()
             color = "#ffffff"
         else:
-            # Package script: green
+            # Package script: green. Saga only accepts a fixed enum of text
+            # colors — use its green (#74db63); #00ff00 is rejected with a 400.
             display_text = text
-            color = "#00ff00"
+            color = "#74db63"
 
         # Build children array — label in bold if present, then text
         children = []
@@ -978,15 +979,71 @@ def _build_linear_instance_slate(script_sections: list) -> dict:
     return {"document": blocks}
 
 
+def _associate_clips_with_story(saga_url: str, headers: dict, story_id: str,
+                                clip_item_ids: list) -> tuple:
+    """Associate rendered Mimir clips with a Saga story as assets.
+
+    Uses ``POST /stories/{id}/assets`` with ``externalId`` set to the Mimir item
+    id — the documented write path for attaching rendered media to a story (the
+    Saga API has no direct per-instance asset-attach endpoint; an unassigned
+    instance surfaces the story's assets). Best-effort per clip: a 2xx counts as
+    associated, and a 409/"already exists" conflict is treated as already
+    associated (idempotent). Any other failure is recorded but does not abort the
+    remaining clips.
+
+    Returns:
+        Tuple ``(associated_count, error_or_None)`` where ``error_or_None`` is a
+        short message describing the first hard failure encountered (or None when
+        every clip associated / already existed).
+    """
+    associated = 0
+    first_error = None
+    for item_id in clip_item_ids:
+        try:
+            resp = requests.post(
+                f"{saga_url}/stories/{story_id}/assets",
+                headers=headers,
+                # Saga's story-asset itemType enum accepts 'image' | 'video'.
+                # These are rendered video clips.
+                json={"title": item_id, "itemType": "video", "externalId": item_id},
+                timeout=30,
+            )
+            if resp.ok or resp.status_code == 409:
+                # 2xx = created; 409 = already associated (idempotent).
+                associated += 1
+            else:
+                # Log only the status code — never resp.text or the raw request
+                # exception, which can echo the (secret-sourced) Saga URL.
+                msg = f"asset {item_id}: HTTP {resp.status_code}"
+                logger.warning(f"Clip association failed — {msg}")
+                if first_error is None:
+                    first_error = msg
+        except Exception as e:
+            # Log the exception TYPE only; str(e) from requests can include the
+            # full URL (sourced from Secrets Manager).
+            msg = f"asset {item_id}: {type(e).__name__}"
+            logger.warning(f"Clip association error — {msg}")
+            if first_error is None:
+                first_error = msg
+    return associated, first_error
+
+
 @tool
-def create_or_update_linear_instance(story_id: str, script_sections_json: str) -> str:
+def create_or_update_linear_instance(story_id: str, script_sections_json: str,
+                                     clip_item_ids_json: str = None) -> str:
     """Create or update an unassigned linear instance for a Saga story with the generated script.
 
     Checks for an existing unassigned linear instance. If none exists, creates one.
     Then updates the instance content with the formatted script in Slate format.
+    Finally, associates the selected rendered clips with the story so a producer
+    reviewing the unassigned instance sees the media backing the script.
 
     VO text (anchor/talent reads) is written as white text in ALL CAPS.
     Package script text is written in green.
+
+    Failure handling is explicit: if the instance is created/updated but clip
+    association fails, the returned ``status`` is ``"partial_success"`` (never a
+    silent success), with ``clipAssociationError`` describing the failure.
 
     Args:
         story_id: The Saga story ID.
@@ -994,14 +1051,29 @@ def create_or_update_linear_instance(story_id: str, script_sections_json: str) -
             - type: "vo" (white ALL CAPS) or "pkg" (green)
             - label: Optional label (e.g. "ANCHOR:", "PKG VO:")
             - text: The script text for this section
+        clip_item_ids_json: Optional JSON array of Mimir item IDs for the
+            selected rendered clips to associate with the story. When omitted or
+            empty, no clip association is attempted.
+
+    Returns:
+        JSON string with ``instanceId``, ``sectionsWritten``, ``created``,
+        ``status`` ("success" | "partial_success" | error), and (when clips were
+        requested) ``clipsRequested`` / ``clipsAssociated`` / ``clipAssociationError``.
     """
     saga_url = _get_saga_api_url()
     headers = _saga_auth_headers()
     headers["Content-Type"] = "application/json"
 
     script_sections = json.loads(script_sections_json)
+    clip_item_ids = json.loads(clip_item_ids_json) if clip_item_ids_json else []
 
-    logger.info(f"create_or_update_linear_instance: story={story_id}, sections={len(script_sections)}")
+    logger.info(
+        f"create_or_update_linear_instance: story={story_id}, "
+        f"sections={len(script_sections)}, clips={len(clip_item_ids)}"
+    )
+
+    # Build the Slate document once — reused for both create and update paths.
+    slate_doc = _build_linear_instance_slate(script_sections)
 
     # Step 1: Get existing instances for the story
     instances_url = f"{saga_url}/stories/{story_id}/instances"
@@ -1010,57 +1082,121 @@ def create_or_update_linear_instance(story_id: str, script_sections_json: str) -
     instances_data = resp.json()
     instances = instances_data.get("instances", instances_data if isinstance(instances_data, list) else [])
 
-    # Step 2: Find an unassigned linear instance
-    # An unassigned instance has no assignedUserId (or it is null/empty)
-    # and instanceType contains "linear"
+    # Step 2: Find an existing UNASSIGNED, ORG-SCOPED linear instance.
+    # Real Saga API shape (verified against live API):
+    #   - platform is on platformInfo.platform (or platformType), NOT instanceType
+    #   - "unassigned" == platformInfo.account.accountId is null / empty
+    #     (an assigned instance has a rundown accountId + accountTitle)
+    #   - org-scoped instances have ids shaped "<orgId>-INS-...". Bare instances
+    #     ("INS-...") were created by a tenant-scoped key and are INVISIBLE in the
+    #     org's Instances pane. We must NOT reuse a bare instance — otherwise the
+    #     script write lands on a hidden instance. By requiring an org-scoped id
+    #     here, we fall through to CREATE a fresh org-scoped instance instead.
+    def _is_org_scoped(inst_id):
+        return isinstance(inst_id, str) and "-INS-" in inst_id
+
     target_instance_id = None
     for inst in instances:
-        inst_type = inst.get("instanceType", inst.get("type", "")).lower()
-        assigned = inst.get("assignedUserId") or inst.get("assignedUser")
-        if "linear" in inst_type and not assigned:
-            target_instance_id = inst.get("id")
-            logger.info(f"Found existing unassigned linear instance: {target_instance_id}")
+        platform = (
+            (inst.get("platformInfo") or {}).get("platform")
+            or inst.get("platformType")
+            or ""
+        ).lower()
+        account = (inst.get("platformInfo") or {}).get("account") or {}
+        is_unassigned = not account.get("accountId")
+        inst_id = inst.get("id") or inst.get("mId")
+        if platform == "linear" and is_unassigned and _is_org_scoped(inst_id):
+            target_instance_id = inst_id
+            # Log the (untrusted, non-secret) story id for correlation rather
+            # than the instance id, which is derived from a Saga API response
+            # reached via a Secrets-Manager-sourced URL (CodeQL treats such
+            # response-derived values as secret-tainted).
+            logger.info(f"Found existing unassigned org-scoped linear instance for story {story_id}")
             break
 
-    # Step 3: Create a new unassigned linear instance if none found
-    if not target_instance_id:
-        logger.info("No unassigned linear instance found — creating one")
+    if target_instance_id:
+        # Step 3a: Update the existing instance's content via PATCH.
+        patch_url = f"{saga_url}/instances/{target_instance_id}"
+        patch_resp = requests.patch(
+            patch_url, headers=headers, json={"content": slate_doc}, timeout=30
+        )
+        patch_resp.raise_for_status()
+        was_created = False
+        logger.info(
+            f"Updated existing unassigned linear instance for story {story_id} with "
+            f"{len(script_sections)} script sections"
+        )
+    else:
+        # Step 3b: No unassigned linear instance — create one WITH the script
+        # content in a single POST. The Saga create endpoint accepts inline
+        # content, so no follow-up PATCH is needed. The instance inherits the org
+        # of the API key, so an org-scoped key produces an org-stamped instance
+        # visible in that org's Instances pane. It is left UNASSIGNED and
+        # unscheduled (state "todo") for human review.
+        logger.info("No unassigned linear instance found — creating one with script content")
+        story_title = ""
+        try:
+            story_resp = requests.get(
+                f"{saga_url}/stories/{story_id}", headers=_saga_auth_headers(), timeout=30
+            )
+            if story_resp.ok:
+                story_json = story_resp.json()
+                story_title = story_json.get("mTitle") or story_json.get("title") or ""
+        except Exception as e:
+            logger.warning(f"Could not fetch story title for instance: {type(e).__name__}")
+
         create_url = f"{saga_url}/stories/{story_id}/instances"
         create_payload = {
-            "instanceType": "linear",
+            "title": story_title or "Rough Cut",
+            "state": "todo",
+            "platformInfo": {
+                "platform": "linear",
+                "account": {"accountId": None, "accountTitle": "Unassigned"},
+            },
+            "content": slate_doc,
         }
         create_resp = requests.post(
             create_url, headers=headers, json=create_payload, timeout=30
         )
         create_resp.raise_for_status()
-        created = create_resp.json()
+        created_json = create_resp.json()
         target_instance_id = (
-            created.get("id")
-            or created.get("instance", {}).get("id")
+            created_json.get("id")
+            or created_json.get("mId")
+            or (created_json.get("instance", {}) or {}).get("id")
         )
-        logger.info(f"Created new linear instance: {target_instance_id}")
+        if not target_instance_id:
+            return json.dumps({"error": "Failed to create a linear instance",
+                               "status": "error"})
+        was_created = True
+        logger.info(f"Created new unassigned linear instance for story {story_id}")
 
-    if not target_instance_id:
-        return json.dumps({"error": "Failed to find or create a linear instance"})
-
-    # Step 4: Build the Slate document
-    slate_doc = _build_linear_instance_slate(script_sections)
-
-    # Step 5: PATCH the instance content
-    patch_url = f"{saga_url}/instances/{target_instance_id}"
-    patch_payload = {"content": slate_doc}
-    patch_resp = requests.patch(
-        patch_url, headers=headers, json=patch_payload, timeout=30
-    )
-    patch_resp.raise_for_status()
-
-    logger.info(
-        f"Linear instance {target_instance_id} updated with "
-        f"{len(script_sections)} script sections"
-    )
-
-    return json.dumps({
+    # Step 4: Associate the selected rendered clips with the story (best-effort).
+    # The instance/script write already succeeded above; clip association is a
+    # SEPARATE step so its failure is reported as a partial success, never
+    # silently swallowed.
+    result = {
         "instanceId": target_instance_id,
         "sectionsWritten": len(script_sections),
+        "created": was_created,
         "status": "success",
-    })
+    }
+    if clip_item_ids:
+        associated, assoc_error = _associate_clips_with_story(
+            saga_url, headers, story_id, clip_item_ids
+        )
+        result["clipsRequested"] = len(clip_item_ids)
+        result["clipsAssociated"] = associated
+        if assoc_error is not None:
+            result["status"] = "partial_success"
+            result["clipAssociationError"] = assoc_error
+            logger.warning(
+                f"Story {story_id}: script written to instance but clip "
+                f"association partial ({associated}/{len(clip_item_ids)}): {assoc_error}"
+            )
+        else:
+            logger.info(
+                f"Story {story_id}: {associated}/{len(clip_item_ids)} "
+                f"clips associated with story"
+            )
+    return json.dumps(result)

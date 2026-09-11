@@ -36,6 +36,9 @@ export class AgentCoreStack extends cdk.Stack {
     const videoStagingBucketName = ssm.StringParameter.valueForStringParameter(
       this, '/infrastructure/video-staging-bucket-name'
     );
+    const mediaAnalysisBucketName = ssm.StringParameter.valueForStringParameter(
+      this, '/infrastructure/media-analysis-bucket-name'
+    );
 
     // Deploy agents on AgentCore Runtime
     this.multiAgentCore = new MultiAgentCore(this, 'MultiAgentCore', {
@@ -57,6 +60,7 @@ export class AgentCoreStack extends cdk.Stack {
             VECTOR_BUCKET_NAME: vectorBucketName,
             VECTOR_INDEX_NAME: 'video-embeddings-index',
             TRANSCRIPT_STAGING_BUCKET: videoStagingBucketName,
+            STABILITY_BUCKET: mediaAnalysisBucketName,
             POLLY_VOICE_ID: 'Matthew',
             AGENT_MODEL_ID: 'us.anthropic.claude-sonnet-4-20250514-v1:0',
           },
@@ -93,11 +97,15 @@ export class AgentCoreStack extends cdk.Stack {
       resources: ['*'],
     }));
 
-    // Grant S3 read access to the video staging bucket for get_generated_transcript tool
+    // Grant S3 read access to the video staging bucket (transcripts) and the
+    // durable media-analysis bucket (camera-stability maps).
     sharedRole.addToPolicy(new iam.PolicyStatement({
       effect: iam.Effect.ALLOW,
       actions: ['s3:GetObject'],
-      resources: [`arn:aws:s3:::${resourcePrefix}-video-embedding-staging-*/*`],
+      resources: [
+        `arn:aws:s3:::${resourcePrefix}-video-embedding-staging-*/*`,
+        `arn:aws:s3:::${resourcePrefix}-media-analysis-*/*`,
+      ],
     }));
 
     // Grant Polly permissions for voice-over synthesis
