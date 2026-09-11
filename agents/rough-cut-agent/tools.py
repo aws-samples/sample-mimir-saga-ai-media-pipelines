@@ -1012,12 +1012,16 @@ def _associate_clips_with_story(saga_url: str, headers: dict, story_id: str,
                 # 2xx = created; 409 = already associated (idempotent).
                 associated += 1
             else:
-                msg = f"asset {item_id}: HTTP {resp.status_code} {resp.text[:120]}"
+                # Log only the status code — never resp.text or the raw request
+                # exception, which can echo the (secret-sourced) Saga URL.
+                msg = f"asset {item_id}: HTTP {resp.status_code}"
                 logger.warning(f"Clip association failed — {msg}")
                 if first_error is None:
                     first_error = msg
         except Exception as e:
-            msg = f"asset {item_id}: {e}"
+            # Log the exception TYPE only; str(e) from requests can include the
+            # full URL (sourced from Secrets Manager).
+            msg = f"asset {item_id}: {type(e).__name__}"
             logger.warning(f"Clip association error — {msg}")
             if first_error is None:
                 first_error = msg
@@ -1135,7 +1139,7 @@ def create_or_update_linear_instance(story_id: str, script_sections_json: str,
                 story_json = story_resp.json()
                 story_title = story_json.get("mTitle") or story_json.get("title") or ""
         except Exception as e:
-            logger.warning(f"Could not fetch story title for instance: {e}")
+            logger.warning(f"Could not fetch story title for instance: {type(e).__name__}")
 
         create_url = f"{saga_url}/stories/{story_id}/instances"
         create_payload = {
