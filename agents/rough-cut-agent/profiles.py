@@ -200,6 +200,11 @@ ROUGH_CUT_PROFILES = {
     "vosot": {
         "label": "Generate VOSOT",
         "timeline_suffix": "VOSOT",
+        # VOSOT produces TWO linear instances so the anchor can start the SOT on
+        # their own timing: "<story> - VOSOT VO" (VO + nat sound) and
+        # "<story> - VOSOT SOT" (the soundbite(s)). ("<story> - VO" is reserved
+        # for the plain Generate VO action.)
+        "split_vo_sot": True,
         "synthesize_voiceover": False,
         "include_sot": True,
         "shot": _shot_config(),
