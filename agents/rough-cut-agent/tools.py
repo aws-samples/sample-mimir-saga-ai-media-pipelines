@@ -1100,10 +1100,19 @@ def _associate_clips_with_story(saga_url: str, headers: dict, story_id: str,
 
 @tool
 def create_or_update_linear_instance(story_id: str, script_sections_json: str,
-                                     clip_item_ids_json: str = None) -> str:
+                                     clip_item_ids_json: str = None,
+                                     instance_title: str = None) -> str:
     """Create or update an unassigned linear instance for a Saga story with the generated script.
 
-    Checks for an existing unassigned linear instance. If none exists, creates one.
+    IDEMPOTENT per action: when ``instance_title`` is given (e.g.
+    "<story> - VO"), we reuse ONLY an existing unassigned org-scoped linear
+    instance with that exact title and update it in place — so re-running the
+    same action updates its own instance rather than creating a duplicate, and
+    different actions (VO / AI VO / VOSOT / Package) never collide because each
+    owns a distinctly-titled instance. If no matching instance exists, one is
+    created with that title. When ``instance_title`` is omitted, the legacy
+    behavior applies (reuse the first unassigned org-scoped linear instance).
+
     Then updates the instance content with the formatted script in Slate format.
     Finally, associates the selected rendered clips with the story so a producer
     reviewing the unassigned instance sees the media backing the script.
@@ -1124,6 +1133,8 @@ def create_or_update_linear_instance(story_id: str, script_sections_json: str,
         clip_item_ids_json: Optional JSON array of Mimir item IDs for the
             selected rendered clips to associate with the story. When omitted or
             empty, no clip association is attempted.
+        instance_title: Optional exact title for the instance (e.g.
+            "<story> - VO"). Drives idempotent, per-action find-or-create.
 
     Returns:
         JSON string with ``instanceId``, ``sectionsWritten``, ``created``,
@@ -1165,6 +1176,11 @@ def create_or_update_linear_instance(story_id: str, script_sections_json: str,
     def _is_org_scoped(inst_id):
         return isinstance(inst_id, str) and "-INS-" in inst_id
 
+    # Title-aware matching makes re-runs idempotent PER ACTION: with a title we
+    # reuse only the instance carrying that exact title (case-insensitive), and
+    # skip other unassigned instances so distinct actions never clobber each
+    # other. Without a title, fall back to the first unassigned org-scoped one.
+    want_title = (instance_title or "").strip().lower()
     target_instance_id = None
     for inst in instances:
         platform = (
@@ -1175,14 +1191,23 @@ def create_or_update_linear_instance(story_id: str, script_sections_json: str,
         account = (inst.get("platformInfo") or {}).get("account") or {}
         is_unassigned = not account.get("accountId")
         inst_id = inst.get("id") or inst.get("mId")
-        if platform == "linear" and is_unassigned and _is_org_scoped(inst_id):
-            target_instance_id = inst_id
-            # Log the (untrusted, non-secret) story id for correlation rather
-            # than the instance id, which is derived from a Saga API response
-            # reached via a Secrets-Manager-sourced URL (CodeQL treats such
-            # response-derived values as secret-tainted).
-            logger.info(f"Found existing unassigned org-scoped linear instance for story {story_id}")
-            break
+        inst_title = (inst.get("title") or inst.get("mTitle") or "").strip().lower()
+        if not (platform == "linear" and is_unassigned and _is_org_scoped(inst_id)):
+            continue
+        if want_title and inst_title != want_title:
+            # A different action's instance — leave it untouched.
+            continue
+        target_instance_id = inst_id
+        # Log the (untrusted, non-secret) story id for correlation rather than
+        # the instance id, which is derived from a Saga API response reached via
+        # a Secrets-Manager-sourced URL (CodeQL treats response-derived values
+        # as secret-tainted).
+        logger.info(
+            f"Reusing existing unassigned linear instance"
+            f"{' titled ' + repr(instance_title) if want_title else ''} "
+            f"for story {story_id} (idempotent re-run)"
+        )
+        break
 
     if target_instance_id:
         # Step 3a: Update the existing instance's content via PATCH.
@@ -1217,7 +1242,7 @@ def create_or_update_linear_instance(story_id: str, script_sections_json: str,
 
         create_url = f"{saga_url}/stories/{story_id}/instances"
         create_payload = {
-            "title": story_title or "Rough Cut",
+            "title": instance_title or story_title or "Rough Cut",
             "state": "todo",
             "platformInfo": {
                 "platform": "linear",

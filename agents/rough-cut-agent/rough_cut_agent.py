@@ -2957,10 +2957,15 @@ def invoke(payload):
                         clip_item_ids.append(cid)
 
             import json as _json
+            # Title the instance per action (e.g. "<story> - VO") so re-running
+            # the same action updates its own instance (idempotent) and distinct
+            # actions never collide. Mirrors the timeline naming suffix.
+            instance_title = f"{story_title} - {profile.get('timeline_suffix', 'VO')}"
             instance_result_json = create_or_update_linear_instance(
                 story_id=story_id,
                 script_sections_json=_json.dumps(script_sections),
                 clip_item_ids_json=_json.dumps(clip_item_ids),
+                instance_title=instance_title,
             )
             instance_result = json.loads(instance_result_json)
             instance_status = instance_result.get("status", "unknown")
