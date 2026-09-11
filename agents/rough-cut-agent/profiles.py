@@ -29,7 +29,7 @@ tune them per deployment without a code change.
 
 import os
 
-DEFAULT_ROUGH_CUT_TYPE = "full"
+DEFAULT_ROUGH_CUT_TYPE = "ai-vo"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -169,10 +169,11 @@ def _vo_timeline_directive(shot: dict, with_sot: bool, synth: bool = True) -> st
 
 
 ROUGH_CUT_PROFILES = {
-    # Original behavior — no extra constraints, AI voice-over ON (legacy
-    # "Generate Rough Cut"). Left untouched for backward compatibility.
-    "full": {
-        "label": "Full Package",
+    # Generate Package — the full rough cut: script + B-roll + SOT + AI voice,
+    # unconstrained (no VO-only / 30s-cap directives). This is the "Package"
+    # custom action (the original full rough-cut behavior).
+    "package": {
+        "label": "Generate Package",
         "timeline_suffix": "Package",
         "synthesize_voiceover": True,
         "include_sot": True,
@@ -225,17 +226,9 @@ ROUGH_CUT_PROFILES = {
     },
 }
 
-# Backward-compatibility alias: the original "Simple VO" custom action /
-# route (rough-cut-simple-vo) synthesized an AI voice-over, i.e. it behaved as
-# what is now "Generate AI VO". Preserve that mapping so the existing route and
-# any callers keep working unchanged.
-ROUGH_CUT_PROFILES["simple-vo"] = dict(
-    ROUGH_CUT_PROFILES["ai-vo"], label="Simple VO (AI VO)"
-)
-
 
 def get_profile(rough_cut_type):
-    """Return the profile dict for *rough_cut_type*, defaulting to ``full``."""
+    """Return the profile dict for *rough_cut_type*, defaulting to ``ai-vo``."""
     if not rough_cut_type:
         rough_cut_type = DEFAULT_ROUGH_CUT_TYPE
     return ROUGH_CUT_PROFILES.get(

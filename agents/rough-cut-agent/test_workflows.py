@@ -59,17 +59,21 @@ class TestProfiles:
         p = profiles.get_profile("ai-vo")
         assert p["synthesize_voiceover"] is True
 
-    def test_simple_vo_is_backward_compat_alias_for_ai_vo(self):
-        # The original Simple VO action synthesized a voice — preserve that.
-        assert profiles.get_profile("simple-vo")["synthesize_voiceover"] is True
-
-    def test_full_profile_unchanged_defaults(self):
-        p = profiles.get_profile("full")
+    def test_package_profile_is_full_rough_cut(self):
+        p = profiles.get_profile("package")
         assert p["synthesize_voiceover"] is True
         assert p["include_sot"] is True
+        assert p["timeline_suffix"] == "Package"
 
-    def test_unknown_type_falls_back_to_full(self):
-        assert profiles.get_profile("nope")["label"] == profiles.get_profile("full")["label"]
+    def test_simple_vo_and_full_keys_retired(self):
+        # simple-vo (dead alias) and the old 'full' key are gone; the full
+        # rough cut is now keyed 'package'.
+        assert "simple-vo" not in profiles.ROUGH_CUT_PROFILES
+        assert "full" not in profiles.ROUGH_CUT_PROFILES
+
+    def test_unknown_type_falls_back_to_default_ai_vo(self):
+        assert profiles.DEFAULT_ROUGH_CUT_TYPE == "ai-vo"
+        assert profiles.get_profile("nope")["label"] == profiles.get_profile("ai-vo")["label"]
 
     def test_editorial_duration_defaults(self):
         shot = profiles.get_profile("vo")["shot"]
@@ -217,9 +221,7 @@ class TestVoiceoverGating:
         assert types == ["pkg_vo", "pkg_nats"]
         assert passed["soundbites"] == []
 
-    def test_simple_vo_alias_still_synthesizes(self):
-        _, m = _run_invoke("simple-vo")
-        m["_synthesize_voiceovers"].assert_called_once()
+
 
 
 # ---------------------------------------------------------------------------
