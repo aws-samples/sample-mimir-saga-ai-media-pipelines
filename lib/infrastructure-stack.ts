@@ -846,34 +846,25 @@ export class InfrastructureStack extends cdk.Stack {
     mimirApiKeySecret.grantRead(sagaActionHandler);
     sagaActionsApiKeySecret.grantRead(sagaActionHandler);
 
-    const roughCutResource = actionsResource.addResource('rough-cut');
-    roughCutResource.addMethod('POST', new apigateway.LambdaIntegration(sagaActionHandler));
-
-    // The rough-cut VARIANTS below all run the SAME rough-cut state machine and
-    // agent; saga-action-handler maps each path to a distinct roughCutType,
-    // which selects the agent's prompt/constraint profile. Keeping them as
-    // separate routes lets Saga expose them as distinct custom actions.
+    // The three rough-cut actions all run the SAME state machine and agent;
+    // saga-action-handler maps each path to a distinct roughCutType, which
+    // selects the agent's prompt/constraint profile. Separate routes let Saga
+    // expose them as distinct custom actions.
     //
-    // POST /actions/rough-cut-vo — Generate VO: script + B-roll for linear TV,
+    // POST /actions/generate-vo — Generate VO: script + B-roll for linear TV,
     // where an anchor reads the script live. NEVER synthesizes an AI voice.
-    const roughCutVoResource = actionsResource.addResource('rough-cut-vo');
-    roughCutVoResource.addMethod('POST', new apigateway.LambdaIntegration(sagaActionHandler));
+    const generateVoResource = actionsResource.addResource('generate-vo');
+    generateVoResource.addMethod('POST', new apigateway.LambdaIntegration(sagaActionHandler));
 
-    // POST /actions/rough-cut-vosot — Generate VOSOT: VO plus sound-on-tape
+    // POST /actions/generate-vosot — Generate VOSOT: VO plus sound-on-tape
     // interview clips and preserved natural sound (anchor reads VO live).
-    const roughCutVosotResource = actionsResource.addResource('rough-cut-vosot');
-    roughCutVosotResource.addMethod('POST', new apigateway.LambdaIntegration(sagaActionHandler));
+    const generateVosotResource = actionsResource.addResource('generate-vosot');
+    generateVosotResource.addMethod('POST', new apigateway.LambdaIntegration(sagaActionHandler));
 
-    // POST /actions/rough-cut-ai-vo — Generate AI VO: reporter-driven
+    // POST /actions/generate-ai-vo — Generate AI VO: reporter-driven
     // digital/social workflow that DOES synthesize narration (Polly).
-    const roughCutAiVoResource = actionsResource.addResource('rough-cut-ai-vo');
-    roughCutAiVoResource.addMethod('POST', new apigateway.LambdaIntegration(sagaActionHandler));
-
-    // POST /actions/rough-cut-simple-vo endpoint — BACKWARD-COMPAT alias for the
-    // original "Simple VO" action, which synthesized an AI voice (i.e. it maps
-    // to roughCutType="simple-vo", now equivalent to Generate AI VO).
-    const roughCutSimpleVoResource = actionsResource.addResource('rough-cut-simple-vo');
-    roughCutSimpleVoResource.addMethod('POST', new apigateway.LambdaIntegration(sagaActionHandler));
+    const generateAiVoResource = actionsResource.addResource('generate-ai-vo');
+    generateAiVoResource.addMethod('POST', new apigateway.LambdaIntegration(sagaActionHandler));
 
     // Mimir Webhooks API Gateway
     const webhookApiLogGroup = new logs.LogGroup(this, 'MimirWebhooksApiLogs', { retention: logs.RetentionDays.ONE_MONTH });
@@ -1075,7 +1066,7 @@ export class InfrastructureStack extends cdk.Stack {
             "story": "{% $states.input.story %}",
             "triggeredByUserId": "{% $states.input.triggeredByUserId %}",
             "mimirApiKey": "{% $states.input.mimirApiKey %}",
-            "roughCutType": "{% $states.input.roughCutType ? $states.input.roughCutType : 'full' %}"
+            "roughCutType": "{% $states.input.roughCutType ? $states.input.roughCutType : 'ai-vo' %}"
           },
           "Catch": [
             {
@@ -3679,23 +3670,18 @@ export class InfrastructureStack extends cdk.Stack {
       description: 'Step Functions state machine for rough cut timeline generation',
     });
 
-    new cdk.CfnOutput(this, 'RoughCutEndpoint', {
-      value: api.url + 'actions/rough-cut',
-      description: 'Mimir Rough Cut Custom Action Endpoint URL',
-    });
-
     new cdk.CfnOutput(this, 'GenerateVoEndpoint', {
-      value: api.url + 'actions/rough-cut-vo',
+      value: api.url + 'actions/generate-vo',
       description: 'Generate VO custom action (script + B-roll, no AI voice)',
     });
 
     new cdk.CfnOutput(this, 'GenerateVosotEndpoint', {
-      value: api.url + 'actions/rough-cut-vosot',
+      value: api.url + 'actions/generate-vosot',
       description: 'Generate VOSOT custom action (VO + SOT interview clips + nat sound)',
     });
 
     new cdk.CfnOutput(this, 'GenerateAiVoEndpoint', {
-      value: api.url + 'actions/rough-cut-ai-vo',
+      value: api.url + 'actions/generate-ai-vo',
       description: 'Generate AI VO custom action (synthesized narration)',
     });
 

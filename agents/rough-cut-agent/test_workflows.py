@@ -59,17 +59,15 @@ class TestProfiles:
         p = profiles.get_profile("ai-vo")
         assert p["synthesize_voiceover"] is True
 
-    def test_simple_vo_is_backward_compat_alias_for_ai_vo(self):
-        # The original Simple VO action synthesized a voice — preserve that.
-        assert profiles.get_profile("simple-vo")["synthesize_voiceover"] is True
+    def test_retired_profiles_are_gone(self):
+        # full / simple-vo were retired (no backward-compat). Unknown types fall
+        # back to the default (ai-vo).
+        assert "full" not in profiles.ROUGH_CUT_PROFILES
+        assert "simple-vo" not in profiles.ROUGH_CUT_PROFILES
 
-    def test_full_profile_unchanged_defaults(self):
-        p = profiles.get_profile("full")
-        assert p["synthesize_voiceover"] is True
-        assert p["include_sot"] is True
-
-    def test_unknown_type_falls_back_to_full(self):
-        assert profiles.get_profile("nope")["label"] == profiles.get_profile("full")["label"]
+    def test_unknown_type_falls_back_to_default_ai_vo(self):
+        assert profiles.DEFAULT_ROUGH_CUT_TYPE == "ai-vo"
+        assert profiles.get_profile("nope")["label"] == profiles.get_profile("ai-vo")["label"]
 
     def test_editorial_duration_defaults(self):
         shot = profiles.get_profile("vo")["shot"]
@@ -217,9 +215,7 @@ class TestVoiceoverGating:
         assert types == ["pkg_vo", "pkg_nats"]
         assert passed["soundbites"] == []
 
-    def test_simple_vo_alias_still_synthesizes(self):
-        _, m = _run_invoke("simple-vo")
-        m["_synthesize_voiceovers"].assert_called_once()
+
 
 
 # ---------------------------------------------------------------------------
