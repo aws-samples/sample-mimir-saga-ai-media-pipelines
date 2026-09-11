@@ -1107,7 +1107,11 @@ def create_or_update_linear_instance(story_id: str, script_sections_json: str,
         inst_id = inst.get("id") or inst.get("mId")
         if platform == "linear" and is_unassigned and _is_org_scoped(inst_id):
             target_instance_id = inst_id
-            logger.info(f"Found existing unassigned org-scoped linear instance: {target_instance_id}")
+            # Log the (untrusted, non-secret) story id for correlation rather
+            # than the instance id, which is derived from a Saga API response
+            # reached via a Secrets-Manager-sourced URL (CodeQL treats such
+            # response-derived values as secret-tainted).
+            logger.info(f"Found existing unassigned org-scoped linear instance for story {story_id}")
             break
 
     if target_instance_id:
@@ -1119,7 +1123,7 @@ def create_or_update_linear_instance(story_id: str, script_sections_json: str,
         patch_resp.raise_for_status()
         was_created = False
         logger.info(
-            f"Updated existing linear instance {target_instance_id} with "
+            f"Updated existing unassigned linear instance for story {story_id} with "
             f"{len(script_sections)} script sections"
         )
     else:
@@ -1165,7 +1169,7 @@ def create_or_update_linear_instance(story_id: str, script_sections_json: str,
             return json.dumps({"error": "Failed to create a linear instance",
                                "status": "error"})
         was_created = True
-        logger.info(f"Created new unassigned linear instance: {target_instance_id}")
+        logger.info(f"Created new unassigned linear instance for story {story_id}")
 
     # Step 4: Associate the selected rendered clips with the story (best-effort).
     # The instance/script write already succeeded above; clip association is a
@@ -1187,12 +1191,12 @@ def create_or_update_linear_instance(story_id: str, script_sections_json: str,
             result["status"] = "partial_success"
             result["clipAssociationError"] = assoc_error
             logger.warning(
-                f"Linear instance {target_instance_id}: script written but clip "
+                f"Story {story_id}: script written to instance but clip "
                 f"association partial ({associated}/{len(clip_item_ids)}): {assoc_error}"
             )
         else:
             logger.info(
-                f"Linear instance {target_instance_id}: {associated}/{len(clip_item_ids)} "
+                f"Story {story_id}: {associated}/{len(clip_item_ids)} "
                 f"clips associated with story"
             )
     return json.dumps(result)

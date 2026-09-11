@@ -2968,14 +2968,14 @@ def invoke(payload):
             }
             if instance_status == "partial_success":
                 logger.warning(
-                    f"Stage 4 PARTIAL: instance {instance_result.get('instanceId')} created "
+                    f"Stage 4 PARTIAL for story {story_id}: instance created "
                     f"and script written, but clip association failed "
                     f"({instance_result.get('clipsAssociated', 0)}/{len(clip_item_ids)} associated): "
                     f"{instance_result.get('clipAssociationError')}"
                 )
             else:
                 logger.info(
-                    f"Stage 4: Script written to instance {instance_result.get('instanceId')} "
+                    f"Stage 4: Script written to instance for story {story_id} "
                     f"({len(script_sections)} sections, "
                     f"{instance_result.get('clipsAssociated', 0)}/{len(clip_item_ids)} clips associated)"
                 )
