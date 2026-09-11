@@ -568,3 +568,73 @@ class TestBrollEligibility:
     def test_returns_none_without_staging_bucket(self, monkeypatch):
         monkeypatch.delenv("TRANSCRIPT_STAGING_BUCKET", raising=False)
         assert rca._broll_eligible_item_ids([{"mimirItemId": "x", "hasEmbeddings": True}]) is None
+
+
+# ---------------------------------------------------------------------------
+# PKG VO cue sanitization for TTS (P1.3) + nat-sound gain (verify #1)
+# ---------------------------------------------------------------------------
+
+class TestTtsSanitize:
+    def test_strips_leading_cue_labels(self):
+        assert tools.sanitize_for_tts("PKG VO: OWNER SAYS SHE POURED HER HEART IN.") == \
+            "OWNER SAYS SHE POURED HER HEART IN."
+        assert tools.sanitize_for_tts("SOT: I am proud of what we built.") == \
+            "I am proud of what we built."
+        assert tools.sanitize_for_tts("NAT SOUND: crowd cheering") == "crowd cheering"
+
+    def test_drops_standalone_cue_lines(self):
+        assert tools.sanitize_for_tts("PKG VO") == ""
+        assert tools.sanitize_for_tts("STANDUP") == ""
+
+    def test_removes_bracketed_directions(self):
+        assert tools.sanitize_for_tts("((---PKG---)) IT'S THE LAST DANCE.") == "IT'S THE LAST DANCE."
+        assert tools.sanitize_for_tts("((nats))") == ""
+        assert tools.sanitize_for_tts("IN HERSHEY, I'M JASMINE (NAT POP)") == "IN HERSHEY, I'M JASMINE"
+
+    def test_preserves_real_words_that_look_like_cues(self):
+        # ALL CAPS narration is normal in broadcast — never strip for case alone.
+        assert tools.sanitize_for_tts("TONIGHT: THE COMMUNITY MOURNS A HERO.") == \
+            "TONIGHT: THE COMMUNITY MOURNS A HERO."
+        # "LIVE" as a real word (no colon) must survive.
+        assert tools.sanitize_for_tts("LIVE FROM THE SCENE, THE ROAD IS CLOSED.") == \
+            "LIVE FROM THE SCENE, THE ROAD IS CLOSED."
+
+    def test_empty_when_all_cues(self):
+        assert tools.sanitize_for_tts("((nats))\nPKG VO") == ""
+
+
+def _all_gain_denominators(payload):
+    """Collect every audio gainMultiplier denominator in a timeline payload."""
+    dens = []
+    for track in payload.get("audioTracks", []):
+        for box in track:
+            gm = box.get("gainMultiplier") if isinstance(box, dict) else None
+            if gm:
+                dens.append(gm.get("denominator"))
+    return dens
+
+
+class TestNatSoundGain:
+    def test_constant_is_10_percent(self):
+        assert tools.NAT_SOUND_GAIN == (1, 10)
+
+    def test_broll_cover_audio_is_one_tenth_not_one_fifth(self):
+        seq = {
+            "tracks": [
+                {"id": 1, "mediaType": "video", "name": "V1", "clips": [
+                    {"mimirItemId": "broll-1", "start": 0, "inPoint": 0, "outPoint": 4000,
+                     "brollCover": True},
+                ]},
+                {"id": 2, "mediaType": "video", "name": "V2", "clips": [
+                    {"mimirItemId": "broll-2", "start": 0, "inPoint": 0, "outPoint": 4000},
+                ]},
+                {"id": 3, "mediaType": "audio", "name": "A1", "clips": []},
+                {"id": 4, "mediaType": "audio", "name": "A2", "clips": []},
+            ]
+        }
+        cache = {"broll-1": 60, "broll-2": 60}
+        _, _, payload, _ = tools._build_multitrack_timeline_payload(seq, cache)
+        dens = _all_gain_denominators(payload)
+        assert dens, "expected some audio gains"
+        assert 5 not in dens, "nat sound must no longer be 1/5 (20%)"
+        assert 10 in dens, "nat sound cover should be 1/10 (10%)"

@@ -7,6 +7,7 @@ and S3 Vector Index. Credentials are retrieved from Secrets Manager at module lo
 import json
 import logging
 import os
+import re
 
 import boto3
 import requests
@@ -23,6 +24,68 @@ _s3vectors_client = boto3.client("s3vectors")
 MIMIR_BASE_URL = os.environ.get("MIMIR_API_BASE", "https://us.mjoll.no")
 EMBEDDING_MODEL_ID = "amazon.nova-2-multimodal-embeddings-v1:0"
 EMBEDDING_DIMENSION = 1024
+
+# Nat sound (B-roll cover audio) is mixed LOW under the voice-over. Ernie's
+# editorial spec is ~10% (1/10). Env-overridable via NAT_SOUND_GAIN_DENOMINATOR.
+_NAT_GAIN_DEN = int(os.environ.get("NAT_SOUND_GAIN_DENOMINATOR", "10") or "10")
+NAT_SOUND_GAIN = (1, _NAT_GAIN_DEN if _NAT_GAIN_DEN > 0 else 10)
+
+# ---------------------------------------------------------------------------
+# Text-to-speech sanitization
+# ---------------------------------------------------------------------------
+# Newsroom scripts embed production cues and slug lines that humans must SEE in
+# the SAGA instance but that must NEVER be spoken by the AI voice. Broadcast VO
+# is written in ALL CAPS, so we must NOT strip lines merely for being uppercase
+# — only known cue tokens, cue labels, and bracketed directions are removed.
+
+# Cue labels that prefix a script line, e.g. "PKG VO: ...". Matched at line
+# start and ONLY when followed by a colon, so real words ("LIVE FROM THE
+# SCENE...") are never stripped. Longer labels first so they match greedily.
+_TTS_CUE_LABELS = sorted([
+    "pkg vo", "pkg sot", "pkg nats", "pkg", "vo/sot", "vosot", "vo",
+    "sot", "nats", "nat sound", "nat", "anchor q&a", "anchor", "on cam",
+    "oncam", "reporter", "stand up", "standup", "live tag", "live", "tag",
+    "super", "cg", "font", "wrap", "lead", "toss",
+], key=len, reverse=True)
+_TTS_LABEL_RE = re.compile(
+    r"^\s*(?:" + "|".join(re.escape(l) for l in _TTS_CUE_LABELS) + r")\s*:\s*",
+    re.IGNORECASE,
+)
+# Standalone cue lines (no colon) that are ONLY a cue token, e.g. a line that
+# is just "PKG VO" or "STANDUP". Compared against the same vocabulary.
+_TTS_CUE_TOKENS = {re.sub(r"[^a-z0-9 ]", "", l).strip() for l in _TTS_CUE_LABELS}
+# Bracketed production directions: (( )), [[ ]], [ ], ( ). In broadcast VO these
+# are non-spoken directions (e.g. "((nats))", "(NAT POP)", "[SOT full]").
+_TTS_BRACKET_RE = re.compile(r"\(\(.*?\)\)|\[\[.*?\]\]|\[.*?\]|\(.*?\)", re.DOTALL)
+
+
+def sanitize_for_tts(text: str) -> str:
+    """Strip newsroom production cues/slugs from *text* before TTS.
+
+    Removes bracketed directions ((( )), [[ ]], [ ], ( )), leading cue labels
+    (``PKG VO:``, ``ANCHOR:``, ``SOT:``, ``NATS:`` …), and standalone cue-only
+    lines (``PKG VO``, ``STANDUP`` …). Never strips a line just for being
+    ALL CAPS (broadcast VO is written that way). This is applied ONLY to the
+    text sent to the AI voice — the script written to the SAGA instance keeps
+    all cues intact for producers/anchors.
+
+    Returns the cleaned, single-spaced text (may be empty if the input was
+    entirely cues).
+    """
+    if not text:
+        return ""
+    cleaned = _TTS_BRACKET_RE.sub(" ", text)
+    kept = []
+    for line in cleaned.splitlines():
+        line = _TTS_LABEL_RE.sub("", line)  # drop a leading "LABEL:" prefix
+        norm = re.sub(r"[^a-z0-9 ]", " ", line.lower())
+        norm = re.sub(r"\s+", " ", norm).strip()
+        if not norm:
+            continue
+        if norm in _TTS_CUE_TOKENS:  # whole line was just a cue token
+            continue
+        kept.append(line.strip())
+    return re.sub(r"\s+", " ", " ".join(kept)).strip()
 
 # --- Module-level credential cache ---
 _secret_cache: dict[str, str] = {}
@@ -403,9 +466,9 @@ def _build_multitrack_timeline_payload(sequence_details, item_details_cache):
 
         # Emit audio clips for each channel on V1's dedicated audio tracks.
         # SOT/interview clips play at full gain. B-roll cover clips (filling
-        # the VO-led spans that keep V1 gapless) play at 1/5 gain — nat sound
-        # under the voice-over, matching the V2 B-roll audio convention.
-        gain = (1, 5) if clip.get("brollCover") else (1, 1)
+        # the VO-led spans that keep V1 gapless) play at NAT_SOUND_GAIN (~10%) —
+        # nat sound under the voice-over, matching the V2 B-roll audio convention.
+        gain = NAT_SOUND_GAIN if clip.get("brollCover") else (1, 1)
         n_channels = item_refs[mimir_id].get("nAudioChannels", 2)
         for ch in range(n_channels):
             ch_list = v1_audio_ch0 if ch == 0 else v1_audio_ch1
@@ -474,7 +537,8 @@ def _build_multitrack_timeline_payload(sequence_details, item_details_cache):
             ch_list = v2_audio_ch0 if ch == 0 else v2_audio_ch1
             ch_list.append({
                 "type": "audio", "srcId": src_id, "boxId": f"box-a{box_counter}",
-                "channel": ch, "gainMultiplier": {"numerator": 1, "denominator": 5},
+                "channel": ch,
+                "gainMultiplier": {"numerator": NAT_SOUND_GAIN[0], "denominator": NAT_SOUND_GAIN[1]},
                 "controlPoints": [], "name": None,
             })
             box_counter += 1
@@ -818,13 +882,19 @@ def generate_voiceover(text: str, story_id: str, section_index: int) -> str:
         logger.error("TRANSCRIPT_STAGING_BUCKET environment variable is not set")
         return json.dumps({"error": "TRANSCRIPT_STAGING_BUCKET not configured", "sectionIndex": section_index})
 
+    # Strip newsroom production cues so the AI voice never speaks them.
+    spoken_text = sanitize_for_tts(text)
+    if not spoken_text:
+        logger.warning(f"Section {section_index} was entirely cues — nothing to synthesize")
+        return json.dumps({"error": "No speakable text after cue sanitization", "sectionIndex": section_index})
+
     s3_key = f"voiceover/{story_id}/{section_index}.mp3"
     logger.info(f"Generating voiceover for story {story_id}, section {section_index} with voice {voice_id}")
 
     try:
         polly_client = boto3.client("polly")
         response = polly_client.synthesize_speech(
-            Text=text,
+            Text=spoken_text,
             OutputFormat="mp3",
             Engine="neural",
             VoiceId=voice_id,

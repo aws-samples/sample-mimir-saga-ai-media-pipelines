@@ -3,7 +3,7 @@ from strands import Agent
 from strands.models import BedrockModel
 from prompts import SCRIPT_ANALYSIS_PROMPT, SOURCE_MATERIAL_PROMPT, TIMELINE_ASSEMBLY_PROMPT
 from profiles import get_profile, DEFAULT_ROUGH_CUT_TYPE
-from tools import get_transcript, get_generated_transcript, query_embeddings, get_mimir_item_details, create_timeline, update_story_status, get_word_timing, generate_voiceover, upload_voiceover_to_mimir, create_or_update_linear_instance, _build_linear_instance_slate
+from tools import get_transcript, get_generated_transcript, query_embeddings, get_mimir_item_details, create_timeline, update_story_status, get_word_timing, generate_voiceover, upload_voiceover_to_mimir, create_or_update_linear_instance, _build_linear_instance_slate, sanitize_for_tts
 import json
 import logging
 import os
@@ -1242,13 +1242,21 @@ def _synthesize_voiceovers(
         if not text:
             continue
 
+        # Strip newsroom production cues/slugs (e.g. "PKG VO:", "((nats))") from
+        # the text sent to Polly ONLY. The full script — cues included — is
+        # still written to the SAGA instance for producers/anchors to read.
+        spoken_text = sanitize_for_tts(text)
+        if not spoken_text:
+            logger.info(f"VO section {section_key}: only production cues, nothing to synthesize — skipping")
+            continue
+
         logger.info(f"Synthesizing Polly VO for section {section_key}")
 
         try:
             # 1. Call Polly
             polly = boto3.client("polly")
             polly_resp = polly.synthesize_speech(
-                Text=text,
+                Text=spoken_text,
                 OutputFormat="mp3",
                 Engine="neural",
                 VoiceId=voice_id,
