@@ -1684,6 +1684,37 @@ def _fill_spans(spans: list, candidate_pool: list, used_segments: set,
     return filled
 
 
+def _broll_eligible_item_ids(enriched_assets, max_words=50):
+    """Return the item IDs that are true B-roll cover — clips with little or no
+    speech — excluding interview / standup / soundbite footage whose audio (and
+    on-camera talking head) doesn't belong under a live-read voice-over.
+
+    Classification uses the generated transcript word count in the staging
+    bucket: a clip with fewer than *max_words* words (or no transcript at all)
+    is cover-eligible; anything wordier is treated as a talking-head/interview
+    clip and excluded. Returns None when transcripts can't be read (no staging
+    bucket), signalling the caller to fall back to all clips.
+    """
+    staging = os.environ.get("TRANSCRIPT_STAGING_BUCKET", "")
+    if not staging:
+        return None
+    s3 = boto3.client("s3")
+    eligible = []
+    for a in enriched_assets:
+        mid = a.get("mimirItemId", "")
+        if not mid or not a.get("hasEmbeddings"):
+            continue
+        try:
+            resp = s3.get_object(Bucket=staging, Key=f"transcripts/{mid}/transcript.json")
+            word_count = len(json.loads(resp["Body"].read()).get("fullTranscript", "").split())
+            if word_count < max_words:
+                eligible.append(mid)
+        except Exception:
+            # No transcript on file → almost certainly B-roll cover.
+            eligible.append(mid)
+    return eligible
+
+
 def _query_broll_candidates(bedrock, s3vectors_client, vector_bucket, index_name,
                             item_ids, query_text, strict_cache, usable_cache,
                             min_shot_s, top_k=12):
@@ -1762,9 +1793,25 @@ def _fill_v1_per_section(script_analysis, total_ms, enriched_assets, shot_config
     index_name = os.environ.get("VECTOR_INDEX_NAME", "")
     if not vector_bucket or not index_name:
         return None
-    item_ids = [a["mimirItemId"] for a in enriched_assets if a.get("hasEmbeddings")]
-    if not item_ids:
+    all_item_ids = [a["mimirItemId"] for a in enriched_assets if a.get("hasEmbeddings")]
+    if not all_item_ids:
         return None
+
+    # Restrict cover to true B-roll (low/no speech) so a live-read VO never gets
+    # an interview/standup "talking head" as cover. Fall back to all clips when
+    # classification is unavailable or leaves too few options.
+    broll_ids = _broll_eligible_item_ids(enriched_assets)
+    if broll_ids is not None and len(broll_ids) >= 3:
+        item_ids = broll_ids
+        logger.info(
+            f"VO cover pool restricted to {len(item_ids)}/{len(all_item_ids)} "
+            f"B-roll-eligible clips (excluding interview/standup footage)")
+    else:
+        item_ids = all_item_ids
+        if broll_ids is not None:
+            logger.info(
+                f"Only {len(broll_ids)} B-roll-eligible clip(s) (<3) — using all "
+                f"{len(all_item_ids)} clips for VO cover")
 
     bedrock = boto3.client("bedrock-runtime")
     s3vectors_client = boto3.client("s3vectors")
@@ -2090,6 +2137,7 @@ def run_timeline_assembly(
     profile_directive: str = "",
     shot_config: dict = None,
     synthesize_voiceover: bool = True,
+    timeline_label: str = "Rough Cut",
 ) -> dict:
     """Assemble a rough cut timeline and create it in Mimir.
 
@@ -2243,7 +2291,7 @@ def run_timeline_assembly(
         # sequenceDetails itemRefs directly.
 
         timeline_result_json = create_timeline(
-            title=f"{story_title} - Rough Cut",
+            title=f"{story_title} - {timeline_label}",
             sequence_details_json=json.dumps(assembly.get("sequenceDetails", {})),
             parent_item_ids=parent_ids,
             folder_id=folder_id,
@@ -2868,6 +2916,7 @@ def invoke(payload):
             profile_directive=profile["timeline_directive"],
             shot_config=profile["shot"],
             synthesize_voiceover=profile.get("synthesize_voiceover", True),
+            timeline_label=profile.get("timeline_suffix", profile["label"]),
         )
 
         # --- Stage 4: Write script to a new unassigned Saga linear instance ---

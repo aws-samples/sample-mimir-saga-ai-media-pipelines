@@ -173,6 +173,7 @@ ROUGH_CUT_PROFILES = {
     # "Generate Rough Cut"). Left untouched for backward compatibility.
     "full": {
         "label": "Full Package",
+        "timeline_suffix": "Package",
         "synthesize_voiceover": True,
         "include_sot": True,
         "shot": _shot_config(),
@@ -183,6 +184,7 @@ ROUGH_CUT_PROFILES = {
     # anchor reads the script live. NEVER synthesizes an AI voice.
     "vo": {
         "label": "Generate VO",
+        "timeline_suffix": "VO",
         "synthesize_voiceover": False,
         "include_sot": False,
         "shot": _shot_config(),
@@ -196,6 +198,7 @@ ROUGH_CUT_PROFILES = {
     # sound preserved. Anchor reads the VO live, so still NO AI voice.
     "vosot": {
         "label": "Generate VOSOT",
+        "timeline_suffix": "VOSOT",
         "synthesize_voiceover": False,
         "include_sot": True,
         "shot": _shot_config(),
@@ -210,6 +213,7 @@ ROUGH_CUT_PROFILES = {
     # voice on.
     "ai-vo": {
         "label": "Generate AI VO",
+        "timeline_suffix": "AI VO",
         "synthesize_voiceover": True,
         "include_sot": False,
         "shot": _shot_config(),

@@ -530,3 +530,41 @@ class TestVoLengthCap:
         assert max_end <= 30000, f"timeline {max_end}ms exceeds the 30s cap"
         for c in v1["clips"]:
             assert 0 < c["duration"] <= 5000, f"shot {c} violates the 5s ceiling"
+
+
+# ---------------------------------------------------------------------------
+# B-roll eligibility: exclude talking-head / interview footage from VO cover
+# ---------------------------------------------------------------------------
+
+class TestBrollEligibility:
+    def test_excludes_wordy_clips_keeps_broll(self, monkeypatch):
+        monkeypatch.setenv("TRANSCRIPT_STAGING_BUCKET", "staging")
+        transcripts = {
+            "broll-short": {"fullTranscript": "crowd ambient noise"},          # 3 words -> B-roll
+            "interview": {"fullTranscript": " ".join(["word"] * 120)},          # 120 words -> talky
+            "standup": {"fullTranscript": " ".join(["reporter"] * 80)},         # 80 words -> talky
+        }
+
+        class _FakeS3:
+            def get_object(self, Bucket, Key):
+                mid = Key.split("/")[1]
+                if mid == "no-transcript":
+                    raise Exception("NoSuchKey")
+                body = json.dumps(transcripts[mid]).encode()
+                return {"Body": MagicMock(read=lambda: body)}
+
+        monkeypatch.setattr(rca.boto3, "client", lambda name, *a, **k: _FakeS3())
+
+        assets = [
+            {"mimirItemId": "broll-short", "hasEmbeddings": True},
+            {"mimirItemId": "interview", "hasEmbeddings": True},
+            {"mimirItemId": "standup", "hasEmbeddings": True},
+            {"mimirItemId": "no-transcript", "hasEmbeddings": True},
+        ]
+        eligible = rca._broll_eligible_item_ids(assets, max_words=50)
+        assert set(eligible) == {"broll-short", "no-transcript"}
+        assert "interview" not in eligible and "standup" not in eligible
+
+    def test_returns_none_without_staging_bucket(self, monkeypatch):
+        monkeypatch.delenv("TRANSCRIPT_STAGING_BUCKET", raising=False)
+        assert rca._broll_eligible_item_ids([{"mimirItemId": "x", "hasEmbeddings": True}]) is None
