@@ -1932,6 +1932,23 @@ export class InfrastructureStack extends cdk.Stack {
     // Binaries are in layers/ffmpeg/bin/ (gitignored, download separately).
     // Used by the stability-analysis handler (below) and the reframe-custom
     // CMAF/keyframe/tile handlers (later in this stack).
+    //
+    // GUARD: fail synth LOUDLY if the binaries are missing. A prior incident
+    // shipped an empty (674-byte) layer built from just the .gitignore/README,
+    // which made ffprobe/ffmpeg ENOENT at runtime and silently disabled camera
+    // stability analysis. Never publish an empty FFmpeg layer again — run
+    // deploy.sh (which downloads the static build) before `cdk deploy`.
+    for (const bin of ['ffmpeg', 'ffprobe']) {
+      const binPath = path.join('layers', 'ffmpeg', 'bin', bin);
+      if (!require('fs').existsSync(binPath)) {
+        throw new Error(
+          `FFmpeg layer binary missing: ${binPath}. The FFmpeg static build is ` +
+          `not vendored in git — run ./deploy.sh (or the download steps in it) to ` +
+          `populate layers/ffmpeg/bin/ before deploying, so the stability-analysis ` +
+          `handler and CMAF/keyframe/tile handlers get working ffmpeg/ffprobe.`
+        );
+      }
+    }
     const ffmpegLayer = new lambda.LayerVersion(this, 'FfmpegLayer', {
       layerVersionName: 'ffmpeg-static',
       code: lambda.Code.fromAsset('layers/ffmpeg'),
