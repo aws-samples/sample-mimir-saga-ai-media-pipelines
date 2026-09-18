@@ -1606,7 +1606,8 @@ def _stable_only_segments(stability_data: dict, min_span_ms: int = 3000,
 
 def _fill_spans(spans: list, candidate_pool: list, used_segments: set,
                 broll_cover: bool = False, min_clip_ms: int = 3000,
-                target_clip_ms: int = 6000, max_clip_ms: int = None) -> list:
+                target_clip_ms: int = 6000, max_clip_ms: int = None,
+                prev_item_id: str = None) -> list:
     """Fills each (start, end) span with clips from the candidate pool.
 
     Picks unused candidates (deduped on itemId+segmentIndex across both video
@@ -1626,46 +1627,63 @@ def _fill_spans(spans: list, candidate_pool: list, used_segments: set,
     """
     TARGET_CLIP_MS = target_clip_ms
     filled = []
+    # Track the last placed source so two shots from the SAME source clip are
+    # not placed back-to-back (reads as a jump cut) and coverage stays varied.
+    last_item = prev_item_id
     for span_start, span_end in spans:
         position = span_start
         while position < span_end:
             remaining = span_end - position
 
-            def unused():
+            def unused(avoid):
                 for c in candidate_pool:
-                    if (c["itemId"], c["segmentIndex"]) not in used_segments:
-                        yield c, int((c["endTimeSeconds"] - c["startTimeSeconds"]) * 1000)
+                    if (c["itemId"], c["segmentIndex"]) in used_segments:
+                        continue
+                    if avoid is not None and c["itemId"] == avoid:
+                        continue
+                    yield c, int((c["endTimeSeconds"] - c["startTimeSeconds"]) * 1000)
 
-            # Closing move: when one clip can finish the span (remainder within
-            # target + min), prefer the most relevant candidate long enough to
-            # cover it exactly — avoids manufacturing short tail clips. Skipped
-            # when the remainder would exceed the max shot ceiling, so we never
-            # emit an over-length shot just to close a span.
-            best, clip_dur = None, 0
-            if remaining <= TARGET_CLIP_MS + min_clip_ms and (
-                max_clip_ms is None or remaining <= max_clip_ms
-            ):
-                for c, cand_dur in unused():
-                    if cand_dur >= remaining:
-                        best, clip_dur = c, remaining
-                        break
-            # Normal pick: longest-viable candidate at target length. If the
-            # tail this leaves is under min_clip_ms, absorb as much as the
-            # source allows rather than shortening below the minimum.
-            if best is None:
-                for c, cand_dur in unused():
+            def choose(avoid):
+                # Closing move: one clip finishes the span exactly (no tail),
+                # unless the remainder would exceed the max shot ceiling.
+                if remaining <= TARGET_CLIP_MS + min_clip_ms and (
+                    max_clip_ms is None or remaining <= max_clip_ms
+                ):
+                    for c, cand_dur in unused(avoid):
+                        if cand_dur >= remaining:
+                            return c, remaining
+                # Normal pick: longest-viable candidate at target length, then
+                # guard the span tail so we never leave a sub-minimum sliver
+                # (Carl's "1-second clips") — nor exceed the max ceiling.
+                for c, cand_dur in unused(avoid):
                     if cand_dur >= min(min_clip_ms, remaining):
-                        best = c
                         source_dur = cand_dur
-                        clip_dur = min(TARGET_CLIP_MS, remaining, source_dur)
-                        tail = remaining - clip_dur
-                        if 0 < tail < min_clip_ms:
-                            clip_dur = min(remaining, source_dur)
-                        # Enforce the hard shot ceiling (never over-length),
-                        # even if that re-introduces a small tail to fill next.
+                        cd = min(TARGET_CLIP_MS, remaining, source_dur)
                         if max_clip_ms is not None:
-                            clip_dur = min(clip_dur, max_clip_ms)
-                        break
+                            cd = min(cd, max_clip_ms)
+                        if 0 < remaining - cd < min_clip_ms:
+                            if remaining >= 2 * min_clip_ms:
+                                # Rebalance: shorten this shot so the leftover
+                                # tail is itself >= min (both shots land within
+                                # [min, max]) instead of a flash-frame remainder.
+                                cd = remaining - min_clip_ms
+                                if max_clip_ms is not None:
+                                    cd = min(cd, max_clip_ms)
+                                cd = min(cd, source_dur)
+                            elif (source_dur >= remaining
+                                  and (max_clip_ms is None
+                                       or remaining <= max_clip_ms + min_clip_ms)):
+                                # Span too short to split into two >= min shots —
+                                # one slightly-long shot beats a flash frame.
+                                cd = remaining
+                        return c, cd
+                return None, 0
+
+            # Prefer a DIFFERENT source than the previous shot; fall back to
+            # allowing the same source only when nothing else can fill the span.
+            best, clip_dur = choose(last_item)
+            if best is None:
+                best, clip_dur = choose(None)
             if not best:
                 logger.warning(f"B-roll pool exhausted; span covered only to {position}ms of {span_end}ms")
                 break
@@ -1688,6 +1706,7 @@ def _fill_spans(spans: list, candidate_pool: list, used_segments: set,
             if broll_cover:
                 clip["brollCover"] = True
             filled.append(clip)
+            last_item = best["itemId"]
             position += clip_dur
     return filled
 
@@ -1850,6 +1869,7 @@ def _fill_v1_per_section(script_analysis, total_ms, enriched_assets, shot_config
     used = set()
     fillers = []
     pos = 0
+    prev_item = None  # threads the last source across slices to avoid a jump cut on the boundary
     for i, sec in enumerate(sections):
         # Last section absorbs any rounding remainder so V1 reaches total_ms.
         slice_end = total_ms if i == len(sections) - 1 else min(
@@ -1866,13 +1886,15 @@ def _fill_v1_per_section(script_analysis, total_ms, enriched_assets, shot_config
                                if (c["itemId"], c["segmentIndex"]) not in sec_keys]
         seg = _fill_spans([(pos, slice_end)], combined, used, broll_cover=True,
                           min_clip_ms=min_clip_ms, target_clip_ms=target_clip_ms,
-                          max_clip_ms=max_clip_ms)
+                          max_clip_ms=max_clip_ms, prev_item_id=prev_item)
         logger.info(
             f"Per-section cover: {sec.get('sectionType')}_{sec.get('orderIndex')} "
             f"[{pos}-{slice_end}ms] -> {len(seg)} clip(s) "
             f"({len(sec_pool)} section-specific matches)"
         )
         fillers.extend(seg)
+        if seg:
+            prev_item = seg[-1].get("mimirItemId")
         pos = slice_end
     return fillers
 
