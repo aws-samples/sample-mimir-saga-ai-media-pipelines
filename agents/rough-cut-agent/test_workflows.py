@@ -456,6 +456,66 @@ class TestShotDurationConstraints:
 
 
 # ---------------------------------------------------------------------------
+# Shot-grammar guardrails: no sub-minimum slivers, no same-source jump cuts,
+# and no same-source back-to-back placement in the filler.
+# ---------------------------------------------------------------------------
+
+class TestShotGrammarGuardrails:
+    def _pool(self, n=12, seg_len_s=10.0):
+        # n distinct source clips so variety has alternatives to choose from.
+        return [
+            {"itemId": f"i{k}", "segmentIndex": 0,
+             "startTimeSeconds": 0.0, "endTimeSeconds": seg_len_s, "distance": 0.1 + k * 0.001}
+            for k in range(n)
+        ]
+
+    def test_no_sub_minimum_sliver_at_span_tail(self):
+        # A 6s span with 4s target / 5s max / 3s min must NOT become 5s + 1s
+        # (a flash frame). It should split into two >= min shots.
+        filled = rca._fill_spans([(0, 6000)], self._pool(), set(),
+                                 min_clip_ms=3000, target_clip_ms=4000, max_clip_ms=5000)
+        assert filled, "expected the span to be filled"
+        for c in filled:
+            assert c["duration"] >= 3000, f"sub-minimum sliver produced: {[x['duration'] for x in filled]}"
+            assert c["duration"] <= 5000
+        assert sum(c["duration"] for c in filled) == 6000
+
+    def test_no_sliver_across_a_longer_span(self):
+        # 30s / 4s target should never leave a <3s shot anywhere.
+        filled = rca._fill_spans([(0, 30000)], self._pool(n=12), set(),
+                                 min_clip_ms=3000, target_clip_ms=4000, max_clip_ms=5000)
+        assert sum(c["duration"] for c in filled) == 30000
+        assert all(3000 <= c["duration"] <= 5000 for c in filled), \
+            [c["duration"] for c in filled]
+
+    def test_avoids_same_source_back_to_back(self):
+        # Two nearest candidates share a source; the filler must interleave a
+        # different source between them (jump-cut prevention).
+        pool = [
+            {"itemId": "A", "segmentIndex": 0, "startTimeSeconds": 0, "endTimeSeconds": 10, "distance": 0.10},
+            {"itemId": "A", "segmentIndex": 1, "startTimeSeconds": 20, "endTimeSeconds": 30, "distance": 0.11},
+            {"itemId": "B", "segmentIndex": 0, "startTimeSeconds": 0, "endTimeSeconds": 10, "distance": 0.20},
+        ]
+        filled = rca._fill_spans([(0, 12000)], pool, set(),
+                                 min_clip_ms=3000, target_clip_ms=4000, max_clip_ms=5000)
+        ids = [c["mimirItemId"] for c in filled]
+        for a, b in zip(ids, ids[1:]):
+            assert a != b, f"same-source adjacency not avoided: {ids}"
+
+    def test_prev_item_id_avoids_leading_repeat(self):
+        # When the previous span ended on source A, the next span should not
+        # open on A if another source can fill it.
+        pool = [
+            {"itemId": "A", "segmentIndex": 0, "startTimeSeconds": 0, "endTimeSeconds": 10, "distance": 0.10},
+            {"itemId": "B", "segmentIndex": 0, "startTimeSeconds": 0, "endTimeSeconds": 10, "distance": 0.20},
+        ]
+        filled = rca._fill_spans([(0, 4000)], pool, set(),
+                                 min_clip_ms=3000, target_clip_ms=4000, max_clip_ms=5000,
+                                 prev_item_id="A")
+        assert filled[0]["mimirItemId"] == "B"
+
+
+# ---------------------------------------------------------------------------
 # 4. Stability analysis is invoked for Generate VO (requirement 3 stability)
 # ---------------------------------------------------------------------------
 
