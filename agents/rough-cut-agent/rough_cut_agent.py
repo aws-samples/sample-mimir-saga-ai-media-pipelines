@@ -2519,6 +2519,24 @@ def _synthesize_script_from_transcripts(
         return ""
 
 
+# Section-type groups for splitting a VOSOT script into two instances.
+# VO family = spoken-by-anchor lines + natural sound; SOT = interview soundbites.
+_VO_SECTION_TYPES = {"pkg_vo", "pkg_nats", "anchor_intro", "reporter_live", "live_tag", "anchor_qa"}
+_SOT_SECTION_TYPES = {"pkg_sot", "super"}
+
+
+def _sections_subset(script_analysis: dict, keep_types: set) -> dict:
+    """Return a shallow copy of *script_analysis* whose parsedSections is
+    filtered to only the given sectionTypes (used to split VOSOT into a VO
+    instance and a SOT instance)."""
+    subset = dict(script_analysis)
+    subset["parsedSections"] = [
+        s for s in script_analysis.get("parsedSections", [])
+        if s.get("sectionType") in keep_types
+    ]
+    return subset
+
+
 def _build_script_sections_from_analysis(script_analysis: dict) -> list:
     """Convert a ScriptAnalysis parsedSections array into linear instance script sections.
 
@@ -2938,68 +2956,57 @@ def invoke(payload):
         # association fails, we surface a partial-failure status rather than
         # silently reporting success.
         try:
-            logger.info("Stage 4: Writing script to a new unassigned Saga linear instance")
-            script_sections = _build_script_sections_from_analysis(script_analysis)
-            _save_artifact(story_id, "05-script-sections", script_sections, run_id)
-
-            # Collect the selected rendered clips (video-track items placed on
-            # the timeline) to associate with the instance. Audio-only VO items
-            # are excluded — they are not source media the producer reviews.
-            clip_item_ids = []
-            seen_clip_ids = set()
-            for track in result.get("sequenceDetails", {}).get("tracks", []):
-                if track.get("mediaType") != "video":
-                    continue
-                for clip in track.get("clips", []):
-                    cid = clip.get("mimirItemId")
-                    if cid and cid not in seen_clip_ids:
-                        seen_clip_ids.add(cid)
-                        clip_item_ids.append(cid)
-
+            logger.info("Stage 4: Writing script to unassigned Saga linear instance(s)")
             import json as _json
-            # Title the instance per action (e.g. "<story> - VO") so re-running
-            # the same action updates its own instance (idempotent) and distinct
-            # actions never collide. Mirrors the timeline naming suffix.
-            instance_title = f"{story_title} - {profile.get('timeline_suffix', 'VO')}"
-            instance_result_json = create_or_update_linear_instance(
-                story_id=story_id,
-                script_sections_json=_json.dumps(script_sections),
-                clip_item_ids_json=_json.dumps(clip_item_ids),
-                instance_title=instance_title,
-            )
-            instance_result = json.loads(instance_result_json)
-            instance_status = instance_result.get("status", "unknown")
+            suffix = profile.get("timeline_suffix", "VO")
 
-            # Surface the instance outcome (incl. partial failure) on the result.
-            result.setdefault("summary", {})["instance"] = {
-                "instanceId": instance_result.get("instanceId"),
-                "status": instance_status,
-                "sectionsWritten": instance_result.get("sectionsWritten"),
-                "clipsRequested": len(clip_item_ids),
-                "clipsAssociated": instance_result.get("clipsAssociated"),
-                "clipAssociationError": instance_result.get("clipAssociationError"),
-            }
-            # Log only untainted locals (story id + counts). The per-clip
-            # associated count and error live in result.summary.instance above;
-            # they are NOT logged because they are parsed from the tool return,
-            # which carries the (secret-tainted) instance id.
-            if instance_status == "partial_success":
-                logger.warning(
-                    f"Stage 4 PARTIAL for story {story_id}: script written to instance, "
-                    f"but clip association incomplete for {len(clip_item_ids)} requested "
-                    f"clip(s) — see result.summary.instance for details"
-                )
+            # Build the instance plan: (title, sections). VOSOT splits into two
+            # instances so the anchor can start the SOT on their own timing —
+            # "<story> - VOSOT VO" (VO + nat sound) and "<story> - VOSOT SOT"
+            # (the soundbite(s)). Everything else is a single "<story> - <suffix>"
+            # instance. Instances are SCRIPT ONLY — no clips are associated; the
+            # media deliverable is the Cutter sequence (timeline), not rendered
+            # assets.
+            if profile.get("split_vo_sot"):
+                plan = [
+                    (f"{story_title} - {suffix} VO",
+                     _build_script_sections_from_analysis(
+                         _sections_subset(script_analysis, _VO_SECTION_TYPES))),
+                    (f"{story_title} - {suffix} SOT",
+                     _build_script_sections_from_analysis(
+                         _sections_subset(script_analysis, _SOT_SECTION_TYPES))),
+                ]
             else:
+                plan = [(f"{story_title} - {suffix}",
+                         _build_script_sections_from_analysis(script_analysis))]
+
+            instances_summary = []
+            for title, sections in plan:
+                if not sections:
+                    logger.info(f"Stage 4: no sections for '{suffix}' instance variant — skipping")
+                    continue
+                # Idempotent, title-aware find-or-create; re-running the same
+                # action updates its own instance and never collides with others.
+                res = json.loads(create_or_update_linear_instance(
+                    story_id=story_id,
+                    script_sections_json=_json.dumps(sections),
+                    instance_title=title,
+                ))
+                instances_summary.append({
+                    "instanceId": res.get("instanceId"),
+                    "status": res.get("status"),
+                    "sectionsWritten": res.get("sectionsWritten"),
+                })
                 logger.info(
-                    f"Stage 4: Script written to instance for story {story_id} "
-                    f"({len(script_sections)} sections, {len(clip_item_ids)} clips requested)"
+                    f"Stage 4: wrote {len(sections)} script sections to a "
+                    f"'{suffix}' instance for story {story_id}"
                 )
+
+            _save_artifact(story_id, "05-instances", instances_summary, run_id)
+            result.setdefault("summary", {})["instances"] = instances_summary
         except Exception as e:
             logger.warning(f"Stage 4 (Write Script to Linear Instance) failed non-fatally: {e}")
-            result.setdefault("summary", {})["instance"] = {
-                "status": "error",
-                "error": str(e),
-            }
+            result.setdefault("summary", {})["instances"] = [{"status": "error", "error": str(e)}]
 
         return result
 

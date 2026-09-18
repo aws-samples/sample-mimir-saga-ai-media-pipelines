@@ -8,9 +8,9 @@ Covers the acceptance-criteria behaviors:
   3. Shot-duration constraints (3-5s band, hard 5s ceiling) are applied by the
      B-roll filler.
   4. Stability analysis is invoked during the Generate VO timeline rebuild.
-  5. Saga instance creation receives the script AND the selected clips.
-  6. Partial failures (instance created, clip association failed) are reported
-     as ``partial_success`` — never a silent success.
+  5. Saga instance creation is SCRIPT ONLY (no clips are associated).
+  6. VOSOT produces TWO instances ("<story> - VOSOT VO" and
+     "<story> - VOSOT SOT"); all other profiles produce a single instance.
 
 External SDKs (strands, bedrock_agentcore) are stubbed before import so the
 tests run without those packages or any network access — matching the pattern
@@ -153,8 +153,7 @@ def _run_invoke(rough_cut_type, instance_return=None):
     """
     if instance_return is None:
         instance_return = json.dumps({
-            "instanceId": "INS-1", "status": "success",
-            "sectionsWritten": 1, "clipsRequested": 1, "clipsAssociated": 1,
+            "instanceId": "INS-1", "status": "success", "sectionsWritten": 1,
         })
 
     patches = {
@@ -244,29 +243,65 @@ class TestTargetPassthrough:
 
 
 # ---------------------------------------------------------------------------
-# 5. Instance receives script + selected clips (requirement 4)
+# 5. Instance creation is script-only (no clips); 6. VOSOT → two instances
 # ---------------------------------------------------------------------------
 
 class TestInstanceCreation:
-    def test_instance_receives_script_and_clips(self):
+    def test_instance_receives_script_only_no_clips(self):
         _, m = _run_invoke("vo")
         _, kwargs = m["create_or_update_linear_instance"].call_args
         # Script sections derived from the analysis
         sections = json.loads(kwargs["script_sections_json"])
         assert len(sections) == 1 and sections[0]["text"]
-        # Selected rendered clip ids from the timeline video tracks
-        clip_ids = json.loads(kwargs["clip_item_ids_json"])
-        assert clip_ids == ["clip-a"]
+        # Instances are SCRIPT ONLY — no clip ids are ever passed.
+        assert "clip_item_ids_json" not in kwargs
+        # A per-action title drives idempotent find-or-create.
+        assert kwargs["instance_title"] == "Test Story - VO"
 
-    def test_partial_failure_surfaced_on_result(self):
-        partial = json.dumps({
-            "instanceId": "INS-1", "status": "partial_success",
-            "sectionsWritten": 1, "clipsRequested": 1, "clipsAssociated": 0,
-            "clipAssociationError": "asset clip-a: HTTP 500",
-        })
-        result, _ = _run_invoke("vo", instance_return=partial)
-        assert result["summary"]["instance"]["status"] == "partial_success"
-        assert result["summary"]["instance"]["clipAssociationError"]
+    def test_vo_creates_single_instance(self):
+        _, m = _run_invoke("vo")
+        assert m["create_or_update_linear_instance"].call_count == 1
+
+    def test_instance_summary_recorded_on_result(self):
+        result, _ = _run_invoke("vo")
+        instances = result["summary"]["instances"]
+        assert len(instances) == 1
+        assert instances[0]["status"] == "success"
+
+    def test_vosot_creates_two_titled_instances(self):
+        # VOSOT splits into a VO instance and a SOT instance so the anchor can
+        # start the soundbite on their own timing. Feed an analysis that has
+        # both VO-family and SOT sections so both subsets are non-empty.
+        analysis = dict(_SCRIPT_ANALYSIS_STUB)
+        analysis["parsedSections"] = [
+            {"sectionType": "pkg_vo", "content": "vo one", "orderIndex": 0,
+             "estimatedDurationMs": 4000},
+            {"sectionType": "pkg_sot", "content": "a quote", "orderIndex": 1,
+             "estimatedDurationMs": 6000, "speaker": "X", "quotedText": "a quote"},
+        ]
+        patches = {
+            "run_script_analysis": MagicMock(return_value=analysis),
+            "run_source_material": MagicMock(return_value={"candidateSegments": [], "gaps": [], "coveragePercentage": 0}),
+            "_detect_reporter_vo": MagicMock(return_value={}),
+            "_synthesize_voiceovers": MagicMock(return_value={}),
+            "run_timeline_assembly": MagicMock(return_value=json.loads(json.dumps(_TIMELINE_RESULT_STUB))),
+            "create_or_update_linear_instance": MagicMock(
+                return_value=json.dumps({"instanceId": "INS-1", "status": "success", "sectionsWritten": 1})),
+            "_save_artifact": MagicMock(),
+        }
+        with patch.multiple("rough_cut_agent", **patches):
+            rca.invoke(_make_payload("vosot"))
+
+        calls = patches["create_or_update_linear_instance"].call_args_list
+        assert len(calls) == 2
+        titles = [c.kwargs["instance_title"] for c in calls]
+        assert titles == ["Test Story - VOSOT VO", "Test Story - VOSOT SOT"]
+
+        # The VO instance must carry no SOT sections; the SOT instance only SOT.
+        vo_sections = json.loads(calls[0].kwargs["script_sections_json"])
+        sot_sections = json.loads(calls[1].kwargs["script_sections_json"])
+        assert all("SOT" not in (s.get("label") or "") for s in vo_sections)
+        assert sot_sections and all("SOT" in (s.get("label") or "") for s in sot_sections)
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +380,7 @@ class TestStabilityInvoked:
 
 
 # ---------------------------------------------------------------------------
-# 6. create_or_update_linear_instance partial-failure path (requirement 4)
+# 6. create_or_update_linear_instance is script-only (no clip association)
 # ---------------------------------------------------------------------------
 
 class _Resp:
@@ -363,20 +398,20 @@ class _Resp:
             raise Exception(f"HTTP {self.status_code}")
 
 
-class TestCreateInstancePartialFailure:
-    def _run(self, asset_status):
-        """Create-instance path where asset association returns *asset_status*."""
+class TestCreateInstanceScriptOnly:
+    def _run(self):
+        """Create-instance path (no existing instance) → POST with content."""
+        posted = {}
+
         def fake_get(url, **kwargs):
             if url.endswith("/instances"):
                 return _Resp(200, {"instances": []})  # no existing instance
             return _Resp(200, {"mTitle": "Test Story"})  # story title fetch
 
         def fake_post(url, **kwargs):
-            if url.endswith("/instances"):
-                return _Resp(200, {"id": "ORG-INS-NEW"})  # instance created
-            if url.endswith("/assets"):
-                return _Resp(asset_status, {}, text="boom" if asset_status >= 400 else "")
-            return _Resp(200, {})
+            posted["url"] = url
+            posted["json"] = kwargs.get("json")
+            return _Resp(200, {"id": "ORG-INS-NEW"})
 
         def fake_patch(url, **kwargs):
             return _Resp(200, {})
@@ -392,26 +427,26 @@ class TestCreateInstancePartialFailure:
             out = tools.create_or_update_linear_instance(
                 story_id="STR-TEST",
                 script_sections_json=json.dumps([{"type": "vo", "label": "PKG VO:", "text": "hi"}]),
-                clip_item_ids_json=json.dumps(["clip-a"]),
+                instance_title="Test Story - VO",
             )
-        return json.loads(out)
+        return json.loads(out), posted
 
-    def test_success_when_clip_association_succeeds(self):
-        res = self._run(asset_status=200)
+    def test_create_returns_success_and_no_clip_fields(self):
+        res, posted = self._run()
         assert res["status"] == "success"
-        assert res["clipsAssociated"] == 1
+        assert res["created"] is True
+        assert res["sectionsWritten"] == 1
+        # Script-only: the result never reports clip association.
+        assert "clipsAssociated" not in res
+        assert "clipAssociationError" not in res
 
-    def test_partial_success_when_clip_association_fails(self):
-        res = self._run(asset_status=500)
-        assert res["status"] == "partial_success"
-        assert res["clipsAssociated"] == 0
-        assert res["clipAssociationError"]
-
-    def test_conflict_counts_as_associated(self):
-        # 409 = asset already on the story (idempotent) → still success.
-        res = self._run(asset_status=409)
-        assert res["status"] == "success"
-        assert res["clipsAssociated"] == 1
+    def test_create_posts_only_to_instances_never_assets(self):
+        _, posted = self._run()
+        # The create POST targets the story's instances endpoint (with inline
+        # script content) — never the /assets clip-association endpoint.
+        assert posted["url"].endswith("/instances")
+        assert "content" in posted["json"]
+        assert posted["json"]["title"] == "Test Story - VO"
 
 
 # ---------------------------------------------------------------------------
