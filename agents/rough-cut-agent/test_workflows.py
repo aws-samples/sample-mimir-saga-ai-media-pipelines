@@ -146,10 +146,30 @@ _TIMELINE_RESULT_STUB = {
 }
 
 
-def _run_invoke(rough_cut_type, instance_return=None):
+# A real-looking broadcast read (>= MIN_SCRIPT_WORDS, no placeholder markers).
+_SUBSTANTIVE = (
+    "The city council approved a new budget today after weeks of debate over "
+    "funding for parks, roads, and public safety across the district this year."
+)
+
+
+def _linear_instance(text, title="", inst_id="OTHER-INS-1", assigned=False):
+    """Build a minimal LINEAR instance dict as story-context-handler returns."""
+    account = {"accountId": "RND-1" if assigned else None}
+    return {
+        "id": inst_id,
+        "title": title,
+        "platformInfo": {"platform": "linear", "account": account},
+        "content": {"document": [{"children": [{"text": text}]}]},
+    }
+
+
+def _run_invoke(rough_cut_type, instance_return=None, payload=None, synth_return=""):
     """Run rca.invoke() with all heavy stages patched out.
 
-    Returns a dict of the mocks so tests can assert on calls.
+    Returns a dict of the mocks so tests can assert on calls. Pass ``payload``
+    to override the default, and ``synth_return`` to stub the context-synthesis
+    script.
     """
     if instance_return is None:
         instance_return = json.dumps({
@@ -161,12 +181,16 @@ def _run_invoke(rough_cut_type, instance_return=None):
         "run_source_material": MagicMock(return_value={"candidateSegments": [], "gaps": [], "coveragePercentage": 0}),
         "_detect_reporter_vo": MagicMock(return_value={}),
         "_synthesize_voiceovers": MagicMock(return_value={}),
+        # Stage 0 context helpers — mocked so the workflow tests never hit
+        # Bedrock/S3 when a payload has no trusted script.
+        "_gather_model_knowledge": MagicMock(return_value=""),
+        "_synthesize_script_from_transcripts": MagicMock(return_value=synth_return),
         "run_timeline_assembly": MagicMock(return_value=json.loads(json.dumps(_TIMELINE_RESULT_STUB))),
         "create_or_update_linear_instance": MagicMock(return_value=instance_return),
         "_save_artifact": MagicMock(),
     }
     with patch.multiple("rough_cut_agent", **patches):
-        result = rca.invoke(_make_payload(rough_cut_type))
+        result = rca.invoke(payload if payload is not None else _make_payload(rough_cut_type))
     return result, patches
 
 
@@ -207,6 +231,8 @@ class TestVoiceoverGating:
             "run_source_material": MagicMock(return_value={"candidateSegments": [], "gaps": [], "coveragePercentage": 0}),
             "_detect_reporter_vo": MagicMock(return_value={}),
             "_synthesize_voiceovers": MagicMock(return_value={}),
+            "_gather_model_knowledge": MagicMock(return_value=""),
+            "_synthesize_script_from_transcripts": MagicMock(return_value=""),
             "run_timeline_assembly": MagicMock(return_value=json.loads(json.dumps(_TIMELINE_RESULT_STUB))),
             "create_or_update_linear_instance": MagicMock(return_value=json.dumps({"instanceId": "INS-1", "status": "success"})),
             "_save_artifact": MagicMock(),
@@ -302,6 +328,90 @@ class TestInstanceCreation:
         sot_sections = json.loads(calls[1].kwargs["script_sections_json"])
         assert all("SOT" not in (s.get("label") or "") for s in vo_sections)
         assert sot_sections and all("SOT" in (s.get("label") or "") for s in sot_sections)
+
+
+# ---------------------------------------------------------------------------
+# Script-source selection: trust a real reporter script, otherwise generate
+# from context (transcripts + content + research). Thin/placeholder and
+# agent-generated instances must NOT be used verbatim.
+# ---------------------------------------------------------------------------
+
+class TestScriptSourceSelection:
+    def _run(self, instances, story_content, synth_return=""):
+        payload = _make_payload("vo")
+        payload["storyContext"]["instances"] = instances
+        payload["storyContext"]["story"]["content"] = {
+            "document": [{"children": [{"text": story_content}]}]
+        }
+        _, patches = _run_invoke("vo", payload=payload, synth_return=synth_return)
+        # story_context is the first positional arg to run_script_analysis.
+        story_context = patches["run_script_analysis"].call_args[0][0]
+        return story_context, patches
+
+    def test_thin_instance_ignored_uses_story_content(self):
+        # An 11-char stub instance ("Car Racing") must NOT win over a real
+        # story.content script — this is the bug that broke the Car Racing run.
+        thin = _linear_instance("Car Racing", title="Car Racing")
+        ctx, p = self._run([thin], _SUBSTANTIVE)
+        assert ctx["script"] == _SUBSTANTIVE
+        p["_synthesize_script_from_transcripts"].assert_not_called()
+
+    def test_agent_generated_instance_ignored(self):
+        # An instance THIS agent created ("<story> - VO") must never feed back
+        # in as the input script.
+        gen = _linear_instance(_SUBSTANTIVE + " generated copy", title="Test Story - VO")
+        ctx, _ = self._run([gen], _SUBSTANTIVE)
+        assert ctx["script"] == _SUBSTANTIVE
+        assert "generated copy" not in ctx["script"]
+
+    def test_single_reporter_instance_used(self):
+        # One substantive, non-generated instance is the authoritative script,
+        # even when story.content is a thin stub.
+        reporter = _linear_instance(_SUBSTANTIVE, title="Reporter Draft")
+        ctx, p = self._run([reporter], "Car Racing")
+        assert ctx["script"] == _SUBSTANTIVE
+        p["_synthesize_script_from_transcripts"].assert_not_called()
+
+    def test_multiple_reporter_instances_generate_from_context(self):
+        # Ambiguous: two substantive reporter instances → don't guess; generate
+        # a script from context instead.
+        a = _linear_instance(_SUBSTANTIVE, title="Draft A", inst_id="A-INS-1")
+        b = _linear_instance(_SUBSTANTIVE + " variant", title="Draft B", inst_id="B-INS-2")
+        ctx, p = self._run([a, b], "Car Racing",
+                           synth_return="SYNTHESIZED SCRIPT FROM CONTEXT")
+        p["_synthesize_script_from_transcripts"].assert_called_once()
+        assert ctx["script"] == "SYNTHESIZED SCRIPT FROM CONTEXT"
+
+    def test_placeholder_content_generates_from_context(self):
+        # No instances and a placeholder story.content → generate from context.
+        ctx, p = self._run([], "PKG VO: CAR RACING STORY - INSUFFICIENT SCRIPT CONTENT PROVIDED",
+                           synth_return="SYNTHESIZED SCRIPT FROM CONTEXT")
+        p["_synthesize_script_from_transcripts"].assert_called_once()
+        assert ctx["script"] == "SYNTHESIZED SCRIPT FROM CONTEXT"
+        # The story content is still handed to the synthesizer as context.
+        _, kwargs = p["_synthesize_script_from_transcripts"].call_args
+        assert "INSUFFICIENT" in kwargs["story_content_text"]
+
+
+class TestSubstantiveScriptHelper:
+    def test_short_stub_is_not_substantive(self):
+        assert rca._is_substantive_script("Car Racing") is False
+
+    def test_empty_is_not_substantive(self):
+        assert rca._is_substantive_script("   ") is False
+
+    def test_placeholder_marker_is_not_substantive(self):
+        assert rca._is_substantive_script(
+            "This story has insufficient script content provided for now indeed"
+        ) is False
+
+    def test_real_script_is_substantive(self):
+        assert rca._is_substantive_script(_SUBSTANTIVE) is True
+
+    def test_generated_suffixes_cover_all_actions(self):
+        sfx = rca._generated_instance_suffixes()
+        for expected in (" - vo", " - ai vo", " - vosot", " - vosot vo", " - vosot sot", " - package"):
+            assert expected in sfx
 
 
 # ---------------------------------------------------------------------------

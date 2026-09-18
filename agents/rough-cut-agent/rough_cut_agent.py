@@ -2,7 +2,7 @@ from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands import Agent
 from strands.models import BedrockModel
 from prompts import SCRIPT_ANALYSIS_PROMPT, SOURCE_MATERIAL_PROMPT, TIMELINE_ASSEMBLY_PROMPT
-from profiles import get_profile, DEFAULT_ROUGH_CUT_TYPE
+from profiles import get_profile, DEFAULT_ROUGH_CUT_TYPE, ROUGH_CUT_PROFILES
 from tools import get_transcript, get_generated_transcript, query_embeddings, get_mimir_item_details, create_timeline, update_story_status, get_word_timing, generate_voiceover, upload_voiceover_to_mimir, create_or_update_linear_instance, _build_linear_instance_slate, sanitize_for_tts
 import json
 import logging
@@ -2413,21 +2413,29 @@ def _synthesize_script_from_transcripts(
     story_title: str,
     story_description: str,
     enriched_assets: list,
+    story_content_text: str = "",
+    research_text: str = "",
+    model_knowledge: str = "",
 ) -> str:
-    """Synthesize a narrative script from available asset transcripts.
+    """Synthesize a broadcast script from all available context.
 
-    Called when both the story Content section and Research section are empty.
-    Reads all available transcripts from S3, concatenates them with asset
-    titles as headers, then asks Nova Pro to write a broadcast news script
-    from the raw material.
+    Called when there is no trusted reporter script (the story has no usable
+    instance, has multiple ambiguous instances, or only a thin placeholder).
+    Combines whatever context exists — asset transcripts (from S3 or the
+    per-asset timed-transcript URL), the story Content field, the Research
+    section/notes, and model background knowledge — and asks the model to write
+    a complete broadcast package script from that material.
 
     Args:
         story_title: The story title.
         story_description: The story description (may be empty).
         enriched_assets: Enriched asset list from story-context-handler.
+        story_content_text: Plain text of the story Content field (context).
+        research_text: Research/notes text gathered for the story (context).
+        model_knowledge: Model background knowledge on the topic (context).
 
     Returns:
-        A synthesized script string, or empty string if no transcripts found.
+        A synthesized script string, or empty string if no material at all.
     """
     bucket = os.environ.get("TRANSCRIPT_STAGING_BUCKET", "")
     s3 = boto3.client("s3") if bucket else None
@@ -2478,30 +2486,47 @@ def _synthesize_script_from_transcripts(
             title = asset.get("title", item_id)
             transcript_blocks.append(f"### {title}\n{full_text}")
 
-    if not transcript_blocks:
-        logger.info("No transcripts available — cannot synthesize script")
+    combined = "\n\n".join(transcript_blocks)
+
+    # Synthesize from ANY available material — not just transcripts. If the
+    # story has content or research but no transcripts, still write a script.
+    if not (combined or story_content_text.strip() or research_text.strip()):
+        logger.info(
+            "No transcripts, content, or research available — cannot synthesize script"
+        )
         return ""
 
-    combined = "\n\n".join(transcript_blocks)
     logger.info(
-        f"Synthesizing script from {len(transcript_blocks)} transcripts "
-        f"({len(combined)} chars)"
+        f"Synthesizing script from context: {len(transcript_blocks)} transcript(s), "
+        f"content={len(story_content_text)} chars, research={len(research_text)} chars, "
+        f"knowledge={len(model_knowledge)} chars"
     )
 
+    # Build the context block from whatever we have (caps avoid token overflow).
+    context_sections = [
+        f"## Story Title\n{story_title}",
+        f"## Story Description\n{story_description or '(none provided)'}",
+    ]
+    if story_content_text.strip():
+        context_sections.append(f"## Story Content\n{story_content_text[:4000]}")
+    if research_text.strip():
+        context_sections.append(f"## Research\n{research_text[:4000]}")
+    if model_knowledge.strip():
+        context_sections.append(f"## Background Knowledge\n{model_knowledge[:2000]}")
+    if combined:
+        context_sections.append(f"## Transcripts\n{combined[:12000]}")
+
     prompt = (
-        "You are a broadcast news producer. Below are raw transcripts from video clips "
-        "associated with a news story. Using only the information in these transcripts, "
-        "write a complete broadcast news package script. Include:\n"
+        "You are a broadcast news producer. Using the material below, write a "
+        "complete broadcast news package script. Include:\n"
         "- An anchor introduction\n"
         "- Voice-over narration sections (PKG VO) that tell the story\n"
         "- Sound-on-tape sections (SOT) using direct quotes from the transcripts, "
-        "attributed to the speaker\n"
+        "attributed to the speaker (only when the transcripts contain usable quotes)\n"
         "- A live tag or wrap\n\n"
-        "Format the script clearly with section labels. "
-        "Do not invent facts not present in the transcripts.\n\n"
-        f"## Story Title\n{story_title}\n\n"
-        f"## Story Description\n{story_description or '(none provided)'}\n\n"
-        f"## Transcripts\n{combined[:12000]}"  # cap to avoid token overflow
+        "Format the script clearly with section labels. Base the script on the "
+        "provided material and do not invent facts that contradict it.\n\n"
+        + "\n\n".join(context_sections)
     )
 
     try:
@@ -2517,6 +2542,63 @@ def _synthesize_script_from_transcripts(
     except Exception as e:
         logger.warning(f"Script synthesis from transcripts failed: {e}")
         return ""
+
+
+# Minimum word count for a linear-instance or story.content script to be
+# TRUSTED verbatim as the source. A real broadcast VO read easily clears this;
+# titles, stubs, and placeholders ("Car Racing", "INSUFFICIENT SCRIPT CONTENT
+# PROVIDED") fall below it, so we regenerate from context instead. Tunable via
+# the MIN_SCRIPT_WORDS env var.
+MIN_SCRIPT_WORDS = int(os.environ.get("MIN_SCRIPT_WORDS", "15"))
+
+# Substrings that mark a placeholder / non-script even if long enough.
+_PLACEHOLDER_MARKERS = (
+    "insufficient script",
+    "no script content",
+    "placeholder",
+    "lorem ipsum",
+)
+
+
+def _is_substantive_script(text: str) -> bool:
+    """True when *text* looks like a real script worth trusting as the source.
+
+    Rejects empty/tiny content (titles, stubs) below ``MIN_SCRIPT_WORDS`` and
+    any text containing a placeholder marker. Non-substantive scripts route to
+    context-based generation (transcripts + content + research) instead of being
+    used verbatim.
+    """
+    if not text or not text.strip():
+        return False
+    lowered = text.lower()
+    if any(marker in lowered for marker in _PLACEHOLDER_MARKERS):
+        return False
+    return len(text.split()) >= MIN_SCRIPT_WORDS
+
+
+def _generated_instance_suffixes() -> set:
+    """Lowercased title suffixes for instances THIS agent creates (e.g.
+    ``" - vo"``, ``" - vosot sot"``), derived from the rough-cut profiles.
+
+    Read-side script selection uses these to skip our own generated instances so
+    a prior rough cut's script never becomes the next run's input (feedback loop).
+    """
+    suffixes = set()
+    for prof in ROUGH_CUT_PROFILES.values():
+        sfx = prof.get("timeline_suffix")
+        if not sfx:
+            continue
+        suffixes.add(f" - {sfx}".lower())
+        if prof.get("split_vo_sot"):
+            suffixes.add(f" - {sfx} vo".lower())
+            suffixes.add(f" - {sfx} sot".lower())
+    return suffixes
+
+
+def _is_agent_generated_instance(inst: dict, generated_suffixes: set) -> bool:
+    """True when the instance's title matches one this agent produces."""
+    title = (inst.get("title") or inst.get("mTitle") or "").strip().lower()
+    return any(title.endswith(sfx) for sfx in generated_suffixes)
 
 
 # Section-type groups for splitting a VOSOT script into two instances.
@@ -2689,29 +2771,56 @@ def invoke(payload):
                 or inst.get("assignedUser")
             )
 
-        linear_instances = [inst for inst in instances if _is_linear(inst)]
-        # Prefer an assigned instance (a producer has claimed it and written a
-        # script) over an unassigned one, so a reporter's existing script is
-        # used as context when present.
-        linear_instances.sort(key=lambda i: 0 if _is_assigned(i) else 1)
-        for inst in linear_instances:
+        # Candidate reporter scripts: LINEAR instances we did NOT generate,
+        # whose content is SUBSTANTIVE (a real written read — not a title, stub,
+        # or placeholder). We skip our own generated instances (" - VO",
+        # " - VOSOT SOT", ...) so a prior rough cut's script never becomes this
+        # run's input (feedback loop).
+        generated_suffixes = _generated_instance_suffixes()
+        reporter_candidates = []
+        for inst in instances:
+            if not _is_linear(inst):
+                continue
+            if _is_agent_generated_instance(inst, generated_suffixes):
+                continue
             inst_text = _slate_to_text(inst.get("content", {}))
-            if inst_text.strip():
-                script_text = inst_text
-                script_source = f"linear instance {inst.get('id', '')}"
-                logger.info(
-                    f"Using script from linear instance {inst.get('id', '')} "
-                    f"({len(script_text)} chars)"
-                )
-                break
+            if _is_substantive_script(inst_text):
+                # Prefer assigned candidates first for tie-break logging.
+                reporter_candidates.append((0 if _is_assigned(inst) else 1, inst, inst_text))
+        reporter_candidates.sort(key=lambda c: c[0])
 
-        # Fallback: story-level content field
-        if not script_text.strip():
-            story_content = story.get("content", {})
-            script_text = _slate_to_text(story_content)
-            if script_text.strip():
-                script_source = "story.content"
-                logger.info(f"Using script from story.content ({len(script_text)} chars)")
+        # Trust a reporter's script ONLY when exactly one substantive candidate
+        # exists. Zero (all thin / placeholder / our own generated) OR more than
+        # one (ambiguous — which instance is authoritative?) both fall through to
+        # generating a script from context (transcripts + content + research).
+        story_content_text = _slate_to_text(story.get("content", {}))
+        if len(reporter_candidates) == 1:
+            _, inst, inst_text = reporter_candidates[0]
+            script_text = inst_text
+            script_source = f"linear instance {inst.get('id', '')}"
+            logger.info(
+                f"Using script from linear instance {inst.get('id', '')} "
+                f"({len(script_text)} chars)"
+            )
+        elif len(reporter_candidates) > 1:
+            logger.info(
+                f"{len(reporter_candidates)} substantive reporter instances found — "
+                f"ambiguous; generating a script from context instead"
+            )
+        else:
+            logger.info(
+                "No substantive reporter instance found (thin/placeholder or "
+                "agent-generated only)"
+            )
+
+        # Story-level Content field is trusted as the script only when it is
+        # itself substantive AND there was no single reporter instance. When it
+        # is thin, it still feeds context-based generation below.
+        if not script_text.strip() and not reporter_candidates \
+                and _is_substantive_script(story_content_text):
+            script_text = story_content_text
+            script_source = "story.content"
+            logger.info(f"Using script from story.content ({len(script_text)} chars)")
 
         logger.info(f"Script source: {script_source}")
 
@@ -2769,8 +2878,8 @@ def invoke(payload):
         if not script_text.strip():
             # Stage 0a: Ask the model what it knows about the story topic.
             # Surfaces background on people, organisations, and events that
-            # may not be in the transcripts.
-            logger.info("Stage 0a: No script found — gathering model background knowledge")
+            # may not be in the transcripts/content.
+            logger.info("Stage 0a: No trusted script — gathering model background knowledge")
             model_knowledge = _gather_model_knowledge(
                 story_title=story_title,
                 story_description=story_description,
@@ -2778,30 +2887,36 @@ def invoke(payload):
             if model_knowledge:
                 _save_artifact(story_id, "00a-model-knowledge", {"knowledge": model_knowledge}, run_id)
 
-            # Stage 0b: Synthesize a script from transcripts when research is
-            # also absent. If research exists, Script Analysis can use that
-            # directly alongside the model knowledge.
-            if not research_text.strip():
-                logger.info(
-                    "Stage 0b: No content or research section found — "
-                    "synthesizing script from transcripts"
+            # Stage 0b: Generate a script from ALL available context — the story
+            # transcripts, the Content field, the Research section/notes, and
+            # the model knowledge above. This is the path for stories whose
+            # instance is a thin placeholder or that have multiple ambiguous
+            # instances (per the editorial rule: don't trust a stub, build the
+            # script from context).
+            logger.info(
+                "Stage 0b: Generating a script from context "
+                "(transcripts + content + research)"
+            )
+            synthesized = _synthesize_script_from_transcripts(
+                story_title=story_title,
+                story_description=story_description,
+                enriched_assets=assets,
+                story_content_text=story_content_text,
+                research_text=research_text,
+                model_knowledge=model_knowledge,
+            )
+            if synthesized:
+                script_text = synthesized
+                script_source = "synthesized from context"
+                _save_artifact(story_id, "00b-synthesized-script", {"script": synthesized}, run_id)
+                logger.info("Stage 0b: Script synthesized from context")
+            else:
+                logger.warning(
+                    "Stage 0b: No transcripts/content/research to synthesize from — "
+                    "Script Analysis will proceed with model knowledge and title only"
                 )
-                synthesized = _synthesize_script_from_transcripts(
-                    story_title=story_title,
-                    story_description=story_description,
-                    enriched_assets=assets,
-                )
-                if synthesized:
-                    script_text = synthesized
-                    _save_artifact(story_id, "00b-synthesized-script", {"script": synthesized}, run_id)
-                    logger.info("Stage 0b: Script synthesized from transcripts")
-                else:
-                    logger.warning(
-                        "Stage 0b: No transcripts available — Script Analysis will "
-                        "proceed with model knowledge and story title only"
-                    )
         else:
-            logger.info("Stage 0: Script present — skipping background knowledge gathering")
+            logger.info("Stage 0: Trusted script present — skipping context generation")
 
         # --- Stage 1: Script Analysis ---
         try:
