@@ -11,8 +11,8 @@
   },
   {
     "ParameterKey": "SagaApiUrl",
-    "ParameterValue": "https://us.mjoll.no",
-    "Description": "Base URL for the Saga API (e.g., https://pnqrxq1y5l.execute-api.us-east-1.amazonaws.com/v1)."
+    "ParameterValue": "",
+    "Description": "REQUIRED. Base URL for the Saga REST API (an API Gateway invoke URL in the form https://<id>.execute-api.<region>.amazonaws.com/v1). This is NOT the Mimir web URL (https://<instance>.mjoll.no) — Saga and Mimir are separate services at separate endpoints."
   },
   {
     "ParameterKey": "MimirInstance",

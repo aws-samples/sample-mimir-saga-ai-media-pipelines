@@ -88,8 +88,14 @@ Parameters:
 
   SagaApiUrl:
     Type: String
-    Default: https://us.mjoll.no
-    Description: Base URL for the Saga API.
+    AllowedPattern: ^https?://.+
+    Description: >
+      Base URL for the Saga API. This is the Saga REST API (an API Gateway
+      invoke URL in the form https://<id>.execute-api.<region>.amazonaws.com/v1),
+      NOT the Mimir web URL (https://<instance>.mjoll.no). The two services
+      live at different endpoints — using Mimir's URL here will cause every
+      Saga call to return HTML, breaking rough-cut generation and other
+      story-driven actions.
 
   SummaryFieldName:
     Type: String
@@ -326,16 +332,25 @@ Resources:
                     echo "Configuration seeded to SSM (SecureString)"
                   fi
 
-                # Apply runtime parameter overrides. Two ways to override:
+                # Apply runtime parameter overrides from MSAI_PARAM_OVERRIDES.
                 #
-                # 1. JSON overrides for a single build:
+                # On second-and-later deploys, SSM is authoritative — the
+                # CloudFormation stack parameters only seed SSM on first
+                # deploy (above), and must not silently stomp operator fixes
+                # to the stored config. To change a saved value, choose ONE
+                # of:
+                #
+                # 1. JSON override for a single build:
                 #    aws codebuild start-build --project-name <name> \
                 #      --environment-variables-override \
                 #        name=MSAI_PARAM_OVERRIDES,value='{"SummaryFieldName":"ai_summary"}',type=PLAINTEXT
                 #
-                # 2. Update the pipeline stack parameters in the CloudFormation
-                #    console, then start a new build. Non-empty values that
-                #    differ from the SSM config are applied and persisted.
+                # 2. Edit the SSM parameter directly (one-off correction):
+                #    aws ssm put-parameter --name "$SSM_CONFIG_PARAM" \
+                #      --type SecureString --value "$(cat parameters.json)" --overwrite
+                #
+                # 3. Delete the SSM parameter to re-seed from the stack
+                #    parameters on the next build (full reset).
                 - |
                   cd "$PROJECT_DIR"
                   node -e "
@@ -357,16 +372,6 @@ Resources:
                     };
                     const overrides = JSON.parse(process.env.MSAI_PARAM_OVERRIDES || '{}');
                     for (const [k, v] of Object.entries(overrides)) apply(k, v, 'JSON');
-                    const envMap = {
-                      MSAI_MIMIR_API_KEY: 'MimirApiKey',
-                      MSAI_SAGA_API_KEY: 'SagaApiKey',
-                      MSAI_SAGA_API_URL: 'SagaApiUrl',
-                      MSAI_MIMIR_INSTANCE: 'MimirInstance',
-                      MSAI_SUMMARY_FIELD: 'SummaryFieldName',
-                      MSAI_ALLOWED_ISSUER: 'MimirAllowedIssuer',
-                      MSAI_TRANSCRIBE_FALLBACK: 'EnableTranscribeFallback'
-                    };
-                    for (const [envVar, paramKey] of Object.entries(envMap)) apply(paramKey, process.env[envVar], 'env');
                     if (changed) {
                       fs.writeFileSync('parameters.json', JSON.stringify(params, null, 2));
                       console.log('parameters.json updated with overrides');
@@ -381,6 +386,42 @@ Resources:
 
             post_build:
               commands:
+                # Smoke test: the Saga API URL has repeatedly been set to a
+                # value that looks right at a glance (e.g. the Mimir base URL)
+                # but points at something that serves HTML. The deploy itself
+                # reports SUCCEEDED because no CDK resource depends on Saga
+                # being reachable, so the failure only surfaces later when a
+                # user triggers a rough-cut. Catch it here instead.
+                - |
+                  cd "$PROJECT_DIR"
+                  SAGA_URL=$(node -p "(JSON.parse(require('fs').readFileSync('parameters.json')).find(p=>p.ParameterKey==='SagaApiUrl')||{}).ParameterValue||''" 2>/dev/null)
+                  SAGA_KEY=$(node -p "(JSON.parse(require('fs').readFileSync('parameters.json')).find(p=>p.ParameterKey==='SagaApiKey')||{}).ParameterValue||''" 2>/dev/null)
+                  if [ -z "$SAGA_URL" ] || [ -z "$SAGA_KEY" ]; then
+                    echo "⚠️  Skipping Saga API smoke test — SagaApiUrl or SagaApiKey not set in parameters.json"
+                  else
+                    echo "🔍 Smoke-testing Saga API at $SAGA_URL ..."
+                    HTTP_CODE=$(curl -sS -o /tmp/saga_body -D /tmp/saga_headers -w "%{http_code}" --max-time 15 \
+                      -H "x-api-key: $SAGA_KEY" "$SAGA_URL/stories" 2>/dev/null || echo "000")
+                    if grep -qiE "^content-type:[[:space:]]*application/json" /tmp/saga_headers; then
+                      echo "✅ Saga API smoke test passed (HTTP $HTTP_CODE, JSON response)"
+                    else
+                      echo "❌ Saga API smoke test FAILED. SagaApiUrl likely points at the wrong service."
+                      echo "   URL:         $SAGA_URL"
+                      echo "   HTTP status: $HTTP_CODE"
+                      echo "   Response headers (first 5):"
+                      head -5 /tmp/saga_headers 2>/dev/null | sed 's/^/     /'
+                      echo "   Response body (first 200 chars):"
+                      head -c 200 /tmp/saga_body 2>/dev/null | sed 's/^/     /'
+                      echo ""
+                      echo "   Fix: update the SagaApiUrl parameter on the pipeline"
+                      echo "   CloudFormation stack to the correct Saga REST API URL"
+                      echo "   (an API Gateway invoke URL in the form"
+                      echo "   https://<id>.execute-api.<region>.amazonaws.com/v1),"
+                      echo "   delete the SSM parameter $SSM_CONFIG_PARAM to force"
+                      echo "   a re-seed, then re-run the build."
+                      exit 1
+                    fi
+                  fi
                 - |
                   cd "$PROJECT_DIR"
                   if [ -f parameters.json ]; then
