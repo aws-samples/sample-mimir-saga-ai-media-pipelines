@@ -144,14 +144,17 @@ export class McpGatewayStack extends cdk.Stack {
     gatewayTarget.node.addDependency(gatewayRole);
 
     // --- Outputs ---
+    // NOTE: the Gateway's GatewayUrl attribute ALREADY ends in '/mcp'.
+    // Do not append another '/mcp' — the gateway rejects '/mcp/mcp' with
+    // HTTP 400 "Http operation is not supported for gateway protocol type MCP".
     new cdk.CfnOutput(this, 'GatewayUrl', {
       value: gatewayUrl,
-      description: 'AgentCore Gateway URL — use this as the MCP Server Endpoint in Quick Suite',
+      description: 'AgentCore Gateway MCP endpoint — use this as the Base URL in Quick Suite',
     });
 
-    new cdk.CfnOutput(this, 'GatewayMcpEndpoint', {
-      value: cdk.Fn.join('', [gatewayUrl, '/mcp']),
-      description: 'Full MCP endpoint URL for Quick Suite integration',
+    new cdk.CfnOutput(this, 'CognitoScope', {
+      value: 'mcp-gateway/invoke',
+      description: 'OAuth scope to request in Quick Suite service-to-service auth',
     });
 
     new cdk.CfnOutput(this, 'CognitoUserPoolId', {
@@ -169,7 +172,29 @@ export class McpGatewayStack extends cdk.Stack {
       description: 'Cognito Token URL — use as Token URL in Quick Suite MCP service auth',
     });
 
-    // Store in SSM for reference
+    // Store the full connector config in SSM under a stable prefix.
+    // The AgentCore gateway ID and the Cognito client ID both change whenever
+    // this stack is replaced, so downstream consumers (and scripts/get-mcp-config.sh)
+    // should resolve them from these fixed parameter paths rather than
+    // hardcoding values copied out of the console.
+    new ssm.StringParameter(this, 'GatewayClientIdParameter', {
+      parameterName: '/fonn-custom-actions/mcp-gateway/client-id',
+      stringValue: appClient.userPoolClientId,
+      description: 'Cognito App Client ID for the MCP Gateway',
+    });
+
+    new ssm.StringParameter(this, 'GatewayTokenUrlParameter', {
+      parameterName: '/fonn-custom-actions/mcp-gateway/token-url',
+      stringValue: `https://${domain.domainName}.auth.${region}.amazoncognito.com/oauth2/token`,
+      description: 'Cognito OAuth token endpoint for the MCP Gateway',
+    });
+
+    new ssm.StringParameter(this, 'GatewayScopeParameter', {
+      parameterName: '/fonn-custom-actions/mcp-gateway/scope',
+      stringValue: 'mcp-gateway/invoke',
+      description: 'OAuth scope required to invoke MCP tools',
+    });
+
     new ssm.StringParameter(this, 'GatewayUrlParameter', {
       parameterName: '/fonn-custom-actions/mcp-gateway/url',
       stringValue: gatewayUrl,
