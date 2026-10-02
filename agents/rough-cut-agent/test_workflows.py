@@ -348,21 +348,46 @@ class TestScriptSourceSelection:
         story_context = patches["run_script_analysis"].call_args[0][0]
         return story_context, patches
 
-    def test_thin_instance_ignored_uses_story_content(self):
-        # An 11-char stub instance ("Car Racing") must NOT win over a real
-        # story.content script — this is the bug that broke the Car Racing run.
+    def test_substantive_story_content_still_generates_from_context(self):
+        # story.content is a free-form notes/reference field (users paste web
+        # articles, source material, raw transcripts). It is NEVER trusted as
+        # a verbatim script, even when "substantive" by word count — treating
+        # a pasted article as broadcast copy produces off-brand output (the
+        # publisher's station name baked into the AI voice). Instead,
+        # story.content always feeds context-based generation.
         thin = _linear_instance("Car Racing", title="Car Racing")
-        ctx, p = self._run([thin], _SUBSTANTIVE)
-        assert ctx["script"] == _SUBSTANTIVE
-        p["_synthesize_script_from_transcripts"].assert_not_called()
+        ctx, p = self._run([thin], _SUBSTANTIVE,
+                           synth_return="SYNTHESIZED SCRIPT FROM CONTEXT")
+        p["_synthesize_script_from_transcripts"].assert_called_once()
+        assert ctx["script"] == "SYNTHESIZED SCRIPT FROM CONTEXT"
+        # story.content is handed to the synthesizer as context, not script.
+        _, kwargs = p["_synthesize_script_from_transcripts"].call_args
+        assert kwargs["story_content_text"] == _SUBSTANTIVE
+
+    def test_no_instances_and_substantive_content_generates_from_context(self):
+        # Same rule applies with zero instances: substantive story.content
+        # routes to synthesis, not verbatim use.
+        ctx, p = self._run([], _SUBSTANTIVE,
+                           synth_return="SYNTHESIZED SCRIPT FROM CONTEXT")
+        p["_synthesize_script_from_transcripts"].assert_called_once()
+        assert ctx["script"] == "SYNTHESIZED SCRIPT FROM CONTEXT"
 
     def test_agent_generated_instance_ignored(self):
         # An instance THIS agent created ("<story> - VO") must never feed back
-        # in as the input script.
+        # in as the input script. Falls through to context-based generation
+        # (which uses story.content as source material, not as script).
         gen = _linear_instance(_SUBSTANTIVE + " generated copy", title="Test Story - VO")
-        ctx, _ = self._run([gen], _SUBSTANTIVE)
-        assert ctx["script"] == _SUBSTANTIVE
+        ctx, p = self._run([gen], _SUBSTANTIVE,
+                           synth_return="SYNTHESIZED SCRIPT FROM CONTEXT")
+        # Script is synthesized, not pulled verbatim from the agent-generated
+        # instance OR from story.content.
+        p["_synthesize_script_from_transcripts"].assert_called_once()
+        assert ctx["script"] == "SYNTHESIZED SCRIPT FROM CONTEXT"
+        # The agent-generated instance's content must not leak through.
         assert "generated copy" not in ctx["script"]
+        # story.content is handed to the synthesizer as context, not as script.
+        _, kwargs = p["_synthesize_script_from_transcripts"].call_args
+        assert kwargs["story_content_text"] == _SUBSTANTIVE
 
     def test_single_reporter_instance_used(self):
         # One substantive, non-generated instance is the authoritative script,
