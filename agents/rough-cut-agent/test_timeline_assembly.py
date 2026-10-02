@@ -307,7 +307,7 @@ class TestRunTimelineAssembly:
         mock_create.return_value = json.dumps({"id": "timeline-001"})
 
         result = run_timeline_assembly(
-            _valid_script_analysis(), _valid_source_material(),
+            _valid_script_analysis(), _valid_source_material(), [],
             "story-1", "Fire Story", "token-abc",
         )
 
@@ -332,7 +332,7 @@ class TestRunTimelineAssembly:
         mock_create.return_value = json.dumps({"id": "timeline-001"})
 
         run_timeline_assembly(
-            _valid_script_analysis(), _valid_source_material(),
+            _valid_script_analysis(), _valid_source_material(), [],
             "story-1", "Fire Story", "token-abc",
         )
 
@@ -357,7 +357,7 @@ class TestRunTimelineAssembly:
         mock_create.return_value = json.dumps({"id": "timeline-001"})
 
         result = run_timeline_assembly(
-            _valid_script_analysis(), _valid_source_material(),
+            _valid_script_analysis(), _valid_source_material(), [],
             "story-1", "Fire Story", "token-abc",
         )
         assert result["timelineItemId"] == "timeline-001"
@@ -376,7 +376,7 @@ class TestRunTimelineAssembly:
 
         with pytest.raises(ValueError, match="invalid JSON"):
             run_timeline_assembly(
-                _valid_script_analysis(), _valid_source_material(),
+                _valid_script_analysis(), _valid_source_material(), [],
                 "story-1", "Fire Story", "token-abc",
             )
 
@@ -400,7 +400,7 @@ class TestRunTimelineAssembly:
 
         with pytest.raises(ValueError):
             run_timeline_assembly(
-                _valid_script_analysis(), _valid_source_material(),
+                _valid_script_analysis(), _valid_source_material(), [],
                 "story-1", "Fire Story", "token-abc",
             )
 
@@ -422,7 +422,7 @@ class TestRunTimelineAssembly:
         mock_create.return_value = json.dumps({"id": "timeline-001"})
 
         run_timeline_assembly(
-            _valid_script_analysis(), _valid_source_material(),
+            _valid_script_analysis(), _valid_source_material(), [],
             "story-42", "Big Fire Story", "token-abc",
         )
 
