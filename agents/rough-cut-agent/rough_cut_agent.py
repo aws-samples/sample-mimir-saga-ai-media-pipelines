@@ -2548,6 +2548,17 @@ def _synthesize_script_from_transcripts(
         "- A live tag or wrap\n\n"
         "Format the script clearly with section labels. Base the script on the "
         "provided material and do not invent facts that contradict it.\n\n"
+        "Editorial constraints:\n"
+        "- Station, network, and channel identifiers (e.g. 'WBFF', 'CBS12 News', "
+        "'Channel 7', 'NRK', 'BBC', 'Al Jazeera') appear AT MOST ONCE across the "
+        "entire script, placed only in the sign-off / tag / wrap at the end. Do "
+        "NOT open the script, or any PKG VO narration section, with a station "
+        "or network name.\n"
+        "- If a source transcript contains a reporter identifier (e.g. a "
+        "stand-up with 'I'm Jane Doe for X News'), paraphrase without the "
+        "identifier when quoting in VO narration. Only the sign-off may use it.\n"
+        "- Do not invent a station identifier that is not present in the source "
+        "material or story metadata.\n\n"
         + "\n\n".join(context_sections)
     )
 

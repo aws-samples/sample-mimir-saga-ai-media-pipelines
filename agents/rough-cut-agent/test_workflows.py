@@ -907,3 +907,81 @@ class TestInstanceIdempotency:
         out, calls = self._run([], "Car Racing - VOSOT")
         assert calls["created_titles"] == ["Car Racing - VOSOT"]
         assert out["created"] is True
+
+
+
+# ---------------------------------------------------------------------------
+# Script synthesis prompt — editorial constraints (issue #21)
+# ---------------------------------------------------------------------------
+
+class TestSynthesizedScriptPromptConstraints:
+    """The AI-VO script generation prompt must carry explicit constraints that
+    station / network / channel identifiers appear at most once in the script,
+    at the sign-off only. Carl's PSL AI-VO cut said 'CBS12' twice because the
+    LLM mimicked a source transcript stand-up ('CBS12 reporter Antoinette...')
+    AND invented a 'CBS12 News uncovered...' opener. Without the constraint in
+    the prompt the LLM has no reason to limit repetitions.
+
+    The prompt is built inside the function body (not a constant), so these
+    tests capture it by stubbing Agent to record its input, then asserting the
+    captured prompt string contains the editorial constraint markers.
+    """
+
+    def _capture_prompt(self, monkeypatch):
+        """Invoke rca._synthesize_script_from_transcripts with Agent stubbed to
+        record the prompt it receives. Returns the captured prompt string."""
+        captured = {}
+
+        class _FakeAgent:
+            def __init__(self, **kwargs):
+                captured["system_prompt"] = kwargs.get("system_prompt", "")
+            def __call__(self, prompt):
+                captured["user_prompt"] = prompt
+                return "SCRIPT OUTPUT"
+
+        monkeypatch.setattr(rca, "Agent", _FakeAgent)
+        monkeypatch.setattr(rca, "_get_bedrock_model", lambda: object())
+        # No transcripts available — prompt still gets built from title /
+        # content so synthesis proceeds (title + content pass the "any
+        # material" check).
+        rca._synthesize_script_from_transcripts(
+            story_title="Any Story",
+            story_description="",
+            enriched_assets=[],
+            story_content_text="Some substantive story context so synthesis runs.",
+        )
+        return captured
+
+    def test_prompt_restricts_station_identifier_to_signoff(self, monkeypatch):
+        prompt = self._capture_prompt(monkeypatch)["user_prompt"]
+        p = prompt.lower()
+        # The constraint must be present and name the behaviour unambiguously.
+        assert "at most once" in p, (
+            "Prompt must tell the model to use station identifiers at most once"
+        )
+        assert "sign-off" in p or "signoff" in p, (
+            "Prompt must direct identifier placement to the sign-off"
+        )
+        # The constraint must specifically name the artefact class.
+        assert ("station" in p and "network" in p) or "identifier" in p, (
+            "Prompt must call out station/network identifiers specifically"
+        )
+
+    def test_prompt_warns_against_opening_with_station_name(self, monkeypatch):
+        prompt = self._capture_prompt(monkeypatch)["user_prompt"].lower()
+        # Classic failure mode: AI opens with '<CALLSIGN> News uncovered...'.
+        # The prompt must explicitly disallow that so the LLM has a rule to
+        # cite when composing the opener.
+        assert "open" in prompt or "opening" in prompt, (
+            "Prompt must mention the opener case so the LLM applies the rule there"
+        )
+
+    def test_prompt_tells_model_to_paraphrase_identifier_in_transcripts(self, monkeypatch):
+        prompt = self._capture_prompt(monkeypatch)["user_prompt"].lower()
+        # Carl's PSL cut's 'CBS12 reporter Antoinette...' came from an input
+        # transcript. The prompt must tell the model to paraphrase around
+        # identifiers it finds in transcripts, not quote them verbatim.
+        assert "paraphrase" in prompt, (
+            "Prompt must tell the model to paraphrase around transcript "
+            "identifiers rather than quoting them verbatim"
+        )
