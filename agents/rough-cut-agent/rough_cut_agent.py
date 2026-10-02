@@ -2548,6 +2548,17 @@ def _synthesize_script_from_transcripts(
         "- A live tag or wrap\n\n"
         "Format the script clearly with section labels. Base the script on the "
         "provided material and do not invent facts that contradict it.\n\n"
+        "Editorial constraints:\n"
+        "- Station, network, and channel identifiers (e.g. 'WBFF', 'CBS12 News', "
+        "'Channel 7', 'NRK', 'BBC', 'Al Jazeera') appear AT MOST ONCE across the "
+        "entire script, placed only in the sign-off / tag / wrap at the end. Do "
+        "NOT open the script, or any PKG VO narration section, with a station "
+        "or network name.\n"
+        "- If a source transcript contains a reporter identifier (e.g. a "
+        "stand-up with 'I'm Jane Doe for X News'), paraphrase without the "
+        "identifier when quoting in VO narration. Only the sign-off may use it.\n"
+        "- Do not invent a station identifier that is not present in the source "
+        "material or story metadata.\n\n"
         + "\n\n".join(context_sections)
     )
 
@@ -2566,11 +2577,12 @@ def _synthesize_script_from_transcripts(
         return ""
 
 
-# Minimum word count for a linear-instance or story.content script to be
-# TRUSTED verbatim as the source. A real broadcast VO read easily clears this;
+# Minimum word count for a reporter linear-instance script to be TRUSTED
+# verbatim as the source. A real broadcast VO read easily clears this;
 # titles, stubs, and placeholders ("Car Racing", "INSUFFICIENT SCRIPT CONTENT
-# PROVIDED") fall below it, so we regenerate from context instead. Tunable via
-# the MIN_SCRIPT_WORDS env var.
+# PROVIDED") fall below it, so we regenerate from context instead. Tunable
+# via the MIN_SCRIPT_WORDS env var. (story.content is never trusted verbatim
+# regardless of length — see the comment next to Script source selection.)
 MIN_SCRIPT_WORDS = int(os.environ.get("MIN_SCRIPT_WORDS", "15"))
 
 # Substrings that mark a placeholder / non-script even if long enough.
@@ -2835,14 +2847,17 @@ def invoke(payload):
                 "agent-generated only)"
             )
 
-        # Story-level Content field is trusted as the script only when it is
-        # itself substantive AND there was no single reporter instance. When it
-        # is thin, it still feeds context-based generation below.
-        if not script_text.strip() and not reporter_candidates \
-                and _is_substantive_script(story_content_text):
-            script_text = story_content_text
-            script_source = "story.content"
-            logger.info(f"Using script from story.content ({len(script_text)} chars)")
+        # story.content is NEVER used as a verbatim broadcast script, even
+        # when the field is long and well-written. It is a free-form
+        # notes/reference field in Saga — users paste pasted web articles,
+        # source material, raw transcripts, bullet points, and other context
+        # into it. Treating any of that as broadcast copy produces off-brand
+        # output (a pasted web article has the publisher's name baked in
+        # throughout — on-air that reads as the AI voice crediting someone
+        # else's newsroom). Instead, story.content always feeds
+        # context-based generation below, where the model writes a broadcast
+        # script FROM it with the editorial constraints applied (identifiers
+        # at most once, at sign-off).
 
         logger.info(f"Script source: {script_source}")
 
