@@ -30,6 +30,97 @@ EMBEDDING_DIMENSION = 1024
 _NAT_GAIN_DEN = int(os.environ.get("NAT_SOUND_GAIN_DENOMINATOR", "10") or "10")
 NAT_SOUND_GAIN = (1, _NAT_GAIN_DEN if _NAT_GAIN_DEN > 0 else 10)
 
+# Cutter timeline frame rate (29.97 NTSC = 30000/1001 Hz).
+# Rough-cut outputs are rendered at 29.97fps. All timeline positions MUST be
+# expressed as rationals whose denominator is 30000 so clip boundaries fall
+# on integer frames (`numerator = frames * 1001`). The Cutter renderer snaps
+# any non-frame-aligned boundary to the nearest frame — and because the agent
+# previously wrote boundaries in integer milliseconds (denominator 1000), the
+# snap left 1-frame black gaps between docked clips. See issue #14.
+TIMELINE_FRAME_RATE_NUM = 1001
+TIMELINE_FRAME_RATE_DEN = 30000  # 29.97 fps
+
+
+def _ms_to_frame_rational(ms: float) -> dict:
+    """Convert *ms* to a Cutter rational snapped to the nearest 29.97fps frame.
+
+    Returns ``{"numerator": frames * 1001, "denominator": 30000}``. Negative
+    inputs (used by ``mediaStartOffset``) round symmetrically — a -5000ms
+    input returns the negative of what +5000ms would.
+    """
+    frames = round(ms * TIMELINE_FRAME_RATE_DEN / (1000 * TIMELINE_FRAME_RATE_NUM))
+    return {
+        "numerator": frames * TIMELINE_FRAME_RATE_NUM,
+        "denominator": TIMELINE_FRAME_RATE_DEN,
+    }
+
+
+# Default source media info used when the Mimir item lookup fails or an item
+# has no technicalMetadata (e.g. a Polly-generated voice-over we built
+# ourselves). 60s is the pre-existing fallback; the frame rate matches the
+# TIMELINE constants above.
+_DEFAULT_SOURCE_INFO = {
+    "duration_ms": 60000,
+    "frame_rate": 29.97,
+    "time_base_num": TIMELINE_FRAME_RATE_NUM,
+    "time_base_den": TIMELINE_FRAME_RATE_DEN,
+}
+
+
+def _extract_source_media_info(item_details: dict) -> dict:
+    """Extract duration / frame rate / time base from a Mimir item.
+
+    The relevant fields live under ``technicalMetadata.formData``:
+      - ``technical_media_duration`` (int ms)
+      - ``technical_video_frame_rate`` (float, e.g. 29.97)
+      - ``technical_video_time_base`` (string, e.g. ``"1001/30000"``)
+
+    The agent previously read ``details.get("duration", 60)`` at the top
+    level — a field Mimir does NOT return — so every item silently defaulted
+    to 60s. This helper reads the correct nested fields and falls back to
+    broadcast NTSC defaults only when a specific field is absent.
+
+    Returns a dict with ``duration_ms``, ``frame_rate``, ``time_base_num``,
+    and ``time_base_den``.
+    """
+    info = dict(_DEFAULT_SOURCE_INFO)
+    tm = (item_details or {}).get("technicalMetadata", {}).get("formData", {}) or {}
+    dur = tm.get("technical_media_duration")
+    if dur is not None:
+        info["duration_ms"] = int(dur)
+    elif (item_details or {}).get("frameCount"):
+        # Fall back to frameCount * (1001/30000)s when duration is absent.
+        info["duration_ms"] = int(item_details["frameCount"] * 1001 / 30)
+    fps = tm.get("technical_video_frame_rate")
+    if fps:
+        info["frame_rate"] = float(fps)
+    tb = tm.get("technical_video_time_base")
+    if tb and "/" in str(tb):
+        try:
+            num, den = str(tb).split("/")
+            info["time_base_num"] = int(num)
+            info["time_base_den"] = int(den)
+        except ValueError:
+            pass
+    return info
+
+
+def _resolve_source_info(cache: dict, mimir_id: str) -> dict:
+    """Resolve a source-info dict from *cache*, defaulting to NTSC/60s.
+
+    Accepts either the current dict shape (produced by
+    :func:`_extract_source_media_info`) or a legacy scalar duration in
+    seconds — the pre-fix shape — for backward compatibility with existing
+    unit tests. Returns a fresh dict each call so callers can mutate safely.
+    """
+    v = cache.get(mimir_id)
+    if isinstance(v, dict):
+        return dict(v)
+    info = dict(_DEFAULT_SOURCE_INFO)
+    if isinstance(v, (int, float)):
+        info["duration_ms"] = int(v * 1000)
+    return info
+
 # ---------------------------------------------------------------------------
 # Text-to-speech sanitization
 # ---------------------------------------------------------------------------
@@ -300,27 +391,26 @@ def _build_legacy_timeline_payload(sequence_details, item_details_cache):
         out_point_ms = clip.get("outPoint", in_point_ms + clip.get("duration", 5000))
 
         if mimir_id not in item_refs:
-            duration_s = item_details_cache.get(mimir_id, 60)
+            info = _resolve_source_info(item_details_cache, mimir_id)
             item_refs[mimir_id] = {
                 "type": "video",
                 "nAudioChannels": 2,
-                "durationInSeconds": {"numerator": int(duration_s * 1000), "denominator": 1000},
-                "frameDurationInSeconds": {"numerator": 1001, "denominator": 30000},
+                "durationInSeconds": {"numerator": info["duration_ms"], "denominator": 1000},
+                "frameDurationInSeconds": {
+                    "numerator": info["time_base_num"], "denominator": info["time_base_den"]
+                },
                 "hasIndexFile": False,
             }
 
         src_id = f"id-{src_counter}"
-        in_point_s = in_point_ms / 1000.0
-        out_point_s = out_point_ms / 1000.0
-        timeline_pos_s = timeline_position_ms / 1000.0
-        offset_s = timeline_pos_s - in_point_s
+        offset_ms = timeline_position_ms - in_point_ms
 
         source_refs[src_id] = {
             "type": "video-with-audio",
             "itemId": mimir_id,
-            "mediaStartOffset": {"numerator": int(offset_s * 1000), "denominator": 1000},
-            "videoInPointInSeconds": {"numerator": int(in_point_s * 1000), "denominator": 1000},
-            "videoOutPointInSeconds": {"numerator": int(out_point_s * 1000), "denominator": 1000},
+            "mediaStartOffset": _ms_to_frame_rational(offset_ms),
+            "videoInPointInSeconds": _ms_to_frame_rational(in_point_ms),
+            "videoOutPointInSeconds": _ms_to_frame_rational(out_point_ms),
             "audioInPoint": {"type": "follow-video"},
             "audioOutPoint": {"type": "follow-video"},
         }
@@ -431,27 +521,26 @@ def _build_multitrack_timeline_payload(sequence_details, item_details_cache):
 
         # Register video item ref
         if mimir_id not in item_refs:
-            duration_s = item_details_cache.get(mimir_id, 60)
+            info = _resolve_source_info(item_details_cache, mimir_id)
             item_refs[mimir_id] = {
                 "type": "video",
                 "nAudioChannels": 2,
-                "durationInSeconds": {"numerator": int(duration_s * 1000), "denominator": 1000},
-                "frameDurationInSeconds": {"numerator": 1001, "denominator": 30000},
+                "durationInSeconds": {"numerator": info["duration_ms"], "denominator": 1000},
+                "frameDurationInSeconds": {
+                    "numerator": info["time_base_num"], "denominator": info["time_base_den"]
+                },
                 "hasIndexFile": False,
             }
 
         src_id = f"id-{src_counter}"
-        in_point_s = in_point_ms / 1000.0
-        out_point_s = out_point_ms / 1000.0
-        start_s = start_ms / 1000.0
-        offset_s = start_s - in_point_s
+        offset_ms = start_ms - in_point_ms
 
         source_refs[src_id] = {
             "type": "video-with-audio",
             "itemId": mimir_id,
-            "mediaStartOffset": {"numerator": int(offset_s * 1000), "denominator": 1000},
-            "videoInPointInSeconds": {"numerator": int(in_point_s * 1000), "denominator": 1000},
-            "videoOutPointInSeconds": {"numerator": int(out_point_s * 1000), "denominator": 1000},
+            "mediaStartOffset": _ms_to_frame_rational(offset_ms),
+            "videoInPointInSeconds": _ms_to_frame_rational(in_point_ms),
+            "videoOutPointInSeconds": _ms_to_frame_rational(out_point_ms),
             "audioInPoint": {"type": "follow-video"},
             "audioOutPoint": {"type": "follow-video"},
         }
@@ -498,27 +587,26 @@ def _build_multitrack_timeline_payload(sequence_details, item_details_cache):
         out_point_ms = min(out_point_ms, in_point_ms + timeline_dur_ms)
 
         if mimir_id not in item_refs:
-            duration_s = item_details_cache.get(mimir_id, 60)
+            info = _resolve_source_info(item_details_cache, mimir_id)
             item_refs[mimir_id] = {
                 "type": "video",
                 "nAudioChannels": 2,
-                "durationInSeconds": {"numerator": int(duration_s * 1000), "denominator": 1000},
-                "frameDurationInSeconds": {"numerator": 1001, "denominator": 30000},
+                "durationInSeconds": {"numerator": info["duration_ms"], "denominator": 1000},
+                "frameDurationInSeconds": {
+                    "numerator": info["time_base_num"], "denominator": info["time_base_den"]
+                },
                 "hasIndexFile": False,
             }
 
         src_id = f"id-{src_counter}"
-        in_point_s = in_point_ms / 1000.0
-        out_point_s = out_point_ms / 1000.0
-        start_s = start_ms / 1000.0
-        offset_s = start_s - in_point_s
+        offset_ms = start_ms - in_point_ms
 
         source_refs[src_id] = {
             "type": "video-with-audio",
             "itemId": mimir_id,
-            "mediaStartOffset": {"numerator": int(offset_s * 1000), "denominator": 1000},
-            "videoInPointInSeconds": {"numerator": int(in_point_s * 1000), "denominator": 1000},
-            "videoOutPointInSeconds": {"numerator": int(out_point_s * 1000), "denominator": 1000},
+            "mediaStartOffset": _ms_to_frame_rational(offset_ms),
+            "videoInPointInSeconds": _ms_to_frame_rational(in_point_ms),
+            "videoOutPointInSeconds": _ms_to_frame_rational(out_point_ms),
             "audioInPoint": {"type": "follow-video"},
             "audioOutPoint": {"type": "follow-video"},
         }
@@ -568,42 +656,38 @@ def _build_multitrack_timeline_payload(sequence_details, item_details_cache):
                 }
 
             src_id = f"id-{src_counter}"
-            in_point_s = in_point_ms / 1000.0
-            out_point_s = out_point_ms / 1000.0
-            start_s = start_ms / 1000.0
-            offset_s = start_s - in_point_s
+            offset_ms = start_ms - in_point_ms
 
             source_refs[src_id] = {
                 "type": "audio",
                 "itemId": mimir_id,
-                "mediaStartOffset": {"numerator": int(offset_s * 1000), "denominator": 1000},
-                "audioInPointInSeconds": {"numerator": int(in_point_s * 1000), "denominator": 1000},
-                "audioOutPointInSeconds": {"numerator": int(out_point_s * 1000), "denominator": 1000},
+                "mediaStartOffset": _ms_to_frame_rational(offset_ms),
+                "audioInPointInSeconds": _ms_to_frame_rational(in_point_ms),
+                "audioOutPointInSeconds": _ms_to_frame_rational(out_point_ms),
             }
         else:
             # Video-with-audio source (reporter-provided VO from a video asset)
             if mimir_id not in item_refs:
-                duration_s = item_details_cache.get(mimir_id, 60)
+                info = _resolve_source_info(item_details_cache, mimir_id)
                 item_refs[mimir_id] = {
                     "type": "video",
                     "nAudioChannels": 2,
-                    "durationInSeconds": {"numerator": int(duration_s * 1000), "denominator": 1000},
-                    "frameDurationInSeconds": {"numerator": 1001, "denominator": 30000},
+                    "durationInSeconds": {"numerator": info["duration_ms"], "denominator": 1000},
+                    "frameDurationInSeconds": {
+                        "numerator": info["time_base_num"], "denominator": info["time_base_den"]
+                    },
                     "hasIndexFile": False,
                 }
 
             src_id = f"id-{src_counter}"
-            in_point_s = in_point_ms / 1000.0
-            out_point_s = out_point_ms / 1000.0
-            start_s = start_ms / 1000.0
-            offset_s = start_s - in_point_s
+            offset_ms = start_ms - in_point_ms
 
             source_refs[src_id] = {
                 "type": "video-with-audio",
                 "itemId": mimir_id,
-                "mediaStartOffset": {"numerator": int(offset_s * 1000), "denominator": 1000},
-                "videoInPointInSeconds": {"numerator": int(in_point_s * 1000), "denominator": 1000},
-                "videoOutPointInSeconds": {"numerator": int(out_point_s * 1000), "denominator": 1000},
+                "mediaStartOffset": _ms_to_frame_rational(offset_ms),
+                "videoInPointInSeconds": _ms_to_frame_rational(in_point_ms),
+                "videoOutPointInSeconds": _ms_to_frame_rational(out_point_ms),
                 "audioInPoint": {"type": "follow-video"},
                 "audioOutPoint": {"type": "follow-video"},
             }
@@ -691,6 +775,10 @@ def create_timeline(
     logger.info(f"Created timeline item: {item_id}")
 
     # Step 2: Get source item details for Cutter itemRefs
+    # Mimir stores duration and frame rate under technicalMetadata.formData,
+    # NOT at the top level. Reading `details["duration"]` returns None and
+    # silently falls back to 60s for every item — _extract_source_media_info
+    # reads the correct nested fields.
     item_details_cache = {}
     for pid in parent_item_ids:
         try:
@@ -699,11 +787,19 @@ def create_timeline(
                 headers=_mimir_auth_headers(), timeout=30
             )
             resp.raise_for_status()
-            details = resp.json()
-            duration = details.get("duration", 60)
-            item_details_cache[pid] = duration
-        except Exception:
-            item_details_cache[pid] = 60  # default 60s
+            info = _extract_source_media_info(resp.json())
+            item_details_cache[pid] = info
+            logger.debug(
+                f"source {pid}: {info['duration_ms'] / 1000:.3f}s @ "
+                f"{info['frame_rate']}fps ({info['time_base_num']}/{info['time_base_den']})"
+            )
+        except Exception as e:
+            logger.warning(
+                f"source {pid}: Mimir lookup failed ({e}); defaulting to "
+                f"{_DEFAULT_SOURCE_INFO['duration_ms'] / 1000}s/"
+                f"{_DEFAULT_SOURCE_INFO['frame_rate']}fps"
+            )
+            item_details_cache[pid] = dict(_DEFAULT_SOURCE_INFO)
 
     # Step 3: Determine format and build Cutter payload
     tracks = sequence_details.get("tracks", [])
