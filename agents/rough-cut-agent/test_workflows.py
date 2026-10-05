@@ -348,21 +348,46 @@ class TestScriptSourceSelection:
         story_context = patches["run_script_analysis"].call_args[0][0]
         return story_context, patches
 
-    def test_thin_instance_ignored_uses_story_content(self):
-        # An 11-char stub instance ("Car Racing") must NOT win over a real
-        # story.content script — this is the bug that broke the Car Racing run.
+    def test_substantive_story_content_still_generates_from_context(self):
+        # story.content is a free-form notes/reference field (users paste web
+        # articles, source material, raw transcripts). It is NEVER trusted as
+        # a verbatim script, even when "substantive" by word count — treating
+        # a pasted article as broadcast copy produces off-brand output (the
+        # publisher's station name baked into the AI voice). Instead,
+        # story.content always feeds context-based generation.
         thin = _linear_instance("Car Racing", title="Car Racing")
-        ctx, p = self._run([thin], _SUBSTANTIVE)
-        assert ctx["script"] == _SUBSTANTIVE
-        p["_synthesize_script_from_transcripts"].assert_not_called()
+        ctx, p = self._run([thin], _SUBSTANTIVE,
+                           synth_return="SYNTHESIZED SCRIPT FROM CONTEXT")
+        p["_synthesize_script_from_transcripts"].assert_called_once()
+        assert ctx["script"] == "SYNTHESIZED SCRIPT FROM CONTEXT"
+        # story.content is handed to the synthesizer as context, not script.
+        _, kwargs = p["_synthesize_script_from_transcripts"].call_args
+        assert kwargs["story_content_text"] == _SUBSTANTIVE
+
+    def test_no_instances_and_substantive_content_generates_from_context(self):
+        # Same rule applies with zero instances: substantive story.content
+        # routes to synthesis, not verbatim use.
+        ctx, p = self._run([], _SUBSTANTIVE,
+                           synth_return="SYNTHESIZED SCRIPT FROM CONTEXT")
+        p["_synthesize_script_from_transcripts"].assert_called_once()
+        assert ctx["script"] == "SYNTHESIZED SCRIPT FROM CONTEXT"
 
     def test_agent_generated_instance_ignored(self):
         # An instance THIS agent created ("<story> - VO") must never feed back
-        # in as the input script.
+        # in as the input script. Falls through to context-based generation
+        # (which uses story.content as source material, not as script).
         gen = _linear_instance(_SUBSTANTIVE + " generated copy", title="Test Story - VO")
-        ctx, _ = self._run([gen], _SUBSTANTIVE)
-        assert ctx["script"] == _SUBSTANTIVE
+        ctx, p = self._run([gen], _SUBSTANTIVE,
+                           synth_return="SYNTHESIZED SCRIPT FROM CONTEXT")
+        # Script is synthesized, not pulled verbatim from the agent-generated
+        # instance OR from story.content.
+        p["_synthesize_script_from_transcripts"].assert_called_once()
+        assert ctx["script"] == "SYNTHESIZED SCRIPT FROM CONTEXT"
+        # The agent-generated instance's content must not leak through.
         assert "generated copy" not in ctx["script"]
+        # story.content is handed to the synthesizer as context, not as script.
+        _, kwargs = p["_synthesize_script_from_transcripts"].call_args
+        assert kwargs["story_content_text"] == _SUBSTANTIVE
 
     def test_single_reporter_instance_used(self):
         # One substantive, non-generated instance is the authoritative script,
@@ -907,3 +932,184 @@ class TestInstanceIdempotency:
         out, calls = self._run([], "Car Racing - VOSOT")
         assert calls["created_titles"] == ["Car Racing - VOSOT"]
         assert out["created"] is True
+
+
+
+# ---------------------------------------------------------------------------
+# Script synthesis prompt — editorial constraints (issue #21)
+# ---------------------------------------------------------------------------
+
+class TestSynthesizedScriptPromptConstraints:
+    """The AI-VO script generation prompt must carry explicit constraints that
+    station / network / channel identifiers appear at most once in the script,
+    at the sign-off only. Carl's PSL AI-VO cut said 'CBS12' twice because the
+    LLM mimicked a source transcript stand-up ('CBS12 reporter Antoinette...')
+    AND invented a 'CBS12 News uncovered...' opener. Without the constraint in
+    the prompt the LLM has no reason to limit repetitions.
+
+    The prompt is built inside the function body (not a constant), so these
+    tests capture it by stubbing Agent to record its input, then asserting the
+    captured prompt string contains the editorial constraint markers.
+    """
+
+    def _capture_prompt(self, monkeypatch, shot_config=None):
+        """Invoke rca._synthesize_script_from_transcripts with Agent stubbed to
+        record the prompt it receives. Returns the captured prompt string.
+
+        *shot_config* exercises the profile-aware length branching (short-form
+        vs full package). Default None preserves the legacy (unconstrained)
+        prompt shape so the existing identifier tests keep covering it.
+        """
+        captured = {}
+
+        class _FakeAgent:
+            def __init__(self, **kwargs):
+                captured["system_prompt"] = kwargs.get("system_prompt", "")
+            def __call__(self, prompt):
+                captured["user_prompt"] = prompt
+                return "SCRIPT OUTPUT"
+
+        monkeypatch.setattr(rca, "Agent", _FakeAgent)
+        monkeypatch.setattr(rca, "_get_bedrock_model", lambda: object())
+        # No transcripts available — prompt still gets built from title /
+        # content so synthesis proceeds (title + content pass the "any
+        # material" check).
+        rca._synthesize_script_from_transcripts(
+            story_title="Any Story",
+            story_description="",
+            enriched_assets=[],
+            story_content_text="Some substantive story context so synthesis runs.",
+            shot_config=shot_config,
+        )
+        return captured
+
+    def test_prompt_restricts_station_identifier_to_signoff(self, monkeypatch):
+        prompt = self._capture_prompt(monkeypatch)["user_prompt"]
+        p = prompt.lower()
+        # The constraint must be present and name the behaviour unambiguously.
+        assert "at most once" in p, (
+            "Prompt must tell the model to use station identifiers at most once"
+        )
+        assert "sign-off" in p or "signoff" in p, (
+            "Prompt must direct identifier placement to the sign-off"
+        )
+        # The constraint must specifically name the artefact class.
+        assert ("station" in p and "network" in p) or "identifier" in p, (
+            "Prompt must call out station/network identifiers specifically"
+        )
+
+    def test_prompt_warns_against_opening_with_station_name(self, monkeypatch):
+        prompt = self._capture_prompt(monkeypatch)["user_prompt"].lower()
+        # Classic failure mode: AI opens with '<CALLSIGN> News uncovered...'.
+        # The prompt must explicitly disallow that so the LLM has a rule to
+        # cite when composing the opener.
+        assert "open" in prompt or "opening" in prompt, (
+            "Prompt must mention the opener case so the LLM applies the rule there"
+        )
+
+    def test_prompt_tells_model_to_paraphrase_identifier_in_transcripts(self, monkeypatch):
+        prompt = self._capture_prompt(monkeypatch)["user_prompt"].lower()
+        # Carl's PSL cut's 'CBS12 reporter Antoinette...' came from an input
+        # transcript. The prompt must tell the model to paraphrase around
+        # identifiers it finds in transcripts, not quote them verbatim.
+        assert "paraphrase" in prompt, (
+            "Prompt must tell the model to paraphrase around transcript "
+            "identifiers rather than quoting them verbatim"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Script synthesis — profile-aware length (issue #21 follow-up / issue #13)
+# ---------------------------------------------------------------------------
+# The script-synthesis prompt now shapes the target length from the active
+# profile's shot_config. Without this, the LLM wrote a full package script
+# (observed: 188s totalEstimatedDurationMs for a 30s AI-VO target) and the
+# downstream timeline-assembly truncated — the result was a cut that dropped
+# the back half of the story.
+
+class TestSynthesisLengthByProfile:
+    def _capture(self, monkeypatch, shot_config):
+        captured = {}
+
+        class _FakeAgent:
+            def __init__(self, **kwargs):
+                captured["system_prompt"] = kwargs.get("system_prompt", "")
+            def __call__(self, prompt):
+                captured["user_prompt"] = prompt
+                return "SCRIPT OUTPUT"
+
+        monkeypatch.setattr(rca, "Agent", _FakeAgent)
+        monkeypatch.setattr(rca, "_get_bedrock_model", lambda: object())
+        rca._synthesize_script_from_transcripts(
+            story_title="Any Story",
+            story_description="",
+            enriched_assets=[],
+            story_content_text="Some substantive story context so synthesis runs.",
+            shot_config=shot_config,
+        )
+        return captured["user_prompt"]
+
+    def test_short_form_profile_asks_for_short_vo_only_script(self, monkeypatch):
+        """AI-VO / VO / VOSOT shot_config (target_video_duration_s <= 30)
+        must produce a short-form read, NOT a full package script.
+        """
+        shot = profiles._shot_config()  # defaults: 20s script / 30s TRT
+        prompt = self._capture(monkeypatch, shot).lower()
+        # Length target communicated clearly
+        assert "short-form" in prompt
+        assert "20 seconds" in prompt
+        assert "50 words" in prompt
+        # Short-form must NOT also ask for anchor intro / SOT / tag
+        assert "do not include an anchor" in prompt or "stripped-down" in prompt
+        # The full-package wording must NOT appear
+        assert "complete broadcast news package" not in prompt
+        assert "90 seconds" not in prompt
+
+    def test_package_profile_asks_for_full_package_at_target_trt(self, monkeypatch):
+        """Package shot_config (target_video_duration_s > 30s) must produce a
+        full package script with the right TRT and the right narration budget.
+        """
+        shot = profiles._shot_config(script_s=60, video_s=90)
+        prompt = self._capture(monkeypatch, shot).lower()
+        # Target total runtime surfaces the TRT
+        assert "90 seconds" in prompt
+        # Voice-over narration budget surfaces the script_duration
+        assert "60 seconds" in prompt
+        # Word budget derived from script_duration_s * 2.5
+        assert "150 words" in prompt
+        # Package wording keeps the anchor intro / SOT / tag structure
+        assert "anchor introduction" in prompt
+        assert "sot" in prompt
+        assert "live tag" in prompt or "wrap" in prompt
+        # Short-form opt-outs do NOT apply
+        assert "stripped-down" not in prompt
+        assert "20 seconds" not in prompt
+
+    def test_no_shot_config_falls_back_to_legacy_package_wording(self, monkeypatch):
+        """Backward compatibility: callers that pass no shot_config get the
+        legacy 'complete broadcast news package script' wording."""
+        prompt = self._capture(monkeypatch, shot_config=None).lower()
+        assert "complete broadcast news package script" in prompt
+
+    def test_package_profile_shot_config_targets_90s_trt(self):
+        """The Package profile's shot_config carries the longer TRT target
+        (~1:30 broadcast package convention), distinct from the short-form
+        VO family's 30s target. Guards against accidental revert via a
+        future refactor.
+        """
+        package_shot = profiles.get_profile("package")["shot"]
+        assert package_shot["target_video_duration_s"] >= 60, (
+            "Package profile should target a longer TRT than short-form "
+            f"profiles. Got {package_shot['target_video_duration_s']}s."
+        )
+        assert package_shot["script_duration_s"] >= 40, (
+            f"Package script read should be substantially longer than "
+            f"short-form; got {package_shot['script_duration_s']}s."
+        )
+        # Short-form profiles still target 30s
+        for name in ("vo", "vosot", "ai-vo"):
+            short_shot = profiles.get_profile(name)["shot"]
+            assert short_shot["target_video_duration_s"] <= 30, (
+                f"{name} profile should stay short-form; "
+                f"got {short_shot['target_video_duration_s']}s."
+            )
