@@ -42,14 +42,20 @@ def _env_int(name: str, default: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Editorial defaults (Sinclair) — named constants, env-overridable
+# Editorial defaults — named constants, env-overridable
 # ---------------------------------------------------------------------------
-# Standard VO: ~20s script read, ~30s of usable video (the extra ~10s is
+# Short-form VO: ~20s script read, ~30s of usable video (the extra ~10s is
 # intentional padding for anchor read-speed variation and editorial trimming;
 # it need NOT be split symmetrically head/tail). Shots target ~4s and should
 # stay within a 3–5s band.
 VO_SCRIPT_DURATION_S = _env_int("VO_SCRIPT_DURATION_S", 20)
 VO_TARGET_VIDEO_DURATION_S = _env_int("VO_TARGET_VIDEO_DURATION_S", 30)
+# Full rough-cut package: ~1:30 TRT, with the voice-over narration itself
+# totalling ~60s (the remaining ~30s is anchor intro, SOT soundbites, nat
+# sound, and wrap). Env-overridable so newsrooms with different package
+# conventions can retune without a code change.
+PACKAGE_SCRIPT_DURATION_S = _env_int("PACKAGE_SCRIPT_DURATION_S", 60)
+PACKAGE_TARGET_VIDEO_DURATION_S = _env_int("PACKAGE_TARGET_VIDEO_DURATION_S", 90)
 TARGET_SHOT_DURATION_S = _env_int("TARGET_SHOT_DURATION_S", 4)
 MIN_SHOT_DURATION_S = _env_int("MIN_SHOT_DURATION_S", 3)
 MAX_SHOT_DURATION_S = _env_int("MAX_SHOT_DURATION_S", 5)
@@ -169,15 +175,21 @@ def _vo_timeline_directive(shot: dict, with_sot: bool, synth: bool = True) -> st
 
 
 ROUGH_CUT_PROFILES = {
-    # Generate Package — the full rough cut: script + B-roll + SOT + AI voice,
-    # unconstrained (no VO-only / 30s-cap directives). This is the "Package"
-    # custom action (the original full rough-cut behavior).
+    # Generate Package — the full rough cut: script + B-roll + SOT + AI
+    # voice. Targets a traditional ~1:30 TRT (60s of VO narration + 30s of
+    # SOT / intro / wrap / nats), unlike the short-form VO family (30s TRT).
+    # No per-section script/timeline DIRECTIVES — the Package shape is
+    # driven by the shot_config targets and the context-synthesis prompt
+    # (which reads the shot_config to shape the generated script's length).
     "package": {
         "label": "Generate Package",
         "timeline_suffix": "Package",
         "synthesize_voiceover": True,
         "include_sot": True,
-        "shot": _shot_config(),
+        "shot": _shot_config(
+            script_s=PACKAGE_SCRIPT_DURATION_S,
+            video_s=PACKAGE_TARGET_VIDEO_DURATION_S,
+        ),
         "script_directive": "",
         "timeline_directive": "",
     },

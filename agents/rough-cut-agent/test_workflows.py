@@ -952,9 +952,14 @@ class TestSynthesizedScriptPromptConstraints:
     captured prompt string contains the editorial constraint markers.
     """
 
-    def _capture_prompt(self, monkeypatch):
+    def _capture_prompt(self, monkeypatch, shot_config=None):
         """Invoke rca._synthesize_script_from_transcripts with Agent stubbed to
-        record the prompt it receives. Returns the captured prompt string."""
+        record the prompt it receives. Returns the captured prompt string.
+
+        *shot_config* exercises the profile-aware length branching (short-form
+        vs full package). Default None preserves the legacy (unconstrained)
+        prompt shape so the existing identifier tests keep covering it.
+        """
         captured = {}
 
         class _FakeAgent:
@@ -974,6 +979,7 @@ class TestSynthesizedScriptPromptConstraints:
             story_description="",
             enriched_assets=[],
             story_content_text="Some substantive story context so synthesis runs.",
+            shot_config=shot_config,
         )
         return captured
 
@@ -1010,3 +1016,100 @@ class TestSynthesizedScriptPromptConstraints:
             "Prompt must tell the model to paraphrase around transcript "
             "identifiers rather than quoting them verbatim"
         )
+
+
+# ---------------------------------------------------------------------------
+# Script synthesis — profile-aware length (issue #21 follow-up / issue #13)
+# ---------------------------------------------------------------------------
+# The script-synthesis prompt now shapes the target length from the active
+# profile's shot_config. Without this, the LLM wrote a full package script
+# (observed: 188s totalEstimatedDurationMs for a 30s AI-VO target) and the
+# downstream timeline-assembly truncated — the result was a cut that dropped
+# the back half of the story.
+
+class TestSynthesisLengthByProfile:
+    def _capture(self, monkeypatch, shot_config):
+        captured = {}
+
+        class _FakeAgent:
+            def __init__(self, **kwargs):
+                captured["system_prompt"] = kwargs.get("system_prompt", "")
+            def __call__(self, prompt):
+                captured["user_prompt"] = prompt
+                return "SCRIPT OUTPUT"
+
+        monkeypatch.setattr(rca, "Agent", _FakeAgent)
+        monkeypatch.setattr(rca, "_get_bedrock_model", lambda: object())
+        rca._synthesize_script_from_transcripts(
+            story_title="Any Story",
+            story_description="",
+            enriched_assets=[],
+            story_content_text="Some substantive story context so synthesis runs.",
+            shot_config=shot_config,
+        )
+        return captured["user_prompt"]
+
+    def test_short_form_profile_asks_for_short_vo_only_script(self, monkeypatch):
+        """AI-VO / VO / VOSOT shot_config (target_video_duration_s <= 30)
+        must produce a short-form read, NOT a full package script.
+        """
+        shot = profiles._shot_config()  # defaults: 20s script / 30s TRT
+        prompt = self._capture(monkeypatch, shot).lower()
+        # Length target communicated clearly
+        assert "short-form" in prompt
+        assert "20 seconds" in prompt
+        assert "50 words" in prompt
+        # Short-form must NOT also ask for anchor intro / SOT / tag
+        assert "do not include an anchor" in prompt or "stripped-down" in prompt
+        # The full-package wording must NOT appear
+        assert "complete broadcast news package" not in prompt
+        assert "90 seconds" not in prompt
+
+    def test_package_profile_asks_for_full_package_at_target_trt(self, monkeypatch):
+        """Package shot_config (target_video_duration_s > 30s) must produce a
+        full package script with the right TRT and the right narration budget.
+        """
+        shot = profiles._shot_config(script_s=60, video_s=90)
+        prompt = self._capture(monkeypatch, shot).lower()
+        # Target total runtime surfaces the TRT
+        assert "90 seconds" in prompt
+        # Voice-over narration budget surfaces the script_duration
+        assert "60 seconds" in prompt
+        # Word budget derived from script_duration_s * 2.5
+        assert "150 words" in prompt
+        # Package wording keeps the anchor intro / SOT / tag structure
+        assert "anchor introduction" in prompt
+        assert "sot" in prompt
+        assert "live tag" in prompt or "wrap" in prompt
+        # Short-form opt-outs do NOT apply
+        assert "stripped-down" not in prompt
+        assert "20 seconds" not in prompt
+
+    def test_no_shot_config_falls_back_to_legacy_package_wording(self, monkeypatch):
+        """Backward compatibility: callers that pass no shot_config get the
+        legacy 'complete broadcast news package script' wording."""
+        prompt = self._capture(monkeypatch, shot_config=None).lower()
+        assert "complete broadcast news package script" in prompt
+
+    def test_package_profile_shot_config_targets_90s_trt(self):
+        """The Package profile's shot_config carries the longer TRT target
+        (~1:30 broadcast package convention), distinct from the short-form
+        VO family's 30s target. Guards against accidental revert via a
+        future refactor.
+        """
+        package_shot = profiles.get_profile("package")["shot"]
+        assert package_shot["target_video_duration_s"] >= 60, (
+            "Package profile should target a longer TRT than short-form "
+            f"profiles. Got {package_shot['target_video_duration_s']}s."
+        )
+        assert package_shot["script_duration_s"] >= 40, (
+            f"Package script read should be substantially longer than "
+            f"short-form; got {package_shot['script_duration_s']}s."
+        )
+        # Short-form profiles still target 30s
+        for name in ("vo", "vosot", "ai-vo"):
+            short_shot = profiles.get_profile(name)["shot"]
+            assert short_shot["target_video_duration_s"] <= 30, (
+                f"{name} profile should stay short-form; "
+                f"got {short_shot['target_video_duration_s']}s."
+            )

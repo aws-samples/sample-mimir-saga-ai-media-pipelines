@@ -2431,6 +2431,89 @@ def _gather_model_knowledge(
         return ""
 
 
+# Approximate broadcast reading speed. 150 wpm is the long-standing US
+# broadcast norm — slower than conversational speech so the audience can
+# follow a complex story. Used to translate a target read-duration into a
+# word budget for the script-synthesis prompt.
+_BROADCAST_WORDS_PER_SECOND = 2.5
+
+
+def _build_script_length_directive(shot_config: dict) -> tuple[str, str]:
+    """Return (preface, closing_scope) prompt strings describing the target
+    read length for the synthesized script.
+
+    The preface replaces the opening "write a complete broadcast news
+    package script" sentence with wording that matches the profile's
+    target TRT. The closing_scope is appended near the editorial
+    constraints to reinforce the length constraint from a second angle
+    (prompts repeat key constraints to raise compliance).
+
+    Falls back to the legacy "complete broadcast news package" wording
+    when no shot_config is supplied (keeps backward-compat for callers
+    that haven't been updated yet).
+    """
+    if not shot_config:
+        preface = (
+            "You are a broadcast news producer. Using the material below, "
+            "write a complete broadcast news package script. Include an "
+            "anchor introduction, voice-over narration sections (PKG VO) "
+            "that tell the story, sound-on-tape sections (SOT) using "
+            "direct quotes from the transcripts (attributed to the "
+            "speaker, only when the transcripts contain usable quotes), "
+            "and a live tag or wrap."
+        )
+        return preface, ""
+
+    trt_s = int(shot_config.get("target_video_duration_s", 30))
+    script_s = int(shot_config.get("script_duration_s", trt_s))
+    words = max(1, round(script_s * _BROADCAST_WORDS_PER_SECOND))
+
+    if trt_s <= 30:
+        # Short-form: VO-only, no SOTs, no anchor intro. Matches the
+        # VO / VOSOT / AI-VO profiles' timeline-level directives.
+        preface = (
+            "You are a broadcast news producer. Using the material below, "
+            f"write a SHORT-FORM broadcast voice-over read of ABOUT "
+            f"{script_s} SECONDS (~{words} words). Produce 1-3 CONCISE "
+            "PKG VO narration sections. Do NOT include an anchor "
+            "introduction, SOT soundbites, or a live tag — this is a "
+            "stripped-down voice-over cut, not a full package."
+        )
+        closing_scope = (
+            f"- Total voice-over read MUST be about {script_s} seconds "
+            f"(~{words} words). Scripts significantly longer than this "
+            "will be truncated at render time; prefer concision over "
+            "completeness.\n"
+        )
+    else:
+        # Full package: anchor intro + PKG VOs + SOTs + wrap, totalling
+        # roughly the profile's target TRT. The script_duration_s is the
+        # voice-over narration budget specifically (the remainder is intro,
+        # SOTs, and wrap).
+        preface = (
+            "You are a broadcast news producer. Using the material below, "
+            "write a broadcast news package script with a TARGET TOTAL "
+            f"RUNTIME of ABOUT {trt_s} SECONDS. The voice-over narration "
+            f"portion (PKG VO sections combined) should total ABOUT "
+            f"{script_s} SECONDS (~{words} words). Include:\n"
+            "- A brief anchor introduction\n"
+            "- 2-4 PKG VO narration sections that tell the story\n"
+            "- 1-2 SOT soundbite segments using direct quotes from the "
+            "transcripts, attributed to the speaker (only when the "
+            "transcripts contain usable quotes)\n"
+            "- A brief live tag or wrap"
+        )
+        closing_scope = (
+            f"- Target total runtime is {trt_s} seconds; voice-over "
+            f"narration itself should be about {script_s} seconds "
+            f"(~{words} words). The remainder is anchor intro, SOT "
+            "soundbites, and wrap. Scripts significantly longer than this "
+            "will be truncated at render time; prefer concision over "
+            "completeness.\n"
+        )
+    return preface, closing_scope
+
+
 def _synthesize_script_from_transcripts(
     story_title: str,
     story_description: str,
@@ -2438,6 +2521,7 @@ def _synthesize_script_from_transcripts(
     story_content_text: str = "",
     research_text: str = "",
     model_knowledge: str = "",
+    shot_config: dict = None,
 ) -> str:
     """Synthesize a broadcast script from all available context.
 
@@ -2445,8 +2529,18 @@ def _synthesize_script_from_transcripts(
     instance, has multiple ambiguous instances, or only a thin placeholder).
     Combines whatever context exists — asset transcripts (from S3 or the
     per-asset timed-transcript URL), the story Content field, the Research
-    section/notes, and model background knowledge — and asks the model to write
-    a complete broadcast package script from that material.
+    section/notes, and model background knowledge — and asks the model to
+    write a broadcast script from that material.
+
+    The script's TARGET LENGTH is derived from *shot_config*:
+      - When *shot_config.target_video_duration_s* is <= 30s, the prompt
+        asks for a short-form voice-over read (~20s / ~50 words, no SOTs,
+        no anchor intro).
+      - When it is > 30s, the prompt asks for a full package script with
+        the voice-over narration totalling ~*script_duration_s* seconds
+        and a target TRT of ~*target_video_duration_s* seconds.
+      - When *shot_config* is None, the legacy "complete broadcast news
+        package script" wording is used (unconstrained).
 
     Args:
         story_title: The story title.
@@ -2455,6 +2549,9 @@ def _synthesize_script_from_transcripts(
         story_content_text: Plain text of the story Content field (context).
         research_text: Research/notes text gathered for the story (context).
         model_knowledge: Model background knowledge on the topic (context).
+        shot_config: The active profile's shot/duration config
+            (e.g. ``profile["shot"]``). Shapes the target script length —
+            see function body for the branching.
 
     Returns:
         A synthesized script string, or empty string if no material at all.
@@ -2538,27 +2635,25 @@ def _synthesize_script_from_transcripts(
     if combined:
         context_sections.append(f"## Transcripts\n{combined[:12000]}")
 
+    preface, length_closing = _build_script_length_directive(shot_config)
     prompt = (
-        "You are a broadcast news producer. Using the material below, write a "
-        "complete broadcast news package script. Include:\n"
-        "- An anchor introduction\n"
-        "- Voice-over narration sections (PKG VO) that tell the story\n"
-        "- Sound-on-tape sections (SOT) using direct quotes from the transcripts, "
-        "attributed to the speaker (only when the transcripts contain usable quotes)\n"
-        "- A live tag or wrap\n\n"
-        "Format the script clearly with section labels. Base the script on the "
-        "provided material and do not invent facts that contradict it.\n\n"
+        preface + "\n\n"
+        "Format the script clearly with section labels. Base the script on "
+        "the provided material and do not invent facts that contradict it.\n\n"
         "Editorial constraints:\n"
-        "- Station, network, and channel identifiers (e.g. 'WBFF', 'CBS12 News', "
-        "'Channel 7', 'NRK', 'BBC', 'Al Jazeera') appear AT MOST ONCE across the "
-        "entire script, placed only in the sign-off / tag / wrap at the end. Do "
-        "NOT open the script, or any PKG VO narration section, with a station "
-        "or network name.\n"
+        "- Station, network, and channel identifiers (e.g. 'WBFF', "
+        "'CBS12 News', 'Channel 7', 'NRK', 'BBC', 'Al Jazeera') appear AT "
+        "MOST ONCE across the entire script, placed only in the sign-off "
+        "/ tag / wrap at the end. Do NOT open the script, or any PKG VO "
+        "narration section, with a station or network name.\n"
         "- If a source transcript contains a reporter identifier (e.g. a "
         "stand-up with 'I'm Jane Doe for X News'), paraphrase without the "
-        "identifier when quoting in VO narration. Only the sign-off may use it.\n"
-        "- Do not invent a station identifier that is not present in the source "
-        "material or story metadata.\n\n"
+        "identifier when quoting in VO narration. Only the sign-off may "
+        "use it.\n"
+        "- Do not invent a station identifier that is not present in the "
+        "source material or story metadata.\n"
+        + length_closing
+        + "\n"
         + "\n\n".join(context_sections)
     )
 
@@ -2941,6 +3036,11 @@ def invoke(payload):
                 story_content_text=story_content_text,
                 research_text=research_text,
                 model_knowledge=model_knowledge,
+                # Shape the synthesized script's TRT to the active profile.
+                # Without this, the LLM writes a long-form "complete package"
+                # that the downstream timeline-assembly then truncates — the
+                # result is a cut that drops the back half of the story.
+                shot_config=profile.get("shot"),
             )
             if synthesized:
                 script_text = synthesized
