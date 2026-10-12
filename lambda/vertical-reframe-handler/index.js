@@ -591,13 +591,24 @@ exports.handler = async (event) => {
       //   the source's descriptive metadata (station, team, topics, etc.).
       // - Overrides default_title to "<original title> - <aspect ratio>" so
       //   it's distinguishable from the source in Mimir listings.
-      // - OVERRIDES content_type to "Social Post" regardless of the source's
-      //   content_type (typically "Raw"). All reframe outputs (9:16, 1:1,
-      //   4:5) are social-aspect renders by definition, so they should be
-      //   classified as Social Post in the MDF rather than inheriting the
-      //   source's category. The field id is defined by the Mimir MDF —
-      //   keep in sync with lambda/classify-clip-handler/index.js.
+      // - OVERRIDES content_type to the "02_social_post" enum value
+      //   regardless of the source's content_type (typically "Raw"). All
+      //   reframe outputs (9:16, 1:1, 4:5) are social-aspect renders by
+      //   definition, so they belong in the Social Post bucket in the MDF
+      //   rather than inheriting the source's category.
+      //
+      // Mimir's content_type field is a dropdown backed by an MDF enum. The
+      // VALUE must match an allowed option exactly — the Mimir API accepts
+      // any string on PATCH but the UI dropdown renders blank when the
+      // stored value doesn't resolve to an allowed enum entry. Current
+      // allowed values in the default MDF (from GET /api/v1/mdfs/default):
+      //   01_package, 01_SOT, 01_VO, 02_social_post, Archive, audio,
+      //   auto_ingest, graphic, other, paid, promo, Raw
+      // If the MDF enum is renamed, update CONTENT_TYPE_SOCIAL_POST here.
+      // The field id is defined by the Mimir MDF — keep in sync with
+      // lambda/classify-clip-handler/index.js.
       const CONTENT_TYPE_FIELD_ID = 'b6cf1a25-f765-4284-bcac-1823b9c5ea0f';
+      const CONTENT_TYPE_SOCIAL_POST = '02_social_post';
       try {
         const sourceFormData = originalItem?.metadata?.formData || {};
         const formId = originalItem?.metadata?.formId || 'default';
@@ -605,7 +616,7 @@ exports.handler = async (event) => {
         if (copiedFormData.default_title !== undefined) {
           copiedFormData.default_title = reframedTitle;
         }
-        copiedFormData[CONTENT_TYPE_FIELD_ID] = 'Social Post';
+        copiedFormData[CONTENT_TYPE_FIELD_ID] = CONTENT_TYPE_SOCIAL_POST;
         await fetch(`${mimirBaseUrl}/api/v1/itemMetadata/${newItem.id}`, {
           method: 'PATCH',
           headers: {
@@ -615,7 +626,7 @@ exports.handler = async (event) => {
           },
           body: JSON.stringify({ metadataDelta: { formId, formData: copiedFormData } })
         });
-        console.log('Wrote metadata to new item (content_type=Social Post)');
+        console.log(`Wrote metadata to new item (content_type=${CONTENT_TYPE_SOCIAL_POST})`);
       } catch (metaErr) {
         console.warn(`Failed to write metadata (non-fatal): ${metaErr.message}`);
       }
