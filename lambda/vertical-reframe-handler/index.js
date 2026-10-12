@@ -586,30 +586,38 @@ exports.handler = async (event) => {
         }
       }
 
-      // Step 7: Copy metadata from the original item (fetched above), setting the
-      // title metadata to "<original title> - <aspect ratio>" so it carries the
-      // original clip's metadata but is distinguishable from the source.
+      // Step 7: Write metadata on the new reframed item.
+      // - Copies most of the original item's formData so the clip inherits
+      //   the source's descriptive metadata (station, team, topics, etc.).
+      // - Overrides default_title to "<original title> - <aspect ratio>" so
+      //   it's distinguishable from the source in Mimir listings.
+      // - OVERRIDES content_type to "Social Post" regardless of the source's
+      //   content_type (typically "Raw"). All reframe outputs (9:16, 1:1,
+      //   4:5) are social-aspect renders by definition, so they should be
+      //   classified as Social Post in the MDF rather than inheriting the
+      //   source's category. The field id is defined by the Mimir MDF —
+      //   keep in sync with lambda/classify-clip-handler/index.js.
+      const CONTENT_TYPE_FIELD_ID = 'b6cf1a25-f765-4284-bcac-1823b9c5ea0f';
       try {
-        const formData = originalItem?.metadata?.formData;
+        const sourceFormData = originalItem?.metadata?.formData || {};
         const formId = originalItem?.metadata?.formId || 'default';
-        if (formData) {
-          const copiedFormData = { ...formData };
-          if (copiedFormData.default_title !== undefined) {
-            copiedFormData.default_title = reframedTitle;
-          }
-          await fetch(`${mimirBaseUrl}/api/v1/itemMetadata/${newItem.id}`, {
-            method: 'PATCH',
-            headers: {
-              'Accept': 'application/json',
-              'Content-Type': 'application/json',
-              'x-mimir-cognito-id-token': `Bearer ${apiKey}`
-            },
-            body: JSON.stringify({ metadataDelta: { formId, formData: copiedFormData } })
-          });
-          console.log('Copied metadata from original to new item');
+        const copiedFormData = { ...sourceFormData };
+        if (copiedFormData.default_title !== undefined) {
+          copiedFormData.default_title = reframedTitle;
         }
+        copiedFormData[CONTENT_TYPE_FIELD_ID] = 'Social Post';
+        await fetch(`${mimirBaseUrl}/api/v1/itemMetadata/${newItem.id}`, {
+          method: 'PATCH',
+          headers: {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'x-mimir-cognito-id-token': `Bearer ${apiKey}`
+          },
+          body: JSON.stringify({ metadataDelta: { formId, formData: copiedFormData } })
+        });
+        console.log('Wrote metadata to new item (content_type=Social Post)');
       } catch (metaErr) {
-        console.warn(`Failed to copy metadata (non-fatal): ${metaErr.message}`);
+        console.warn(`Failed to write metadata (non-fatal): ${metaErr.message}`);
       }
 
       return {
