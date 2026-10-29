@@ -424,12 +424,23 @@ exports.handler = async (event) => {
       // Pass 2: Composite MOV overlay onto smart-cropped video.
       // Input: croppedVideoUri (output of pass 1).
       // Overlay: overlayS3Uri — QuickTime MOV (qtrle + argb).
-      // Captions: vttUrl (Mimir pre-signed URL) — staged to S3 for MediaConvert.
+      // Captions: vttUrl (Mimir pre-signed URL) — staged to S3 for MediaConvert
+      //           *only* when the producer opted in via the custom-action
+      //           "Add Text on Scr" checkbox (burnCaptions === true).
       // Output: {itemId}/composited/{basename}_{aspect}.mp4
-      const { croppedVideoUri, overlayS3Uri, aspectRatio, itemId, originalFileName, vttUrl } = event;
+      const { croppedVideoUri, overlayS3Uri, aspectRatio, itemId, originalFileName, vttUrl, burnCaptions } = event;
 
-      // Stage VTT from Mimir pre-signed URL to S3 so MediaConvert can read it
-      const vttS3Uri = await stageVttToS3(vttUrl, OUTPUT_BUCKET, itemId);
+      // Strict opt-in: anything other than the exact value `true` leaves the
+      // composite caption-free, matching the Mimir custom-action default
+      // (checkbox starts unchecked). This is a deliberate behaviour change
+      // from the prior "burn-in whenever Mimir has a VTT" default.
+      const captionsRequested = burnCaptions === true;
+      const vttS3Uri = captionsRequested
+        ? await stageVttToS3(vttUrl, OUTPUT_BUCKET, itemId)
+        : null;
+      if (!captionsRequested) {
+        console.log(`Caption burn-in skipped — burnCaptions=${JSON.stringify(burnCaptions)}`);
+      }
 
       const job = await createCompositedJob(
         croppedVideoUri,
