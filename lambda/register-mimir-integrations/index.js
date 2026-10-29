@@ -16,14 +16,20 @@ const secretsClient = new SecretsManagerClient();
 // MDF schema for the Reframe + Graphics custom action.
 //
 // Four producer-editable fields that each override one slot of the auto-
-// generated graphics overlay. Field `key` values here MUST match what the
-// downstream Lambdas (mimir-handler, classify-category-handler,
-// vertical-reframe-handler) read out of `actionData` — Mimir posts the user's
-// values back to the webhook keyed by `key`.
+// generated graphics overlay. The `fieldId` values here are the keys Mimir
+// posts back on the webhook as `actionData[fieldId]`, so downstream Lambdas
+// (mimir-handler, classify-category-handler, vertical-reframe-handler) read
+// them by these exact names.
+//
+// Schema shape follows Mimir's MdfField + LayoutSettings contract:
+//   fields[] carry the data model (id/fieldId/type/required/alternatives)
+//   view[]   carries the UI layout (id/fieldId/label/visible/flex)
+// Labels live on the view entry, not on the field itself. Setting a label on
+// the field is silently dropped and the admin UI then shows the Metadata tab
+// with empty rows (observed on the first deploy of this action).
 //
 // Field IDs are deterministic (fixed UUIDs) so re-registering the action in
-// place preserves the view ordering. Alternative IDs on the choice field do
-// not need to be UUIDs — Mimir accepts any string.
+// place keeps a stable identity.
 // ---------------------------------------------------------------------------
 const REFRAME_WITH_GRAPHICS_FIELD_IDS = {
   title:       'a1b2c3d4-0000-4000-8000-000000000001',
@@ -60,43 +66,62 @@ const REFRAME_WITH_GRAPHICS_MDF_SCHEMAS = {
     fields: [
       {
         id: REFRAME_WITH_GRAPHICS_FIELD_IDS.title,
-        key: 'title',
-        label: 'Title',
+        fieldId: 'title',
         type: 'text',
         required: false,
       },
       {
         id: REFRAME_WITH_GRAPHICS_FIELD_IDS.summary,
-        key: 'summary',
-        label: 'Summary',
+        fieldId: 'summary',
         type: 'text',
         required: false,
       },
       {
         id: REFRAME_WITH_GRAPHICS_FIELD_IDS.gfxTemplate,
-        key: 'gfx_template',
-        label: 'GFX',
+        fieldId: 'gfx_template',
         type: 'choice',
         required: false,
-        alternatives: GFX_TEMPLATE_OPTIONS.map((v, i) => ({
-          id: `gfx-${i + 1}`,
+        alternatives: GFX_TEMPLATE_OPTIONS.map((v) => ({
           value: v,
           label: v,
         })),
       },
       {
         id: REFRAME_WITH_GRAPHICS_FIELD_IDS.toa,
-        key: 'toa',
-        label: 'Add Text on Scr',
+        fieldId: 'toa',
         type: 'checkbox',
         required: false,
       },
     ],
     view: [
-      { fieldId: REFRAME_WITH_GRAPHICS_FIELD_IDS.title },
-      { fieldId: REFRAME_WITH_GRAPHICS_FIELD_IDS.summary },
-      { fieldId: REFRAME_WITH_GRAPHICS_FIELD_IDS.gfxTemplate },
-      { fieldId: REFRAME_WITH_GRAPHICS_FIELD_IDS.toa },
+      {
+        id: REFRAME_WITH_GRAPHICS_FIELD_IDS.title,
+        fieldId: 'title',
+        visible: true,
+        label: 'Title',
+        flex: 12,
+      },
+      {
+        id: REFRAME_WITH_GRAPHICS_FIELD_IDS.summary,
+        fieldId: 'summary',
+        visible: true,
+        label: 'Summary',
+        flex: 12,
+      },
+      {
+        id: REFRAME_WITH_GRAPHICS_FIELD_IDS.gfxTemplate,
+        fieldId: 'gfx_template',
+        visible: true,
+        label: 'GFX',
+        flex: 12,
+      },
+      {
+        id: REFRAME_WITH_GRAPHICS_FIELD_IDS.toa,
+        fieldId: 'toa',
+        visible: true,
+        label: 'Add Text on Scr',
+        flex: 12,
+      },
     ],
   },
   subTypes: [],
