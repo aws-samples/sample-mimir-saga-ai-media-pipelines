@@ -958,33 +958,26 @@ def ffmpeg_composite_overlays(persistent_mov: str, text_mov: str,
                               fps: float) -> None:
     """Composite the two overlay MOVs into a single MOV sized to `duration_seconds`.
 
-    The persistent MOV carries the sidebar / logo / category label (and the
-    scrolling-text animation inside the station template's sidebar sub-comp,
-    which runs the full duration we render). The text MOV carries the title
-    / summary and bakes its own alpha fade-out via render_lottie.js. We
-    compose text on top of persistent from timestamp 0 and clip the output
-    at `duration_seconds`. If the persistent MOV is shorter than the clip,
-    `tpad=stop_mode=clone` holds its final frame to fill the remainder (the
-    sidebar scroll freezes in that case — ok for clips longer than Lottie's
-    native 180s outpoint).
+    The persistent MOV carries the sidebar / logo / category label plus the
+    station template's scrolling "LOCAL NEWS" text, rendered for one full
+    15-second scroll cycle. We `-stream_loop -1` it so the loop restarts
+    seamlessly: at both ends of the cycle the scrolling text is off-screen
+    (Y=4064 below, Y=-893 above), so there's no visible pop at the
+    boundary. The text MOV carries the title / summary and bakes its own
+    alpha fade-out via render_lottie.js. We compose text on top of
+    persistent from timestamp 0 and clip the output at `duration_seconds`.
 
     Output: qtrle + rgba MOV with alpha channel preserved, as MediaConvert's
     MotionImageInserter requires.
     """
-    # Pad the persistent base to the full clip duration. tpad is cheap when
-    # the persistent already covers the clip (just emits nothing). Pass a
-    # slightly longer duration than requested and then trim at `-t` on
-    # output so the tpad vs. output framerate math never leaves us one
-    # frame short.
-    pad_seconds = max(0.0, duration_seconds + 1.0)
-    filter_graph = (
-        f'[0:v]tpad=stop_mode=clone:stop_duration={pad_seconds:.3f}[bg];'
-        f'[bg][1:v]overlay=eof_action=pass:format=auto'
-    )
+    filter_graph = '[0:v][1:v]overlay=eof_action=pass:format=auto'
 
     cmd = [
         '/usr/local/bin/ffmpeg',
         '-y',
+        # Loop the persistent MOV indefinitely; `-t` on output trims to the
+        # clip length. Must be an INPUT option, placed before `-i`.
+        '-stream_loop', '-1',
         '-i', persistent_mov,
         '-i', text_mov,
         '-filter_complex', filter_graph,
@@ -1289,11 +1282,14 @@ def handler(event, context):
         # visibly pop.
         fps = float(lottie_data['fr'])
         # Safety cap: a long clip could push persistent render past the
-        # Lambda timeout. 60s of persistent is enough for every short-form
-        # social clip we've seen; longer clips tpad-freeze the final frame
-        # in the composite below, so the sidebar stays on screen (scroll
-        # stops) rather than disappearing.
-        PERSISTENT_FRAMES_SAFETY_CAP = int(60 * fps)
+        # subprocess timeout. 15 seconds (450 frames @ 29.97) is exactly
+        # one cycle of the station template's sidebar scroll — the inner
+        # 15sec sub-comp animates its text string from Y=4064 to Y=-893
+        # over this range, so both the first and last captured frames
+        # have the text off-screen. Looping that chunk via
+        # ffmpeg_composite_overlays below gives us a continuous scroll
+        # for any clip length without hitting the render budget.
+        PERSISTENT_FRAMES_SAFETY_CAP = int(15 * fps)
         lottie_total_frames = int(lottie_data.get('op', 0))
         persistent_frames_requested = int(round(video_duration_seconds * fps))
         persistent_frames_available = max(0, lottie_total_frames - persistent_start_frame)
