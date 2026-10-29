@@ -2572,6 +2572,11 @@ export class InfrastructureStack extends cdk.Stack {
         'transcript.$': '$$.Execution.Input.transcript',
         'mimirDetails.$': '$.mimirDetails',
         'mimirApiKey.$': '$$.Execution.Input.mimirApiKey',
+        // Producer-supplied overrides from the Mimir custom-action metadata
+        // form. Always an object (mimir-handler normalises null fields when
+        // the producer leaves them blank), so classify-category-handler can
+        // selectively bypass or short-circuit the Bedrock call.
+        'userMetadata.$': '$$.Execution.Input.userMetadata',
       }),
       resultPath: '$.classification',
       outputPath: '$',
@@ -2586,10 +2591,14 @@ export class InfrastructureStack extends cdk.Stack {
         'metadata': {},
         'mimirApiKey.$': '$$.Execution.Input.mimirApiKey',
       }),
-      // Extract mimirDetails and proxyUrl; baseFilename derived from originalFileName
+      // Extract mimirDetails, proxyUrl, and the normalised videoDurationMs
+      // (always a number, 0 when technicalMetadata hasn't populated yet).
+      // The RenderOverlay task reads videoDurationMs to size the combined
+      // overlay MOV to match the clip length.
       resultSelector: {
         'mimirDetails.$': '$.Payload.mimirDetails',
         'proxyUrl.$': '$.Payload.proxyUrl',
+        'videoDurationMs.$': '$.Payload.videoDurationMs',
       },
       resultPath: '$',
     });
@@ -2606,6 +2615,16 @@ export class InfrastructureStack extends cdk.Stack {
         'mimirDetails.$': '$.mimirDetails',
         'lottieTemplates.$': '$.lottieTemplates',
         'templateKey.$': '$.lottieTemplates[\'9:16\']',
+        'videoDurationMs.$': '$.videoDurationMs',
+        // Lower-third placement: calibrated against customer reference art,
+        // which lands the title top around 72% of frame height. Yoffsets
+        // scale with frame height so all three aspects share a visual
+        // position (300 / 1920 ≈ 15.6%, applied proportionally below).
+        // Font size held constant since the frame width is 1080 for every
+        // aspect — the kicker lines (Line 1/2/3) overran 100pt at 16 chars
+        // so the override brings them to 80pt.
+        'textYOffset': 300,
+        'textFontSize': 80,
       },
     });
     const setTemplate11 = new stepfunctions.Pass(this, 'SetTemplate11', {
@@ -2617,6 +2636,10 @@ export class InfrastructureStack extends cdk.Stack {
         'mimirDetails.$': '$.mimirDetails',
         'lottieTemplates.$': '$.lottieTemplates',
         'templateKey.$': '$.lottieTemplates[\'1:1\']',
+        'videoDurationMs.$': '$.videoDurationMs',
+        // 300 * (1080 / 1920) ≈ 170
+        'textYOffset': 170,
+        'textFontSize': 80,
       },
     });
     const setTemplate45 = new stepfunctions.Pass(this, 'SetTemplate45', {
@@ -2628,6 +2651,10 @@ export class InfrastructureStack extends cdk.Stack {
         'mimirDetails.$': '$.mimirDetails',
         'lottieTemplates.$': '$.lottieTemplates',
         'templateKey.$': '$.lottieTemplates[\'4:5\']',
+        'videoDurationMs.$': '$.videoDurationMs',
+        // 300 * (1350 / 1920) ≈ 210
+        'textYOffset': 210,
+        'textFontSize': 80,
       },
     });
 
@@ -2654,9 +2681,24 @@ export class InfrastructureStack extends cdk.Stack {
         'line3.$': '$.classification.Payload.line3',
         'location.$': '$.classification.Payload.location',
         'headline.$': '$.classification.Payload.headline',
-        // Cap at 450 frames (15s at 29.97fps) — MediaConvert loops the overlay
-        // via Playback: REPEAT so we don't need to match the full video duration.
-        'maxFrames': 450,
+        // Target TEXT overlay timeline: 8 seconds total, dissolving out
+        // over the final 2 seconds (frames 180–240 ramp alpha from 1.0 →
+        // 0.0 via FFmpeg `fade=t=out:alpha=1`). The persistent variant
+        // (sidebar/logo/category label) is rendered separately at frame
+        // 90 and extended by FFmpeg tpad to the clip duration before the
+        // text is composited on top. MediaConvert then plays the combined
+        // MOV with `Playback: ONCE` for exactly the clip length.
+        'maxFrames': 240,
+        'fadeOutDurationSeconds': 2,
+        // Clip duration (ms) normalised by mimir-details-handler — always a
+        // number, 0 if the Mimir item's technicalMetadata hadn't finished
+        // populating yet. The handler falls back to 60s when it sees 0 so
+        // the pipeline degrades gracefully instead of failing the state.
+        'videoDurationMs.$': '$.videoDurationMs',
+        // Per-aspect lower-third placement + kicker-line font size override,
+        // set in the SetTemplate91X passes above and threaded through here.
+        'textYOffset.$': '$.textYOffset',
+        'textFontSize.$': '$.textFontSize',
       }),
       resultPath: '$.overlayResult',
     });
@@ -2717,6 +2759,10 @@ export class InfrastructureStack extends cdk.Stack {
         // burned in. Resolved to "" upstream when the item has no VTT, so a
         // caption-less item doesn't fail this state with States.Runtime.
         'vttUrl.$': '$.vttUrlResolved',
+        // Strict producer opt-in — only true (checkbox checked) triggers
+        // caption burn-in; false / undefined keeps the composite caption-free
+        // even when the item has a VTT.
+        'burnCaptions.$': '$$.Execution.Input.userMetadata.burnCaptions',
       }),
       resultPath: '$.compositedResult',
     });
@@ -2824,6 +2870,9 @@ export class InfrastructureStack extends cdk.Stack {
         // Pass the full lottieTemplates map into each branch so RenderOverlay
         // can reference the correct key via a States.Format expression
         'lottieTemplates.$': '$$.Execution.Input.lottieTemplates',
+        // Clip duration (ms) — RenderOverlay needs this to size the FFmpeg
+        // tpad extension on the persistent variant to the full clip length.
+        'videoDurationMs.$': '$.videoDurationMs',
       },
     }).itemProcessor(perAspectRatioBranch);
 

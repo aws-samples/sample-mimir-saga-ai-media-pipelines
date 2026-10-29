@@ -29,6 +29,7 @@ gradient fills). The reference template ships without those layers, so both
 steps log a warning and no-op. They are retained for templates that add them.
 """
 
+import copy
 import json
 import logging
 import os
@@ -47,21 +48,27 @@ s3_client = boto3.client('s3')
 # Matches the 'Choose News Type' effect on the 'sidebar control' null layer
 # ---------------------------------------------------------------------------
 
+# Entries include both the Lottie template's native names (ENTERTAINMENT,
+# POLITICS) and the Amagi-style labels exposed to producers via the Mimir
+# custom-action `gfx_template` choice (ENTERTAINMENT NEWS, NEWS & POLITICS).
+# Both forms resolve to the same dropdown index / brand color, so whichever
+# string the classifier or producer sends renders the same visual treatment.
 CATEGORY_DROPDOWN = {
-    'LOCAL NEWS':        1,
-    'BREAKING NEWS':     2,
-    'ENTERTAINMENT':     3,
-    'NATIONAL NEWS':     4,
-    'POLITICS':          5,
-    'SPORTS':            6,
-    'WORLD NEWS':        7,
-    'WEATHER':           8,
+    'LOCAL NEWS':         1,
+    'BREAKING NEWS':      2,
+    'ENTERTAINMENT':      3,
+    'ENTERTAINMENT NEWS': 3,
+    'NATIONAL NEWS':      4,
+    'POLITICS':           5,
+    'NEWS & POLITICS':    5,
+    'SPORTS':             6,
+    'WORLD NEWS':         7,
+    'WEATHER':            8,
 }
 
 # Aliases for common variations
 CATEGORY_ALIASES = {
     'ENTERTAINMENT / LIFESTYLE': 'ENTERTAINMENT',
-    'NEWS & POLITICS':           'POLITICS',
     'BUSINESS & FINANCE':        'NATIONAL NEWS',
     'EDUCATION':                 'NATIONAL NEWS',
     'LOCAL LIVING':              'LOCAL NEWS',
@@ -75,16 +82,20 @@ CATEGORY_ALIASES = {
     'BREAKING':                  'BREAKING NEWS',
 }
 
-# Category → accent color (hex)
+# Category → accent color (hex). ENTERTAINMENT NEWS / NEWS & POLITICS are
+# the Amagi dropdown labels and share colours with their short-form equivalents
+# so the brand treatment stays consistent across both naming styles.
 CATEGORY_COLORS = {
-    'LOCAL NEWS':        '#EFA192',
-    'BREAKING NEWS':     '#DC0101',
-    'ENTERTAINMENT':     '#764BD9',
-    'NATIONAL NEWS':     '#06569D',
-    'POLITICS':          '#4A4A4A',
-    'SPORTS':            '#000000',
-    'WORLD NEWS':        '#4A4A4A',
-    'WEATHER':           '#9C86A7',
+    'LOCAL NEWS':         '#EFA192',
+    'BREAKING NEWS':      '#DC0101',
+    'ENTERTAINMENT':      '#764BD9',
+    'ENTERTAINMENT NEWS': '#764BD9',
+    'NATIONAL NEWS':      '#06569D',
+    'POLITICS':           '#4A4A4A',
+    'NEWS & POLITICS':    '#4A4A4A',
+    'SPORTS':             '#000000',
+    'WORLD NEWS':         '#4A4A4A',
+    'WEATHER':            '#9C86A7',
 }
 
 DEFAULT_CATEGORY = 'BREAKING NEWS'
@@ -750,8 +761,256 @@ def _hide_matte_layers(data: dict) -> None:
     logger.info(f"_hide_matte_layers: hid {hidden} matte sources, unmatted {unmatted} targets")
 
 
+# ---------------------------------------------------------------------------
+# Dual-variant rendering: split the Lottie into "text" and "persistent" halves
+# ---------------------------------------------------------------------------
+#
+# The overlay has two visual groups that need different on-screen lifetimes:
+#
+#   TEXT GROUP      — animates in with the clip, holds, then dissolves.
+#   PERSISTENT GROUP — appears from the first frame and stays on-screen for
+#                      the entire clip (sidebar colour wash + logo bug +
+#                      category label + optional location/credit).
+#
+# MediaConvert's MotionImageInserter only allows one MOV overlay per output,
+# so we render two patched clones of the Lottie — one with each group hidden
+# via opacity=0 — then FFmpeg-composite them into a single MOV sized to the
+# clip. The text MOV plays once with a fade-out; the persistent frame is
+# frozen and extended to match the clip duration.
+#
+# Note on parenting: opacity does NOT cascade through parent chains in
+# lottie-web (confirmed by patch_lottie which sets opacity 0 on both
+# Location/Courtesy and location/courtesy-TextBox when location is empty).
+# So we hide every child layer explicitly rather than relying on a parent
+# alpha blend.
+
+# The pipeline has shipped two Lottie template designs across different
+# tenants: a 14-layer customer-agnostic reference (the one committed to the
+# repo) and a 33-layer station toolkit variant (the one still live in some
+# S3 buckets, carrying a full category-sidebar system + per-category gradient
+# fills + an extra TextBox copy on each label). Both share the same text
+# layer names on the animated group, so the TEXT matcher is a simple
+# frozenset. The PERSISTENT matcher is a predicate so it can also cover
+# the station variant's sidebar/gradient layers by prefix/substring.
+
+# Hidden in the PERSISTENT variant → keeps the sidebar/logo/category label
+# visible. Line 1-3 and body text are already text layers; `breaking line`
+# is a shape layer so hiding it needs an explicit entry here.
+TEXT_LAYER_NAMES = frozenset([
+    'Line 1',
+    'Line 2',
+    'Line 3',
+    'body text',
+    'breaking line',
+])
+
+# Exact names of persistent-group layers across both known template variants.
+_PERSISTENT_EXACT_NAMES = frozenset([
+    # Customer-agnostic reference template (14 layers)
+    'logo_placeholder',
+    'Category Label',
+    'Category Label-TextBox',
+    # Station toolkit template (33 layers) uses different names
+    'logo_wpde_abc15.png',
+    'BREAKING NEWS',             # the station variant's category label layer
+    'BREAKING NEWS-TextBox',
+    'BREAKING NEWS-TextBox 2',   # auto-sizing stub left over from After Effects
+    # Shared across both variants
+    'Location/Courtesy',
+    'location/courtesy-TextBox',
+    'location/courtesy-TextBox 2',
+])
+
+
+def _is_persistent_layer(name: str) -> bool:
+    """Return True for any layer that must stay visible for the full clip.
+
+    Covers both known Lottie template variants:
+      - exact-name matches for logo / category label / location-credit
+      - prefix match for the station template's `sidebar_<category> - Nmin`
+        sub-comp layers (one per category — only the matching one is visible)
+    """
+    stripped = (name or '').strip()
+    if stripped in _PERSISTENT_EXACT_NAMES:
+        return True
+    if stripped.startswith('sidebar_'):
+        return True
+    return False
+
+
+def _is_text_layer(name: str) -> bool:
+    """Return True for any layer in the animated title/summary text group.
+
+    Includes the per-category `<Category> Gradient` root-level fills — those
+    are the colour wash behind the title (not the sidebar's own colour,
+    which lives inside the `sidebar_*` sub-comps). The customer wants the
+    gradient to dissolve off with the title text, not persist.
+    """
+    stripped = (name or '').strip()
+    if stripped in TEXT_LAYER_NAMES:
+        return True
+    if stripped.endswith('Gradient'):
+        return True
+    return False
+
+
+def shift_text_block_down(data: dict, offset_y: float) -> int:
+    """Move the title/summary block vertically by `offset_y` pixels (positive = down).
+
+    The template parents Line 2/3, body text, breaking line, and the Category
+    Label to `Line 1`, so shifting Line 1's Y value cascades to every child —
+    we only have to touch one layer. Both the keyframe values and the inline
+    expression's `baseY` are updated so the shift lands whether lottie-web
+    evaluates the expression or falls back to the keyframes.
+
+    Gradient fills behind the title are shifted alongside, so the colour wash
+    stays anchored under the text instead of leaving a seam.
+
+    Returns the number of layers mutated (for logging). A zero or missing
+    `offset_y` is a no-op.
+    """
+    import re
+    if not offset_y:
+        return 0
+
+    def shift_split_axis(axis: dict) -> None:
+        """Shift a Lottie split-position single-axis property in-place."""
+        if not isinstance(axis, dict):
+            return
+        k = axis.get('k')
+        if isinstance(k, list):
+            for kf in k:
+                if isinstance(kf, dict) and 's' in kf and isinstance(kf['s'], list):
+                    kf['s'] = [v + offset_y for v in kf['s']]
+        elif isinstance(k, (int, float)):
+            axis['k'] = k + offset_y
+        # Also patch baked-in expressions that read `baseY = <N>`
+        expr = axis.get('x')
+        if isinstance(expr, str):
+            axis['x'] = re.sub(
+                r'(baseY\s*=\s*)(-?\d+(?:\.\d+)?)',
+                lambda m: f'{m.group(1)}{float(m.group(2)) + offset_y}',
+                expr,
+            )
+
+    def shift_position(pos: dict) -> bool:
+        """Shift a Lottie position property. Returns True if touched."""
+        if not isinstance(pos, dict):
+            return False
+        if pos.get('s') is True:
+            # Split-position: shift only the Y axis
+            shift_split_axis(pos.get('y'))
+            return True
+        k = pos.get('k')
+        if isinstance(k, list):
+            # Static vector [x, y, (z)] or a keyframe list
+            if k and isinstance(k[0], (int, float)):
+                k[1] = k[1] + offset_y
+                return True
+            for kf in k:
+                if isinstance(kf, dict) and 's' in kf and isinstance(kf['s'], list) and len(kf['s']) >= 2:
+                    kf['s'][1] = kf['s'][1] + offset_y
+            return True
+        return False
+
+    moved = 0
+    # Line 1 is the parent of every animated text layer and of Category Label.
+    # Shifting its position propagates through the parent chain in lottie-web.
+    for layer in data.get('layers', []):
+        if (layer.get('nm') or '').strip() == 'Line 1':
+            if shift_position(layer.get('ks', {}).get('p', {})):
+                moved += 1
+            break
+    # Gradient fills are not parented, so they need their own shift.
+    for layer in data.get('layers', []):
+        nm = (layer.get('nm') or '').strip()
+        if nm.endswith('Gradient'):
+            if shift_position(layer.get('ks', {}).get('p', {})):
+                moved += 1
+    return moved
+
+
+def hide_layers_by_predicate(data: dict, predicate) -> int:
+    """Mark every layer whose name matches `predicate` as hidden.
+
+    Sets BOTH `hd: True` (Bodymovin's "disabled in AE" flag — lottie-web
+    skips the whole layer, including its sub-comp traversal, when this is
+    set) AND opacity 0 (belt-and-braces in case the particular renderer
+    build ignores `hd`). `hd` is the one that matters for render speed:
+    the station toolkit template has ~250 layers inside its sidebar
+    sub-comps, and composing them all per frame when hidden-by-opacity
+    is what pushed the persistent render over its subprocess timeout.
+
+    Walks root layers and every asset sub-comp. `predicate` receives the
+    layer's name (whitespace preserved so startswith/endswith callers can
+    handle their own normalisation) and returns True to hide. Returns the
+    number of layers mutated.
+    """
+    hidden = 0
+    all_layer_sets = [data.get('layers', [])]
+    for asset in data.get('assets', []):
+        if 'layers' in asset:
+            all_layer_sets.append(asset['layers'])
+
+    for layers in all_layer_sets:
+        for layer in layers:
+            name = layer.get('nm') or ''
+            if predicate(name):
+                layer['hd'] = True
+                layer.setdefault('ks', {})['o'] = {'a': 0, 'k': 0, 'ix': 11}
+                hidden += 1
+    return hidden
+
+
+def ffmpeg_composite_overlays(persistent_mov: str, text_mov: str,
+                              output_path: str, duration_seconds: float,
+                              fps: float) -> None:
+    """Composite the two overlay MOVs into a single MOV sized to `duration_seconds`.
+
+    The persistent MOV carries the sidebar / logo / category label plus the
+    station template's scrolling "LOCAL NEWS" text, rendered for one full
+    15-second scroll cycle. We `-stream_loop -1` it so the loop restarts
+    seamlessly: at both ends of the cycle the scrolling text is off-screen
+    (Y=4064 below, Y=-893 above), so there's no visible pop at the
+    boundary. The text MOV carries the title / summary and bakes its own
+    alpha fade-out via render_lottie.js. We compose text on top of
+    persistent from timestamp 0 and clip the output at `duration_seconds`.
+
+    Output: qtrle + rgba MOV with alpha channel preserved, as MediaConvert's
+    MotionImageInserter requires.
+    """
+    filter_graph = '[0:v][1:v]overlay=eof_action=pass:format=auto'
+
+    cmd = [
+        '/usr/local/bin/ffmpeg',
+        '-y',
+        # Loop the persistent MOV indefinitely; `-t` on output trims to the
+        # clip length. Must be an INPUT option, placed before `-i`.
+        '-stream_loop', '-1',
+        '-i', persistent_mov,
+        '-i', text_mov,
+        '-filter_complex', filter_graph,
+        '-t', f'{duration_seconds:.3f}',
+        '-r', str(fps),
+        '-c:v', 'qtrle',
+        '-pix_fmt', 'rgba',
+        '-movflags', '+faststart',
+        output_path,
+    ]
+    logger.info('Compositing overlays: ' + ' '.join(cmd))
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if result.stderr:
+        logger.info('ffmpeg_composite stderr:\n' + result.stderr[-2000:])
+    if result.returncode != 0:
+        raise RuntimeError(
+            f'ffmpeg composite failed (rc={result.returncode}): {result.stderr[-1500:]}'
+        )
+
+
 def render_lottie_to_mov(lottie_data: dict, output_path: str,
-                         max_frames: int = None) -> dict:
+                         max_frames: int = None,
+                         fade_out_seconds: float = 0.0,
+                         start_frame: int = 0) -> dict:
     """Render a Lottie JSON dict to a QuickTime Animation (qtrle) MOV with alpha.
 
     Uses Puppeteer + lottie-web (SVG renderer) via render_lottie.js subprocess.
@@ -761,6 +1020,14 @@ def render_lottie_to_mov(lottie_data: dict, output_path: str,
         lottie_data: Preprocessed and patched Lottie JSON dict.
         output_path: Local file path for the output MOV.
         max_frames: Optional cap on frame count (None = full animation).
+        fade_out_seconds: Alpha fade-out length applied to the end of the MOV.
+            0 (default) renders a hard cut on the final frame; any positive
+            value ramps the alpha channel down to 0 over the last N seconds
+            via an FFmpeg `fade=t=out:alpha=1` filter.
+        start_frame: Lottie frame index to begin rendering at. Lets a caller
+            skip past a one-shot slide-in and capture only the settled state
+            of the animation (used for the "persistent" overlay variant that
+            sits on-screen the whole clip). Default 0 renders from the start.
 
     Returns:
         dict with frameCount, fps, width, height
@@ -783,16 +1050,30 @@ def render_lottie_to_mov(lottie_data: dict, output_path: str,
             str(h),
             str(fps),
         ]
-        if max_frames is not None:
+        # Positional-arg order on the Node CLI is: max_frames, fade_out_seconds,
+        # start_frame. If a later arg is set but an earlier one isn't, pad with
+        # sentinel 0 so the positions line up.
+        need_fade = bool(fade_out_seconds and fade_out_seconds > 0)
+        need_start = bool(start_frame and start_frame > 0)
+        if need_start:
+            cmd.append(str(max_frames if max_frames is not None else 0))
+            cmd.append(str(fade_out_seconds or 0))
+            cmd.append(str(start_frame))
+        elif need_fade:
+            cmd.append(str(max_frames if max_frames is not None else 0))
+            cmd.append(str(fade_out_seconds))
+        elif max_frames is not None:
             cmd.append(str(max_frames))
 
         logger.info(f"Running: {' '.join(cmd)}")
 
+        # Lambda's overall timeout is 15 min; leave ~90s headroom for the
+        # subsequent FFmpeg composite + S3 upload.
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=600,  # 10 min max
+            timeout=810,
         )
 
         if result.stderr:
@@ -836,6 +1117,17 @@ def handler(event, context):
       location         (str)  Location / source credit (optional, default '')
       headline         (str)  Full headline sentence (optional, default '')
       maxFrames        (int)  Optional frame cap (default: full animation)
+      fadeOutDurationSeconds (float) Alpha fade applied to the last N seconds
+                              of the TEXT variant MOV so the title/summary
+                              dissolves off screen. 0 / absent = hard cut.
+      videoDurationMs  (int)  Clip duration in milliseconds. Sets how long
+                              the persistent variant is extended to via
+                              FFmpeg `tpad`, so the sidebar/logo stays on
+                              screen for the whole clip. Fallback 60000ms.
+      persistentStartFrame (int) Lottie frame at which the persistent variant
+                              is captured. Default 90 (~3s) skips past the
+                              intro slide-in so the sidebar/logo appears
+                              from frame 0 of the output already settled.
 
     Returns:
       overlayS3Uri     (str)  s3://bucket/key of the rendered MOV
@@ -862,6 +1154,22 @@ def handler(event, context):
     location = event.get('location', '')
     headline = event.get('headline', '')
     max_frames = event.get('maxFrames', None)
+    fade_out_seconds = float(event.get('fadeOutDurationSeconds', 0) or 0)
+    # Default 60s matches the typical social-clip length when the caller
+    # omits the field. A longer clip will see the persistent overlay stop
+    # at 60s — a trade for robustness against missing duration metadata.
+    video_duration_ms = float(event.get('videoDurationMs', 60000) or 60000)
+    video_duration_seconds = video_duration_ms / 1000.0
+    persistent_start_frame = int(event.get('persistentStartFrame', 90) or 90)
+    # Vertical offset applied to the title/summary block in the TEXT variant
+    # only, so producers can push the lower-third into a cleaner part of the
+    # frame without touching the persistent sidebar / logo. Positive = down.
+    text_y_offset = float(event.get('textYOffset', 0) or 0)
+    # Font size override for the kicker lines (Line 1/2/3) only. Body text
+    # keeps the template's authored size. The reference template ships Line
+    # 1/2/3 at 100pt ProximaNova-Extrabld, which overruns 1080-wide frames
+    # for ~16-char kickers; the customer's reference art lands around 80pt.
+    text_font_size = int(event.get('textFontSize', 0) or 0)
 
     # S3 key: {itemId}/overlays/{baseFilename}_{aspect}.mov
     aspect_suffix = aspect_ratio.replace(':', '-')
@@ -921,10 +1229,115 @@ def handler(event, context):
         if max_frames is None:
             logger.info("No maxFrames provided — rendering full animation")
 
-        # Step 6: Render → qtrle MOV with alpha
-        mov_path = os.path.join(tmpdir, f'{base_filename}_{aspect_suffix}.mov')
-        render_info = render_lottie_to_mov(lottie_data, mov_path, max_frames)
-        frames_rendered = render_info['frameCount']
+        # Step 6: Dual-variant render.
+        #
+        # Clone the fully-patched Lottie into two forks and hide the opposite
+        # layer group in each. deepcopy() is cheap at the sizes we see here
+        # (<1 MB JSON) and keeps the patch pipeline above single-sourced.
+        text_lottie = copy.deepcopy(lottie_data)
+        persistent_lottie = copy.deepcopy(lottie_data)
+        hidden_in_text = hide_layers_by_predicate(text_lottie, _is_persistent_layer)
+        hidden_in_persistent = hide_layers_by_predicate(persistent_lottie, _is_text_layer)
+        logger.info(
+            f"Dual-variant split — text variant hid {hidden_in_text} persistent layer(s); "
+            f"persistent variant hid {hidden_in_persistent} text layer(s)."
+        )
+
+        # Shift the title/summary block vertically in the TEXT variant only.
+        # The persistent variant keeps its own Line 1 position so the
+        # Category Label (parented to Line 1) stays where the designer put
+        # it next to the sidebar/logo.
+        if text_y_offset:
+            moved = shift_text_block_down(text_lottie, text_y_offset)
+            logger.info(
+                f"Text variant: shifted {moved} layer(s) down by {text_y_offset:.0f}px"
+            )
+        # Shrink the kicker lines so long titles don't overrun the frame
+        # width. Applied to the text variant only — persistent variant
+        # doesn't render these layers (they're hidden by _is_text_layer).
+        if text_font_size:
+            resized = 0
+            for layer in text_lottie.get('layers', []):
+                nm = (layer.get('nm') or '').strip()
+                if nm in ('Line 1', 'Line 2', 'Line 3'):
+                    try:
+                        layer['t']['d']['k'][0]['s']['s'] = text_font_size
+                        resized += 1
+                    except (KeyError, IndexError, TypeError):
+                        pass
+            logger.info(
+                f"Text variant: resized {resized} kicker layer(s) to {text_font_size}pt"
+            )
+
+        text_mov_path = os.path.join(tmpdir, f'{base_filename}_{aspect_suffix}_text.mov')
+        persistent_mov_path = os.path.join(tmpdir, f'{base_filename}_{aspect_suffix}_persistent.mov')
+        combined_mov_path = os.path.join(tmpdir, f'{base_filename}_{aspect_suffix}.mov')
+
+        # Text variant: animated title/summary with its own alpha fade-out so
+        # the dissolve is baked into this MOV rather than retriggered on every
+        # loop by MediaConvert.
+        text_info = render_lottie_to_mov(
+            text_lottie,
+            text_mov_path,
+            max_frames=max_frames,
+            fade_out_seconds=fade_out_seconds,
+        )
+
+        # Persistent variant: render the full clip duration (capped) starting
+        # at `persistent_start_frame` so the sidebar/logo appears already-
+        # landed from frame 0 of the output. We render through the whole clip
+        # rather than freezing a single frame because the station template's
+        # sidebar carries a scrolling "LOCAL NEWS" / "BREAKING NEWS" text
+        # animation that a single-frame freeze would stop dead. The sub-comp
+        # isn't built for seamless looping, so a stream_loop here would
+        # visibly pop.
+        fps = float(lottie_data['fr'])
+        # Safety cap: Lambda's hard 15-min timeout caps how many
+        # persistent frames we can produce in a single invocation. Puppeteer
+        # + lottie-web renders the station toolkit at ~5 fps when text-group
+        # layers are hidden with `hd: True`, so a 40-second ceiling (1200
+        # frames @ 29.97) leaves comfortable headroom. Clips longer than
+        # 40s loop the final 40s via `-stream_loop -1` in the composite
+        # below — with the hidden-layer speedup the full-render path
+        # covers every short-form social clip we care about, and the
+        # longer-clip loop still shows a continuous (if looping) scroll.
+        PERSISTENT_FRAMES_SAFETY_CAP = int(40 * fps)
+        lottie_total_frames = int(lottie_data.get('op', 0))
+        persistent_frames_requested = int(round(video_duration_seconds * fps))
+        persistent_frames_available = max(0, lottie_total_frames - persistent_start_frame)
+        persistent_frames = min(
+            persistent_frames_requested,
+            persistent_frames_available,
+            PERSISTENT_FRAMES_SAFETY_CAP,
+        )
+        # Enforce a floor so very short clips still get a usable scroll window
+        persistent_frames = max(persistent_frames, 60)
+        logger.info(
+            f"Persistent variant: rendering {persistent_frames} frame(s) "
+            f"({persistent_frames / fps:.2f}s) starting at Lottie frame "
+            f"{persistent_start_frame} (clip duration {video_duration_seconds:.2f}s)"
+        )
+        render_lottie_to_mov(
+            persistent_lottie,
+            persistent_mov_path,
+            max_frames=persistent_frames,
+            fade_out_seconds=0,
+            start_frame=persistent_start_frame,
+        )
+
+        # Step 6b: Composite the two MOVs into a single alpha overlay sized
+        # to the clip, so MediaConvert can play it once with Playback: ONCE
+        # without re-triggering the text animation.
+        ffmpeg_composite_overlays(
+            persistent_mov=persistent_mov_path,
+            text_mov=text_mov_path,
+            output_path=combined_mov_path,
+            duration_seconds=video_duration_seconds,
+            fps=fps,
+        )
+        mov_path = combined_mov_path
+        render_info = text_info
+        frames_rendered = text_info['frameCount']
 
         # Step 7: Upload MOV to S3
         logger.info(f"Uploading MOV to s3://{output_bucket}/{s3_key}")

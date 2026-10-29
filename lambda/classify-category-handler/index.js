@@ -30,20 +30,20 @@ const s3Client = new S3Client();
 const MODEL_ID = process.env.CLASSIFY_MODEL_ID || 'us.amazon.nova-pro-v1:0';
 const TRANSCRIPT_BUCKET = process.env.TRANSCRIPT_STAGING_BUCKET || '';
 
+// Must mirror the `gfx_template` choice options declared on the Mimir custom
+// action in register-mimir-integrations. The producer sees these labels in
+// the dropdown and the LLM is constrained to the same list, so whichever
+// path picks the category, the result is always a value the overlay handler
+// recognises.
 const CATEGORIES = [
   'BREAKING NEWS',
-  'ENTERTAINMENT / LIFESTYLE',
+  'ENTERTAINMENT NEWS',
+  'LOCAL NEWS',
+  'NATIONAL NEWS',
   'NEWS & POLITICS',
   'SPORTS',
-  'BUSINESS & FINANCE',
-  'EDUCATION',
   'WEATHER',
-  'NATIONAL NEWS',
-  'LOCAL NEWS',
-  'LOCAL LIVING',
-  'OFFBEAT',
-  'SCIENCE & TECHNOLOGY',
-  'UNREAL & UNEXPECTED',
+  'WORLD NEWS',
 ];
 
 const SYSTEM_PROMPT = `You are a broadcast news graphics producer. 
@@ -142,13 +142,129 @@ async function fetchTranscriptFromS3(itemId) {
   }
 }
 
+/**
+ * Split a producer-supplied title into up to three kicker lines of 12 chars
+ * each, on word boundaries, so a longer title can still fit the Lottie's
+ * three large text layers without truncation mid-word.
+ *
+ * - Each line is uppercased and capped at 12 characters.
+ * - Words longer than 12 chars are hard-split (there is no softer option
+ *   given the Lottie text box width).
+ * - If the full title fits on fewer than three lines, the remaining lines
+ *   are returned as empty strings so patch_lottie clears them.
+ * - Any content past 36 chars is silently dropped — the overlay physically
+ *   has nowhere to put it.
+ */
+function splitTitleIntoLines(title, maxLines = 3, maxCharsPerLine = 12) {
+  if (!title || typeof title !== 'string') {
+    return Array(maxLines).fill('');
+  }
+  const words = title.trim().toUpperCase().split(/\s+/).filter(Boolean);
+  const lines = [];
+  let current = '';
+  for (const w of words) {
+    if (lines.length >= maxLines) break;
+    // Word longer than a single line → hard split
+    if (w.length > maxCharsPerLine) {
+      if (current) {
+        lines.push(current);
+        current = '';
+        if (lines.length >= maxLines) break;
+      }
+      let rest = w;
+      while (rest.length > maxCharsPerLine && lines.length < maxLines) {
+        lines.push(rest.slice(0, maxCharsPerLine));
+        rest = rest.slice(maxCharsPerLine);
+      }
+      current = rest;
+      continue;
+    }
+    const candidate = current ? `${current} ${w}` : w;
+    if (candidate.length <= maxCharsPerLine) {
+      current = candidate;
+    } else {
+      lines.push(current);
+      current = w;
+    }
+  }
+  if (current && lines.length < maxLines) {
+    lines.push(current);
+  }
+  while (lines.length < maxLines) lines.push('');
+  return lines.slice(0, maxLines);
+}
+
+/**
+ * Overlay producer-supplied values on top of the AI-generated classification.
+ * Each override is independent: when a producer leaves a field blank the AI
+ * output for that slot stays in place.
+ *
+ * - `title` → split across line1/2/3 (word-wrapped, uppercase, 12-char lines)
+ * - `summary` → `headline` (the full-sentence body text, 80-char hard cap)
+ * - `gfxTemplate` → `category` (one of the CATEGORIES values)
+ *
+ * `location` is always sourced from the LLM since the custom action has no
+ * field for it.
+ */
+function applyOverrides(classification, userMetadata) {
+  if (!userMetadata || typeof userMetadata !== 'object') return classification;
+  const out = { ...classification };
+  if (userMetadata.title) {
+    const [l1, l2, l3] = splitTitleIntoLines(userMetadata.title);
+    out.line1 = l1;
+    out.line2 = l2;
+    out.line3 = l3;
+  }
+  if (userMetadata.summary) {
+    out.headline = String(userMetadata.summary).slice(0, 80);
+  }
+  if (userMetadata.gfxTemplate) {
+    // Trust the choice-field value — register-mimir-integrations constrains
+    // the dropdown options to the same CATEGORIES list, and the overlay
+    // handler falls back to a default if it ever sees something unknown.
+    out.category = userMetadata.gfxTemplate;
+  }
+  return out;
+}
+
+// Exported so unit tests can validate override behaviour without invoking
+// Bedrock.
+module.exports.splitTitleIntoLines = splitTitleIntoLines;
+module.exports.applyOverrides = applyOverrides;
+
 exports.handler = async (event) => {
+  const userMetadata = event.userMetadata || {};
+  const hasAllOverrides = !!(userMetadata.title && userMetadata.summary && userMetadata.gfxTemplate);
+
   console.log('Classify category handler received:', JSON.stringify({
     title: event.title,
     itemId: event.itemId,
     hasTimedTranscriptUrl: !!(event.mimirDetails?.timedTranscriptUrl),
     hasTranscript: !!event.transcript,
+    overrides: {
+      title: !!userMetadata.title,
+      summary: !!userMetadata.summary,
+      gfxTemplate: !!userMetadata.gfxTemplate,
+    },
+    shortCircuitBedrock: hasAllOverrides,
   }));
+
+  // Producer filled in every text field → Bedrock has nothing left to pick,
+  // so skip the call entirely. Location stays empty since there is no
+  // producer field for it.
+  if (hasAllOverrides) {
+    const [l1, l2, l3] = splitTitleIntoLines(userMetadata.title);
+    const result = {
+      category: userMetadata.gfxTemplate,
+      line1: l1,
+      line2: l2,
+      line3: l3,
+      headline: String(userMetadata.summary).slice(0, 80),
+      location: '',
+    };
+    console.log('Classification result (overrides only):', JSON.stringify(result));
+    return result;
+  }
 
   const title = event.title || '';
   const description = event.description || '';
@@ -221,6 +337,11 @@ exports.handler = async (event) => {
   result.headline = (result.headline || result.line1 || '').substring(0, 80);
   result.location = (result.location || '').substring(0, 30).toUpperCase();
 
-  console.log('Classification result:', JSON.stringify(result));
-  return result;
+  // Overlay any producer-supplied values on the AI output. Each override is
+  // independent — a producer who only sets `title` still gets the AI's
+  // category, headline and location.
+  const finalResult = applyOverrides(result, userMetadata);
+
+  console.log('Classification result:', JSON.stringify(finalResult));
+  return finalResult;
 };
