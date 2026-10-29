@@ -761,7 +761,8 @@ def _hide_matte_layers(data: dict) -> None:
 
 
 def render_lottie_to_mov(lottie_data: dict, output_path: str,
-                         max_frames: int = None) -> dict:
+                         max_frames: int = None,
+                         fade_out_seconds: float = 0.0) -> dict:
     """Render a Lottie JSON dict to a QuickTime Animation (qtrle) MOV with alpha.
 
     Uses Puppeteer + lottie-web (SVG renderer) via render_lottie.js subprocess.
@@ -771,6 +772,10 @@ def render_lottie_to_mov(lottie_data: dict, output_path: str,
         lottie_data: Preprocessed and patched Lottie JSON dict.
         output_path: Local file path for the output MOV.
         max_frames: Optional cap on frame count (None = full animation).
+        fade_out_seconds: Alpha fade-out length applied to the end of the MOV.
+            0 (default) renders a hard cut on the final frame; any positive
+            value ramps the alpha channel down to 0 over the last N seconds
+            via an FFmpeg `fade=t=out:alpha=1` filter.
 
     Returns:
         dict with frameCount, fps, width, height
@@ -793,7 +798,13 @@ def render_lottie_to_mov(lottie_data: dict, output_path: str,
             str(h),
             str(fps),
         ]
-        if max_frames is not None:
+        # Positional arg order: max_frames must be present (even if 0, meaning
+        # "no cap") before fade_out_seconds, since both are positional in the
+        # Node CLI. Use 0 as the sentinel for "render everything".
+        if fade_out_seconds and fade_out_seconds > 0:
+            cmd.append(str(max_frames if max_frames is not None else 0))
+            cmd.append(str(fade_out_seconds))
+        elif max_frames is not None:
             cmd.append(str(max_frames))
 
         logger.info(f"Running: {' '.join(cmd)}")
@@ -846,6 +857,9 @@ def handler(event, context):
       location         (str)  Location / source credit (optional, default '')
       headline         (str)  Full headline sentence (optional, default '')
       maxFrames        (int)  Optional frame cap (default: full animation)
+      fadeOutDurationSeconds (float) Alpha fade applied to the last N seconds
+                              of the MOV so the overlay dissolves off
+                              screen. 0 / absent = hard cut on final frame.
 
     Returns:
       overlayS3Uri     (str)  s3://bucket/key of the rendered MOV
@@ -872,6 +886,7 @@ def handler(event, context):
     location = event.get('location', '')
     headline = event.get('headline', '')
     max_frames = event.get('maxFrames', None)
+    fade_out_seconds = float(event.get('fadeOutDurationSeconds', 0) or 0)
 
     # S3 key: {itemId}/overlays/{baseFilename}_{aspect}.mov
     aspect_suffix = aspect_ratio.replace(':', '-')
@@ -933,7 +948,12 @@ def handler(event, context):
 
         # Step 6: Render → qtrle MOV with alpha
         mov_path = os.path.join(tmpdir, f'{base_filename}_{aspect_suffix}.mov')
-        render_info = render_lottie_to_mov(lottie_data, mov_path, max_frames)
+        render_info = render_lottie_to_mov(
+            lottie_data,
+            mov_path,
+            max_frames=max_frames,
+            fade_out_seconds=fade_out_seconds,
+        )
         frames_rendered = render_info['frameCount']
 
         # Step 7: Upload MOV to S3

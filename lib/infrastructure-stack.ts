@@ -2659,9 +2659,14 @@ export class InfrastructureStack extends cdk.Stack {
         'line3.$': '$.classification.Payload.line3',
         'location.$': '$.classification.Payload.location',
         'headline.$': '$.classification.Payload.headline',
-        // Cap at 450 frames (15s at 29.97fps) — MediaConvert loops the overlay
-        // via Playback: REPEAT so we don't need to match the full video duration.
-        'maxFrames': 450,
+        // Target overlay timeline: 8 seconds total, dissolving out over the
+        // final 2 seconds (frames 180–240 ramp alpha from 1.0 → 0.0 via
+        // FFmpeg `fade=t=out:alpha=1`). Combined with MediaConvert's
+        // `Playback: ONCE` further down, the Lottie intro + ~4.4s hold
+        // + 2s dissolve plays one time per clip rather than retriggering
+        // on a loop.
+        'maxFrames': 240,
+        'fadeOutDurationSeconds': 2,
       }),
       resultPath: '$.overlayResult',
     });

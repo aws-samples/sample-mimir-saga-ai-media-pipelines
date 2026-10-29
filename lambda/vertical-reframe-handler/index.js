@@ -270,7 +270,13 @@ async function createCompositedJob(croppedVideoUri, overlayS3Uri, outputBucket, 
         Input: overlayS3Uri,
         InsertionMode: 'MOV',
         Offset: { ImageX: 0, ImageY: 0 },
-        Playback: 'REPEAT',
+        // ONCE: play the overlay a single time at the start of the clip then
+        // leave the composite caption-free. The overlay MOV is authored with
+        // an FFmpeg alpha fade in its final seconds (see render_lottie.js) so
+        // the graphic dissolves off rather than hard-cutting. REPEAT would
+        // retrigger the intro animation every ~8s on longer clips, which the
+        // producer tooling intentionally avoids.
+        Playback: 'ONCE',
       },
       Inputs: [{
         FileInput: croppedVideoUri,

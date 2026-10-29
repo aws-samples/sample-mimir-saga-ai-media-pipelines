@@ -6,7 +6,11 @@
  * Puppeteer + lottie-web (SVG renderer).
  *
  * Usage:
- *   node render_lottie.js <animation_json_path> <output_mov_path> <width> <height> <fps> [max_frames]
+ *   node render_lottie.js <animation_json_path> <output_mov_path> <width> <height> <fps> [max_frames] [fade_out_seconds]
+ *
+ * When fade_out_seconds is > 0 the output MOV's alpha channel is tapered
+ * from 1.0 to 0.0 over the final N seconds, so the overlay dissolves off
+ * screen rather than hard-cutting. Expressed in seconds (float) not frames.
  *
  * Stdout: JSON { frameCount, fps, width, height }
  * Stderr: progress logs
@@ -25,10 +29,10 @@ const EMPTY_PNG = Buffer.from(
 );
 
 async function main() {
-  const [,, animJsonPath, outputMovPath, widthStr, heightStr, fpsStr, maxFramesStr] = process.argv;
+  const [,, animJsonPath, outputMovPath, widthStr, heightStr, fpsStr, maxFramesStr, fadeOutSecondsStr] = process.argv;
 
   if (!animJsonPath || !outputMovPath || !widthStr || !heightStr || !fpsStr) {
-    process.stderr.write('Usage: node render_lottie.js <anim.json> <output.mov> <width> <height> <fps> [max_frames]\n');
+    process.stderr.write('Usage: node render_lottie.js <anim.json> <output.mov> <width> <height> <fps> [max_frames] [fade_out_seconds]\n');
     process.exit(1);
   }
 
@@ -36,6 +40,9 @@ async function main() {
   const H = parseInt(heightStr);
   const fps = parseFloat(fpsStr);
   const maxFrames = maxFramesStr ? parseInt(maxFramesStr) : null;
+  // Fade length in seconds; 0 (or absent) disables the fade entirely so the
+  // overlay ends on its final rendered frame.
+  const fadeOutSeconds = fadeOutSecondsStr ? parseFloat(fadeOutSecondsStr) : 0;
 
   const animJson = fs.readFileSync(animJsonPath, 'utf8');
   const animData = JSON.parse(animJson);
@@ -180,7 +187,21 @@ async function main() {
       '-y',
       '-f', 'image2pipe', '-vcodec', 'png', '-r', String(fps), '-i', 'pipe:0',
     ];
-    if (needsScale) ffmpegArgs.push('-vf', `scale=${W}:${H}:flags=lanczos`);
+    const filters = [];
+    if (needsScale) filters.push(`scale=${W}:${H}:flags=lanczos`);
+    // Alpha fade-out ramp applied to the LAST `fadeOutSeconds` of the MOV so
+    // the overlay dissolves off instead of popping off. `alpha=1` restricts
+    // the fade to the alpha plane — RGB stays untouched, which matters once
+    // MediaConvert composites the MOV onto the smart-crop video.
+    const totalSeconds = framesToRender / fps;
+    const fadeStart = fadeOutSeconds > 0
+      ? Math.max(0, totalSeconds - fadeOutSeconds)
+      : null;
+    if (fadeStart !== null) {
+      filters.push(`fade=t=out:st=${fadeStart.toFixed(3)}:d=${fadeOutSeconds.toFixed(3)}:alpha=1`);
+      process.stderr.write(`Alpha fade-out: start=${fadeStart.toFixed(3)}s, duration=${fadeOutSeconds.toFixed(3)}s (clip ends at ${totalSeconds.toFixed(3)}s)\n`);
+    }
+    if (filters.length) ffmpegArgs.push('-vf', filters.join(','));
     ffmpegArgs.push('-vcodec', 'qtrle', '-pix_fmt', 'rgba', '-movflags', '+faststart', outputMovPath);
 
     const ffmpeg = spawn('/usr/local/bin/ffmpeg', ffmpegArgs);
