@@ -29,6 +29,7 @@ gradient fills). The reference template ships without those layers, so both
 steps log a warning and no-op. They are retained for templates that add them.
 """
 
+import copy
 import json
 import logging
 import os
@@ -760,9 +761,122 @@ def _hide_matte_layers(data: dict) -> None:
     logger.info(f"_hide_matte_layers: hid {hidden} matte sources, unmatted {unmatted} targets")
 
 
+# ---------------------------------------------------------------------------
+# Dual-variant rendering: split the Lottie into "text" and "persistent" halves
+# ---------------------------------------------------------------------------
+#
+# The overlay has two visual groups that need different on-screen lifetimes:
+#
+#   TEXT GROUP      — animates in with the clip, holds, then dissolves.
+#   PERSISTENT GROUP — appears from the first frame and stays on-screen for
+#                      the entire clip (sidebar colour wash + logo bug +
+#                      category label + optional location/credit).
+#
+# MediaConvert's MotionImageInserter only allows one MOV overlay per output,
+# so we render two patched clones of the Lottie — one with each group hidden
+# via opacity=0 — then FFmpeg-composite them into a single MOV sized to the
+# clip. The text MOV plays once with a fade-out; the persistent frame is
+# frozen and extended to match the clip duration.
+#
+# Note on parenting: opacity does NOT cascade through parent chains in
+# lottie-web (confirmed by patch_lottie which sets opacity 0 on both
+# Location/Courtesy and location/courtesy-TextBox when location is empty).
+# So we hide every child layer explicitly rather than relying on a parent
+# alpha blend.
+
+# Layers hidden in the TEXT variant (keeps the animating title/summary visible)
+PERSISTENT_LAYER_NAMES = frozenset([
+    'logo_placeholder',
+    'Category Label',
+    'Category Label-TextBox',
+    'Location/Courtesy',
+    'location/courtesy-TextBox',
+])
+
+# Layers hidden in the PERSISTENT variant (keeps the sidebar/logo/category label).
+# Line 1-3 and body text have their visual content gated by opacity but
+# `breaking line` is a shape layer, so hiding it is the only way to drop it.
+TEXT_LAYER_NAMES = frozenset([
+    'Line 1',
+    'Line 2',
+    'Line 3',
+    'body text',
+    'breaking line',
+])
+
+
+def hide_layers_by_name(data: dict, layer_names: frozenset) -> int:
+    """Set opacity to 0 on every layer whose stripped name is in `layer_names`.
+
+    Walks root layers and every asset sub-comp. Matches on exact name after
+    stripping whitespace (some template exports carry trailing spaces on
+    layer names). Returns the number of layers mutated.
+    """
+    hidden = 0
+    all_layer_sets = [data.get('layers', [])]
+    for asset in data.get('assets', []):
+        if 'layers' in asset:
+            all_layer_sets.append(asset['layers'])
+
+    for layers in all_layer_sets:
+        for layer in layers:
+            name = (layer.get('nm') or '').strip()
+            if name in layer_names:
+                layer.setdefault('ks', {})['o'] = {'a': 0, 'k': 0, 'ix': 11}
+                hidden += 1
+    return hidden
+
+
+def ffmpeg_composite_overlays(persistent_mov: str, text_mov: str,
+                              output_path: str, duration_seconds: float,
+                              fps: float) -> None:
+    """Composite the two overlay MOVs into a single MOV sized to `duration_seconds`.
+
+    The persistent MOV (a single settled-state frame) is extended to match
+    the clip duration via `tpad=stop_mode=clone`, then the text MOV is
+    overlayed on top from timestamp 0. The text MOV's own internal alpha
+    fade-out (built in by render_lottie.js) handles the dissolve; `overlay`'s
+    `eof_action=pass` keeps the base visible after the text overlay ends.
+
+    Output: qtrle + rgba MOV with alpha channel preserved, as MediaConvert's
+    MotionImageInserter requires.
+    """
+    # Pad the persistent base to the full clip duration. Pass a slightly
+    # longer duration than requested and then trim at `-t` on output so the
+    # tpad vs. output framerate math never leaves us one frame short.
+    pad_seconds = max(0.0, duration_seconds + 1.0)
+    filter_graph = (
+        f'[0:v]tpad=stop_mode=clone:stop_duration={pad_seconds:.3f}[bg];'
+        f'[bg][1:v]overlay=eof_action=pass:format=auto'
+    )
+
+    cmd = [
+        '/usr/local/bin/ffmpeg',
+        '-y',
+        '-i', persistent_mov,
+        '-i', text_mov,
+        '-filter_complex', filter_graph,
+        '-t', f'{duration_seconds:.3f}',
+        '-r', str(fps),
+        '-c:v', 'qtrle',
+        '-pix_fmt', 'rgba',
+        '-movflags', '+faststart',
+        output_path,
+    ]
+    logger.info('Compositing overlays: ' + ' '.join(cmd))
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if result.stderr:
+        logger.info('ffmpeg_composite stderr:\n' + result.stderr[-2000:])
+    if result.returncode != 0:
+        raise RuntimeError(
+            f'ffmpeg composite failed (rc={result.returncode}): {result.stderr[-1500:]}'
+        )
+
+
 def render_lottie_to_mov(lottie_data: dict, output_path: str,
                          max_frames: int = None,
-                         fade_out_seconds: float = 0.0) -> dict:
+                         fade_out_seconds: float = 0.0,
+                         start_frame: int = 0) -> dict:
     """Render a Lottie JSON dict to a QuickTime Animation (qtrle) MOV with alpha.
 
     Uses Puppeteer + lottie-web (SVG renderer) via render_lottie.js subprocess.
@@ -776,6 +890,10 @@ def render_lottie_to_mov(lottie_data: dict, output_path: str,
             0 (default) renders a hard cut on the final frame; any positive
             value ramps the alpha channel down to 0 over the last N seconds
             via an FFmpeg `fade=t=out:alpha=1` filter.
+        start_frame: Lottie frame index to begin rendering at. Lets a caller
+            skip past a one-shot slide-in and capture only the settled state
+            of the animation (used for the "persistent" overlay variant that
+            sits on-screen the whole clip). Default 0 renders from the start.
 
     Returns:
         dict with frameCount, fps, width, height
@@ -798,10 +916,16 @@ def render_lottie_to_mov(lottie_data: dict, output_path: str,
             str(h),
             str(fps),
         ]
-        # Positional arg order: max_frames must be present (even if 0, meaning
-        # "no cap") before fade_out_seconds, since both are positional in the
-        # Node CLI. Use 0 as the sentinel for "render everything".
-        if fade_out_seconds and fade_out_seconds > 0:
+        # Positional-arg order on the Node CLI is: max_frames, fade_out_seconds,
+        # start_frame. If a later arg is set but an earlier one isn't, pad with
+        # sentinel 0 so the positions line up.
+        need_fade = bool(fade_out_seconds and fade_out_seconds > 0)
+        need_start = bool(start_frame and start_frame > 0)
+        if need_start:
+            cmd.append(str(max_frames if max_frames is not None else 0))
+            cmd.append(str(fade_out_seconds or 0))
+            cmd.append(str(start_frame))
+        elif need_fade:
             cmd.append(str(max_frames if max_frames is not None else 0))
             cmd.append(str(fade_out_seconds))
         elif max_frames is not None:
@@ -858,8 +982,16 @@ def handler(event, context):
       headline         (str)  Full headline sentence (optional, default '')
       maxFrames        (int)  Optional frame cap (default: full animation)
       fadeOutDurationSeconds (float) Alpha fade applied to the last N seconds
-                              of the MOV so the overlay dissolves off
-                              screen. 0 / absent = hard cut on final frame.
+                              of the TEXT variant MOV so the title/summary
+                              dissolves off screen. 0 / absent = hard cut.
+      videoDurationMs  (int)  Clip duration in milliseconds. Sets how long
+                              the persistent variant is extended to via
+                              FFmpeg `tpad`, so the sidebar/logo stays on
+                              screen for the whole clip. Fallback 60000ms.
+      persistentStartFrame (int) Lottie frame at which the persistent variant
+                              is captured. Default 90 (~3s) skips past the
+                              intro slide-in so the sidebar/logo appears
+                              from frame 0 of the output already settled.
 
     Returns:
       overlayS3Uri     (str)  s3://bucket/key of the rendered MOV
@@ -887,6 +1019,12 @@ def handler(event, context):
     headline = event.get('headline', '')
     max_frames = event.get('maxFrames', None)
     fade_out_seconds = float(event.get('fadeOutDurationSeconds', 0) or 0)
+    # Default 60s matches the typical social-clip length when the caller
+    # omits the field. A longer clip will see the persistent overlay stop
+    # at 60s — a trade for robustness against missing duration metadata.
+    video_duration_ms = float(event.get('videoDurationMs', 60000) or 60000)
+    video_duration_seconds = video_duration_ms / 1000.0
+    persistent_start_frame = int(event.get('persistentStartFrame', 90) or 90)
 
     # S3 key: {itemId}/overlays/{baseFilename}_{aspect}.mov
     aspect_suffix = aspect_ratio.replace(':', '-')
@@ -946,15 +1084,58 @@ def handler(event, context):
         if max_frames is None:
             logger.info("No maxFrames provided — rendering full animation")
 
-        # Step 6: Render → qtrle MOV with alpha
-        mov_path = os.path.join(tmpdir, f'{base_filename}_{aspect_suffix}.mov')
-        render_info = render_lottie_to_mov(
-            lottie_data,
-            mov_path,
+        # Step 6: Dual-variant render.
+        #
+        # Clone the fully-patched Lottie into two forks and hide the opposite
+        # layer group in each. deepcopy() is cheap at the sizes we see here
+        # (<1 MB JSON) and keeps the patch pipeline above single-sourced.
+        text_lottie = copy.deepcopy(lottie_data)
+        persistent_lottie = copy.deepcopy(lottie_data)
+        hidden_in_text = hide_layers_by_name(text_lottie, PERSISTENT_LAYER_NAMES)
+        hidden_in_persistent = hide_layers_by_name(persistent_lottie, TEXT_LAYER_NAMES)
+        logger.info(
+            f"Dual-variant split — text variant hid {hidden_in_text} persistent layer(s); "
+            f"persistent variant hid {hidden_in_persistent} text layer(s)."
+        )
+
+        text_mov_path = os.path.join(tmpdir, f'{base_filename}_{aspect_suffix}_text.mov')
+        persistent_mov_path = os.path.join(tmpdir, f'{base_filename}_{aspect_suffix}_persistent.mov')
+        combined_mov_path = os.path.join(tmpdir, f'{base_filename}_{aspect_suffix}.mov')
+
+        # Text variant: animated title/summary with its own alpha fade-out so
+        # the dissolve is baked into this MOV rather than retriggered on every
+        # loop by MediaConvert.
+        text_info = render_lottie_to_mov(
+            text_lottie,
+            text_mov_path,
             max_frames=max_frames,
             fade_out_seconds=fade_out_seconds,
         )
-        frames_rendered = render_info['frameCount']
+
+        # Persistent variant: a single Lottie frame captured *after* the
+        # slide-in has settled, so the sidebar/logo appears already-landed
+        # from the first output frame rather than animating in each time.
+        render_lottie_to_mov(
+            persistent_lottie,
+            persistent_mov_path,
+            max_frames=1,
+            fade_out_seconds=0,
+            start_frame=persistent_start_frame,
+        )
+
+        # Step 6b: Composite the two MOVs into a single alpha overlay sized
+        # to the clip, so MediaConvert can play it once with Playback: ONCE
+        # without re-triggering the text animation.
+        ffmpeg_composite_overlays(
+            persistent_mov=persistent_mov_path,
+            text_mov=text_mov_path,
+            output_path=combined_mov_path,
+            duration_seconds=video_duration_seconds,
+            fps=lottie_data['fr'],
+        )
+        mov_path = combined_mov_path
+        render_info = text_info
+        frames_rendered = text_info['frameCount']
 
         # Step 7: Upload MOV to S3
         logger.info(f"Uploading MOV to s3://{output_bucket}/{s3_key}")

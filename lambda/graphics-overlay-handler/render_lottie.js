@@ -6,11 +6,15 @@
  * Puppeteer + lottie-web (SVG renderer).
  *
  * Usage:
- *   node render_lottie.js <animation_json_path> <output_mov_path> <width> <height> <fps> [max_frames] [fade_out_seconds]
+ *   node render_lottie.js <animation_json_path> <output_mov_path> \
+ *     <width> <height> <fps> [max_frames] [fade_out_seconds] [start_frame]
  *
- * When fade_out_seconds is > 0 the output MOV's alpha channel is tapered
- * from 1.0 to 0.0 over the final N seconds, so the overlay dissolves off
- * screen rather than hard-cutting. Expressed in seconds (float) not frames.
+ * - fade_out_seconds > 0 ramps the output MOV's alpha from 1.0 → 0.0 over
+ *   the final N seconds via an FFmpeg `fade=t=out:alpha=1` filter, so the
+ *   overlay dissolves off screen instead of hard-cutting.
+ * - start_frame > 0 seeks past the intro before capture, so renders can
+ *   begin at a specific point in the animation timeline (e.g. frame 90
+ *   to skip a one-shot slide-in and emit only the settled state).
  *
  * Stdout: JSON { frameCount, fps, width, height }
  * Stderr: progress logs
@@ -29,10 +33,10 @@ const EMPTY_PNG = Buffer.from(
 );
 
 async function main() {
-  const [,, animJsonPath, outputMovPath, widthStr, heightStr, fpsStr, maxFramesStr, fadeOutSecondsStr] = process.argv;
+  const [,, animJsonPath, outputMovPath, widthStr, heightStr, fpsStr, maxFramesStr, fadeOutSecondsStr, startFrameStr] = process.argv;
 
   if (!animJsonPath || !outputMovPath || !widthStr || !heightStr || !fpsStr) {
-    process.stderr.write('Usage: node render_lottie.js <anim.json> <output.mov> <width> <height> <fps> [max_frames] [fade_out_seconds]\n');
+    process.stderr.write('Usage: node render_lottie.js <anim.json> <output.mov> <width> <height> <fps> [max_frames] [fade_out_seconds] [start_frame]\n');
     process.exit(1);
   }
 
@@ -43,6 +47,11 @@ async function main() {
   // Fade length in seconds; 0 (or absent) disables the fade entirely so the
   // overlay ends on its final rendered frame.
   const fadeOutSeconds = fadeOutSecondsStr ? parseFloat(fadeOutSecondsStr) : 0;
+  // Starting point in the Lottie timeline. Lets a caller request e.g. frame 90
+  // to skip past a one-shot slide-in and capture only the settled state —
+  // useful for the "persistent" overlay variant that stays on-screen for the
+  // whole clip. Default 0 renders from the very beginning as before.
+  const startFrame = startFrameStr ? parseInt(startFrameStr) : 0;
 
   const animJson = fs.readFileSync(animJsonPath, 'utf8');
   const animData = JSON.parse(animJson);
@@ -177,10 +186,17 @@ async function main() {
 
     const totalFrames = result.totalFrames;
     const animFps = result.fps;
-    const framesToRender = maxFrames ? Math.min(maxFrames, totalFrames) : totalFrames;
+    // startFrame caps against the animation's last frame so a caller asking
+    // for frame 90 of a 60-frame animation safely falls back to the end
+    // instead of rendering nothing.
+    const effectiveStartFrame = Math.max(0, Math.min(startFrame, totalFrames - 1));
+    const framesAvailable = totalFrames - effectiveStartFrame;
+    const framesToRender = maxFrames
+      ? Math.min(maxFrames, framesAvailable)
+      : framesAvailable;
 
     process.stderr.write(`Animation loaded: ${totalFrames} frames @ ${animFps}fps (${NATIVE_W}x${NATIVE_H})\n`);
-    process.stderr.write(`Rendering ${framesToRender} frames → ${outputMovPath}\n`);
+    process.stderr.write(`Rendering ${framesToRender} frames starting at frame ${effectiveStartFrame} → ${outputMovPath}\n`);
 
     // Start FFmpeg — reads PNG frames from stdin, outputs qtrle MOV with alpha
     const ffmpegArgs = [
@@ -213,13 +229,14 @@ async function main() {
     });
 
     for (let i = 0; i < framesToRender; i++) {
-      await page.evaluate(f => { window._anim.goToAndStop(f, true); }, i);
+      const lottieFrame = effectiveStartFrame + i;
+      await page.evaluate(f => { window._anim.goToAndStop(f, true); }, lottieFrame);
       const pngBuf = await page.screenshot({
         omitBackground: true,
         clip: { x: 0, y: 0, width: NATIVE_W, height: NATIVE_H },
       });
       ffmpeg.stdin.write(pngBuf);
-      if (i % 50 === 0) process.stderr.write(`  Frame ${i}/${framesToRender}\n`);
+      if (i % 50 === 0) process.stderr.write(`  Frame ${i}/${framesToRender} (lottie frame ${lottieFrame})\n`);
     }
 
     ffmpeg.stdin.end();

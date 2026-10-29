@@ -2591,10 +2591,14 @@ export class InfrastructureStack extends cdk.Stack {
         'metadata': {},
         'mimirApiKey.$': '$$.Execution.Input.mimirApiKey',
       }),
-      // Extract mimirDetails and proxyUrl; baseFilename derived from originalFileName
+      // Extract mimirDetails, proxyUrl, and the normalised videoDurationMs
+      // (always a number, 0 when technicalMetadata hasn't populated yet).
+      // The RenderOverlay task reads videoDurationMs to size the combined
+      // overlay MOV to match the clip length.
       resultSelector: {
         'mimirDetails.$': '$.Payload.mimirDetails',
         'proxyUrl.$': '$.Payload.proxyUrl',
+        'videoDurationMs.$': '$.Payload.videoDurationMs',
       },
       resultPath: '$',
     });
@@ -2611,6 +2615,7 @@ export class InfrastructureStack extends cdk.Stack {
         'mimirDetails.$': '$.mimirDetails',
         'lottieTemplates.$': '$.lottieTemplates',
         'templateKey.$': '$.lottieTemplates[\'9:16\']',
+        'videoDurationMs.$': '$.videoDurationMs',
       },
     });
     const setTemplate11 = new stepfunctions.Pass(this, 'SetTemplate11', {
@@ -2622,6 +2627,7 @@ export class InfrastructureStack extends cdk.Stack {
         'mimirDetails.$': '$.mimirDetails',
         'lottieTemplates.$': '$.lottieTemplates',
         'templateKey.$': '$.lottieTemplates[\'1:1\']',
+        'videoDurationMs.$': '$.videoDurationMs',
       },
     });
     const setTemplate45 = new stepfunctions.Pass(this, 'SetTemplate45', {
@@ -2633,6 +2639,7 @@ export class InfrastructureStack extends cdk.Stack {
         'mimirDetails.$': '$.mimirDetails',
         'lottieTemplates.$': '$.lottieTemplates',
         'templateKey.$': '$.lottieTemplates[\'4:5\']',
+        'videoDurationMs.$': '$.videoDurationMs',
       },
     });
 
@@ -2659,14 +2666,20 @@ export class InfrastructureStack extends cdk.Stack {
         'line3.$': '$.classification.Payload.line3',
         'location.$': '$.classification.Payload.location',
         'headline.$': '$.classification.Payload.headline',
-        // Target overlay timeline: 8 seconds total, dissolving out over the
-        // final 2 seconds (frames 180–240 ramp alpha from 1.0 → 0.0 via
-        // FFmpeg `fade=t=out:alpha=1`). Combined with MediaConvert's
-        // `Playback: ONCE` further down, the Lottie intro + ~4.4s hold
-        // + 2s dissolve plays one time per clip rather than retriggering
-        // on a loop.
+        // Target TEXT overlay timeline: 8 seconds total, dissolving out
+        // over the final 2 seconds (frames 180–240 ramp alpha from 1.0 →
+        // 0.0 via FFmpeg `fade=t=out:alpha=1`). The persistent variant
+        // (sidebar/logo/category label) is rendered separately at frame
+        // 90 and extended by FFmpeg tpad to the clip duration before the
+        // text is composited on top. MediaConvert then plays the combined
+        // MOV with `Playback: ONCE` for exactly the clip length.
         'maxFrames': 240,
         'fadeOutDurationSeconds': 2,
+        // Clip duration (ms) normalised by mimir-details-handler — always a
+        // number, 0 if the Mimir item's technicalMetadata hadn't finished
+        // populating yet. The handler falls back to 60s when it sees 0 so
+        // the pipeline degrades gracefully instead of failing the state.
+        'videoDurationMs.$': '$.videoDurationMs',
       }),
       resultPath: '$.overlayResult',
     });
@@ -2838,6 +2851,9 @@ export class InfrastructureStack extends cdk.Stack {
         // Pass the full lottieTemplates map into each branch so RenderOverlay
         // can reference the correct key via a States.Format expression
         'lottieTemplates.$': '$$.Execution.Input.lottieTemplates',
+        // Clip duration (ms) — RenderOverlay needs this to size the FFmpeg
+        // tpad extension on the persistent variant to the full clip length.
+        'videoDurationMs.$': '$.videoDurationMs',
       },
     }).itemProcessor(perAspectRatioBranch);
 
