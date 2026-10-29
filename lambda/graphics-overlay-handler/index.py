@@ -931,7 +931,15 @@ def shift_text_block_down(data: dict, offset_y: float) -> int:
 
 
 def hide_layers_by_predicate(data: dict, predicate) -> int:
-    """Set opacity to 0 on every layer whose name matches `predicate`.
+    """Mark every layer whose name matches `predicate` as hidden.
+
+    Sets BOTH `hd: True` (Bodymovin's "disabled in AE" flag — lottie-web
+    skips the whole layer, including its sub-comp traversal, when this is
+    set) AND opacity 0 (belt-and-braces in case the particular renderer
+    build ignores `hd`). `hd` is the one that matters for render speed:
+    the station toolkit template has ~250 layers inside its sidebar
+    sub-comps, and composing them all per frame when hidden-by-opacity
+    is what pushed the persistent render over its subprocess timeout.
 
     Walks root layers and every asset sub-comp. `predicate` receives the
     layer's name (whitespace preserved so startswith/endswith callers can
@@ -948,6 +956,7 @@ def hide_layers_by_predicate(data: dict, predicate) -> int:
         for layer in layers:
             name = layer.get('nm') or ''
             if predicate(name):
+                layer['hd'] = True
                 layer.setdefault('ks', {})['o'] = {'a': 0, 'k': 0, 'ix': 11}
                 hidden += 1
     return hidden
@@ -1058,11 +1067,13 @@ def render_lottie_to_mov(lottie_data: dict, output_path: str,
 
         logger.info(f"Running: {' '.join(cmd)}")
 
+        # Lambda's overall timeout is 15 min; leave ~90s headroom for the
+        # subsequent FFmpeg composite + S3 upload.
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=600,  # 10 min max
+            timeout=810,
         )
 
         if result.stderr:
@@ -1281,15 +1292,16 @@ def handler(event, context):
         # isn't built for seamless looping, so a stream_loop here would
         # visibly pop.
         fps = float(lottie_data['fr'])
-        # Safety cap: a long clip could push persistent render past the
-        # subprocess timeout. 15 seconds (450 frames @ 29.97) is exactly
-        # one cycle of the station template's sidebar scroll — the inner
-        # 15sec sub-comp animates its text string from Y=4064 to Y=-893
-        # over this range, so both the first and last captured frames
-        # have the text off-screen. Looping that chunk via
-        # ffmpeg_composite_overlays below gives us a continuous scroll
-        # for any clip length without hitting the render budget.
-        PERSISTENT_FRAMES_SAFETY_CAP = int(15 * fps)
+        # Safety cap: Lambda's hard 15-min timeout caps how many
+        # persistent frames we can produce in a single invocation. Puppeteer
+        # + lottie-web renders the station toolkit at ~5 fps when text-group
+        # layers are hidden with `hd: True`, so a 40-second ceiling (1200
+        # frames @ 29.97) leaves comfortable headroom. Clips longer than
+        # 40s loop the final 40s via `-stream_loop -1` in the composite
+        # below — with the hidden-layer speedup the full-render path
+        # covers every short-form social clip we care about, and the
+        # longer-clip loop still shows a continuous (if looping) scroll.
+        PERSISTENT_FRAMES_SAFETY_CAP = int(40 * fps)
         lottie_total_frames = int(lottie_data.get('op', 0))
         persistent_frames_requested = int(round(video_duration_seconds * fps))
         persistent_frames_available = max(0, lottie_total_frames - persistent_start_frame)
