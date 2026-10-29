@@ -2572,6 +2572,11 @@ export class InfrastructureStack extends cdk.Stack {
         'transcript.$': '$$.Execution.Input.transcript',
         'mimirDetails.$': '$.mimirDetails',
         'mimirApiKey.$': '$$.Execution.Input.mimirApiKey',
+        // Producer-supplied overrides from the Mimir custom-action metadata
+        // form. Always an object (mimir-handler normalises null fields when
+        // the producer leaves them blank), so classify-category-handler can
+        // selectively bypass or short-circuit the Bedrock call.
+        'userMetadata.$': '$$.Execution.Input.userMetadata',
       }),
       resultPath: '$.classification',
       outputPath: '$',
@@ -2717,6 +2722,10 @@ export class InfrastructureStack extends cdk.Stack {
         // burned in. Resolved to "" upstream when the item has no VTT, so a
         // caption-less item doesn't fail this state with States.Runtime.
         'vttUrl.$': '$.vttUrlResolved',
+        // Strict producer opt-in — only true (checkbox checked) triggers
+        // caption burn-in; false / undefined keeps the composite caption-free
+        // even when the item has a VTT.
+        'burnCaptions.$': '$$.Execution.Input.userMetadata.burnCaptions',
       }),
       resultPath: '$.compositedResult',
     });

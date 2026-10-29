@@ -12,6 +12,98 @@ const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client
 
 const secretsClient = new SecretsManagerClient();
 
+// ---------------------------------------------------------------------------
+// MDF schema for the Reframe + Graphics custom action.
+//
+// Four producer-editable fields that each override one slot of the auto-
+// generated graphics overlay. Field `key` values here MUST match what the
+// downstream Lambdas (mimir-handler, classify-category-handler,
+// vertical-reframe-handler) read out of `actionData` — Mimir posts the user's
+// values back to the webhook keyed by `key`.
+//
+// Field IDs are deterministic (fixed UUIDs) so re-registering the action in
+// place preserves the view ordering. Alternative IDs on the choice field do
+// not need to be UUIDs — Mimir accepts any string.
+// ---------------------------------------------------------------------------
+const REFRAME_WITH_GRAPHICS_FIELD_IDS = {
+  title:       'a1b2c3d4-0000-4000-8000-000000000001',
+  summary:     'a1b2c3d4-0000-4000-8000-000000000002',
+  gfxTemplate: 'a1b2c3d4-0000-4000-8000-000000000003',
+  toa:         'a1b2c3d4-0000-4000-8000-000000000004',
+};
+
+// Choice options for `gfx_template`. These values are the ONLY ones the
+// classifier Lambda is allowed to pick from when auto-selecting, so what the
+// producer sees in the dropdown and what the AI picks always align.
+const GFX_TEMPLATE_OPTIONS = [
+  'BREAKING NEWS',
+  'ENTERTAINMENT NEWS',
+  'LOCAL NEWS',
+  'NATIONAL NEWS',
+  'NEWS & POLITICS',
+  'SPORTS',
+  'WEATHER',
+  'WORLD NEWS',
+];
+
+// Exported so tests and the deploy-time dry-run can validate the shape
+// without executing the custom-resource handler.
+module.exports.REFRAME_WITH_GRAPHICS_FIELD_IDS = REFRAME_WITH_GRAPHICS_FIELD_IDS;
+module.exports.GFX_TEMPLATE_OPTIONS = GFX_TEMPLATE_OPTIONS;
+
+const REFRAME_WITH_GRAPHICS_MDF_SCHEMAS = {
+  mainSchema: {
+    id: 'a1b2c3d4-0000-4000-8000-000000000000',
+    label: 'Reframe + Graphics metadata',
+    active: true,
+    isSubtype: false,
+    fields: [
+      {
+        id: REFRAME_WITH_GRAPHICS_FIELD_IDS.title,
+        key: 'title',
+        label: 'Title',
+        type: 'text',
+        required: false,
+      },
+      {
+        id: REFRAME_WITH_GRAPHICS_FIELD_IDS.summary,
+        key: 'summary',
+        label: 'Summary',
+        type: 'text',
+        required: false,
+      },
+      {
+        id: REFRAME_WITH_GRAPHICS_FIELD_IDS.gfxTemplate,
+        key: 'gfx_template',
+        label: 'GFX',
+        type: 'choice',
+        required: false,
+        alternatives: GFX_TEMPLATE_OPTIONS.map((v, i) => ({
+          id: `gfx-${i + 1}`,
+          value: v,
+          label: v,
+        })),
+      },
+      {
+        id: REFRAME_WITH_GRAPHICS_FIELD_IDS.toa,
+        key: 'toa',
+        label: 'Add Text on Scr',
+        type: 'checkbox',
+        required: false,
+      },
+    ],
+    view: [
+      { fieldId: REFRAME_WITH_GRAPHICS_FIELD_IDS.title },
+      { fieldId: REFRAME_WITH_GRAPHICS_FIELD_IDS.summary },
+      { fieldId: REFRAME_WITH_GRAPHICS_FIELD_IDS.gfxTemplate },
+      { fieldId: REFRAME_WITH_GRAPHICS_FIELD_IDS.toa },
+    ],
+  },
+  subTypes: [],
+};
+
+module.exports.REFRAME_WITH_GRAPHICS_MDF_SCHEMAS = REFRAME_WITH_GRAPHICS_MDF_SCHEMAS;
+
 async function getMimirApiKey(secretArn) {
   const response = await secretsClient.send(new GetSecretValueCommand({ SecretId: secretArn }));
   return response.SecretString;
@@ -102,8 +194,12 @@ async function registerCustomActions(apiKey, mimirBaseUrl, actionsApiUrl) {
       icon: '',
       includeJWT: true,
       allowedBy: { type: 'everyone' },
-      mdfSchemas: null,
-      metadataEnabled: false
+      // Optional producer-supplied overrides for the graphics overlay.
+      // When a field is left blank the pipeline falls back to the AI-generated
+      // value (category, kicker lines, headline) for that slot. `toa` is a
+      // strict opt-in — captions are only burned in when the box is checked.
+      metadataEnabled: true,
+      mdfSchemas: REFRAME_WITH_GRAPHICS_MDF_SCHEMAS,
     },
     {
       label: 'Reframe Custom',
