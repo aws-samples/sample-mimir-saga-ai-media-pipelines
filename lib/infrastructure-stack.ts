@@ -2616,6 +2616,15 @@ export class InfrastructureStack extends cdk.Stack {
         'lottieTemplates.$': '$.lottieTemplates',
         'templateKey.$': '$.lottieTemplates[\'9:16\']',
         'videoDurationMs.$': '$.videoDurationMs',
+        // Lower-third placement: calibrated against customer reference art,
+        // which lands the title top around 72% of frame height. Yoffsets
+        // scale with frame height so all three aspects share a visual
+        // position (300 / 1920 ≈ 15.6%, applied proportionally below).
+        // Font size held constant since the frame width is 1080 for every
+        // aspect — the kicker lines (Line 1/2/3) overran 100pt at 16 chars
+        // so the override brings them to 80pt.
+        'textYOffset': 300,
+        'textFontSize': 80,
       },
     });
     const setTemplate11 = new stepfunctions.Pass(this, 'SetTemplate11', {
@@ -2628,6 +2637,9 @@ export class InfrastructureStack extends cdk.Stack {
         'lottieTemplates.$': '$.lottieTemplates',
         'templateKey.$': '$.lottieTemplates[\'1:1\']',
         'videoDurationMs.$': '$.videoDurationMs',
+        // 300 * (1080 / 1920) ≈ 170
+        'textYOffset': 170,
+        'textFontSize': 80,
       },
     });
     const setTemplate45 = new stepfunctions.Pass(this, 'SetTemplate45', {
@@ -2640,6 +2652,9 @@ export class InfrastructureStack extends cdk.Stack {
         'lottieTemplates.$': '$.lottieTemplates',
         'templateKey.$': '$.lottieTemplates[\'4:5\']',
         'videoDurationMs.$': '$.videoDurationMs',
+        // 300 * (1350 / 1920) ≈ 210
+        'textYOffset': 210,
+        'textFontSize': 80,
       },
     });
 
@@ -2680,6 +2695,10 @@ export class InfrastructureStack extends cdk.Stack {
         // populating yet. The handler falls back to 60s when it sees 0 so
         // the pipeline degrades gracefully instead of failing the state.
         'videoDurationMs.$': '$.videoDurationMs',
+        // Per-aspect lower-third placement + kicker-line font size override,
+        // set in the SetTemplate91X passes above and threaded through here.
+        'textYOffset.$': '$.textYOffset',
+        'textFontSize.$': '$.textFontSize',
       }),
       resultPath: '$.overlayResult',
     });

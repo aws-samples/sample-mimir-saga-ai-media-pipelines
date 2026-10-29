@@ -829,21 +829,105 @@ def _is_persistent_layer(name: str) -> bool:
       - exact-name matches for logo / category label / location-credit
       - prefix match for the station template's `sidebar_<category> - Nmin`
         sub-comp layers (one per category — only the matching one is visible)
-      - substring match for `<Category> Gradient` fill layers
     """
     stripped = (name or '').strip()
     if stripped in _PERSISTENT_EXACT_NAMES:
         return True
     if stripped.startswith('sidebar_'):
         return True
+    return False
+
+
+def _is_text_layer(name: str) -> bool:
+    """Return True for any layer in the animated title/summary text group.
+
+    Includes the per-category `<Category> Gradient` root-level fills — those
+    are the colour wash behind the title (not the sidebar's own colour,
+    which lives inside the `sidebar_*` sub-comps). The customer wants the
+    gradient to dissolve off with the title text, not persist.
+    """
+    stripped = (name or '').strip()
+    if stripped in TEXT_LAYER_NAMES:
+        return True
     if stripped.endswith('Gradient'):
         return True
     return False
 
 
-def _is_text_layer(name: str) -> bool:
-    """Return True for any layer in the animated title/summary text group."""
-    return (name or '').strip() in TEXT_LAYER_NAMES
+def shift_text_block_down(data: dict, offset_y: float) -> int:
+    """Move the title/summary block vertically by `offset_y` pixels (positive = down).
+
+    The template parents Line 2/3, body text, breaking line, and the Category
+    Label to `Line 1`, so shifting Line 1's Y value cascades to every child —
+    we only have to touch one layer. Both the keyframe values and the inline
+    expression's `baseY` are updated so the shift lands whether lottie-web
+    evaluates the expression or falls back to the keyframes.
+
+    Gradient fills behind the title are shifted alongside, so the colour wash
+    stays anchored under the text instead of leaving a seam.
+
+    Returns the number of layers mutated (for logging). A zero or missing
+    `offset_y` is a no-op.
+    """
+    import re
+    if not offset_y:
+        return 0
+
+    def shift_split_axis(axis: dict) -> None:
+        """Shift a Lottie split-position single-axis property in-place."""
+        if not isinstance(axis, dict):
+            return
+        k = axis.get('k')
+        if isinstance(k, list):
+            for kf in k:
+                if isinstance(kf, dict) and 's' in kf and isinstance(kf['s'], list):
+                    kf['s'] = [v + offset_y for v in kf['s']]
+        elif isinstance(k, (int, float)):
+            axis['k'] = k + offset_y
+        # Also patch baked-in expressions that read `baseY = <N>`
+        expr = axis.get('x')
+        if isinstance(expr, str):
+            axis['x'] = re.sub(
+                r'(baseY\s*=\s*)(-?\d+(?:\.\d+)?)',
+                lambda m: f'{m.group(1)}{float(m.group(2)) + offset_y}',
+                expr,
+            )
+
+    def shift_position(pos: dict) -> bool:
+        """Shift a Lottie position property. Returns True if touched."""
+        if not isinstance(pos, dict):
+            return False
+        if pos.get('s') is True:
+            # Split-position: shift only the Y axis
+            shift_split_axis(pos.get('y'))
+            return True
+        k = pos.get('k')
+        if isinstance(k, list):
+            # Static vector [x, y, (z)] or a keyframe list
+            if k and isinstance(k[0], (int, float)):
+                k[1] = k[1] + offset_y
+                return True
+            for kf in k:
+                if isinstance(kf, dict) and 's' in kf and isinstance(kf['s'], list) and len(kf['s']) >= 2:
+                    kf['s'][1] = kf['s'][1] + offset_y
+            return True
+        return False
+
+    moved = 0
+    # Line 1 is the parent of every animated text layer and of Category Label.
+    # Shifting its position propagates through the parent chain in lottie-web.
+    for layer in data.get('layers', []):
+        if (layer.get('nm') or '').strip() == 'Line 1':
+            if shift_position(layer.get('ks', {}).get('p', {})):
+                moved += 1
+            break
+    # Gradient fills are not parented, so they need their own shift.
+    for layer in data.get('layers', []):
+        nm = (layer.get('nm') or '').strip()
+        if nm.endswith('Gradient'):
+            if shift_position(layer.get('ks', {}).get('p', {})):
+                moved += 1
+    return moved
 
 
 def hide_layers_by_predicate(data: dict, predicate) -> int:
@@ -1073,6 +1157,15 @@ def handler(event, context):
     video_duration_ms = float(event.get('videoDurationMs', 60000) or 60000)
     video_duration_seconds = video_duration_ms / 1000.0
     persistent_start_frame = int(event.get('persistentStartFrame', 90) or 90)
+    # Vertical offset applied to the title/summary block in the TEXT variant
+    # only, so producers can push the lower-third into a cleaner part of the
+    # frame without touching the persistent sidebar / logo. Positive = down.
+    text_y_offset = float(event.get('textYOffset', 0) or 0)
+    # Font size override for the kicker lines (Line 1/2/3) only. Body text
+    # keeps the template's authored size. The reference template ships Line
+    # 1/2/3 at 100pt ProximaNova-Extrabld, which overruns 1080-wide frames
+    # for ~16-char kickers; the customer's reference art lands around 80pt.
+    text_font_size = int(event.get('textFontSize', 0) or 0)
 
     # S3 key: {itemId}/overlays/{baseFilename}_{aspect}.mov
     aspect_suffix = aspect_ratio.replace(':', '-')
@@ -1145,6 +1238,32 @@ def handler(event, context):
             f"Dual-variant split — text variant hid {hidden_in_text} persistent layer(s); "
             f"persistent variant hid {hidden_in_persistent} text layer(s)."
         )
+
+        # Shift the title/summary block vertically in the TEXT variant only.
+        # The persistent variant keeps its own Line 1 position so the
+        # Category Label (parented to Line 1) stays where the designer put
+        # it next to the sidebar/logo.
+        if text_y_offset:
+            moved = shift_text_block_down(text_lottie, text_y_offset)
+            logger.info(
+                f"Text variant: shifted {moved} layer(s) down by {text_y_offset:.0f}px"
+            )
+        # Shrink the kicker lines so long titles don't overrun the frame
+        # width. Applied to the text variant only — persistent variant
+        # doesn't render these layers (they're hidden by _is_text_layer).
+        if text_font_size:
+            resized = 0
+            for layer in text_lottie.get('layers', []):
+                nm = (layer.get('nm') or '').strip()
+                if nm in ('Line 1', 'Line 2', 'Line 3'):
+                    try:
+                        layer['t']['d']['k'][0]['s']['s'] = text_font_size
+                        resized += 1
+                    except (KeyError, IndexError, TypeError):
+                        pass
+            logger.info(
+                f"Text variant: resized {resized} kicker layer(s) to {text_font_size}pt"
+            )
 
         text_mov_path = os.path.join(tmpdir, f'{base_filename}_{aspect_suffix}_text.mov')
         persistent_mov_path = os.path.join(tmpdir, f'{base_filename}_{aspect_suffix}_persistent.mov')
