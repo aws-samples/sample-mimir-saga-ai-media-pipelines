@@ -47,21 +47,27 @@ s3_client = boto3.client('s3')
 # Matches the 'Choose News Type' effect on the 'sidebar control' null layer
 # ---------------------------------------------------------------------------
 
+# Entries include both the Lottie template's native names (ENTERTAINMENT,
+# POLITICS) and the Amagi-style labels exposed to producers via the Mimir
+# custom-action `gfx_template` choice (ENTERTAINMENT NEWS, NEWS & POLITICS).
+# Both forms resolve to the same dropdown index / brand color, so whichever
+# string the classifier or producer sends renders the same visual treatment.
 CATEGORY_DROPDOWN = {
-    'LOCAL NEWS':        1,
-    'BREAKING NEWS':     2,
-    'ENTERTAINMENT':     3,
-    'NATIONAL NEWS':     4,
-    'POLITICS':          5,
-    'SPORTS':            6,
-    'WORLD NEWS':        7,
-    'WEATHER':           8,
+    'LOCAL NEWS':         1,
+    'BREAKING NEWS':      2,
+    'ENTERTAINMENT':      3,
+    'ENTERTAINMENT NEWS': 3,
+    'NATIONAL NEWS':      4,
+    'POLITICS':           5,
+    'NEWS & POLITICS':    5,
+    'SPORTS':             6,
+    'WORLD NEWS':         7,
+    'WEATHER':            8,
 }
 
 # Aliases for common variations
 CATEGORY_ALIASES = {
     'ENTERTAINMENT / LIFESTYLE': 'ENTERTAINMENT',
-    'NEWS & POLITICS':           'POLITICS',
     'BUSINESS & FINANCE':        'NATIONAL NEWS',
     'EDUCATION':                 'NATIONAL NEWS',
     'LOCAL LIVING':              'LOCAL NEWS',
@@ -75,16 +81,20 @@ CATEGORY_ALIASES = {
     'BREAKING':                  'BREAKING NEWS',
 }
 
-# Category → accent color (hex)
+# Category → accent color (hex). ENTERTAINMENT NEWS / NEWS & POLITICS are
+# the Amagi dropdown labels and share colours with their short-form equivalents
+# so the brand treatment stays consistent across both naming styles.
 CATEGORY_COLORS = {
-    'LOCAL NEWS':        '#EFA192',
-    'BREAKING NEWS':     '#DC0101',
-    'ENTERTAINMENT':     '#764BD9',
-    'NATIONAL NEWS':     '#06569D',
-    'POLITICS':          '#4A4A4A',
-    'SPORTS':            '#000000',
-    'WORLD NEWS':        '#4A4A4A',
-    'WEATHER':           '#9C86A7',
+    'LOCAL NEWS':         '#EFA192',
+    'BREAKING NEWS':      '#DC0101',
+    'ENTERTAINMENT':      '#764BD9',
+    'ENTERTAINMENT NEWS': '#764BD9',
+    'NATIONAL NEWS':      '#06569D',
+    'POLITICS':           '#4A4A4A',
+    'NEWS & POLITICS':    '#4A4A4A',
+    'SPORTS':             '#000000',
+    'WORLD NEWS':         '#4A4A4A',
+    'WEATHER':            '#9C86A7',
 }
 
 DEFAULT_CATEGORY = 'BREAKING NEWS'
