@@ -228,9 +228,30 @@ async function main() {
       ffmpeg.on('error', reject);
     });
 
+    // Step through the animation from frame 0 to prime lottie-web's render
+    // state. Without this, calling `goToAndStop(90, true)` cold leaves some
+    // expression-driven layers (notably the sidebar sub-comps whose opacity
+    // reads an effect value off the `sidebar control` null layer) un-
+    // evaluated, so the first captured frame is fully transparent. Walking
+    // through a handful of frames with a double-rAF between each lets the
+    // browser flush an actual paint, so by the time we jump to the real
+    // start frame every layer has been realised at least once.
+    for (let warmup = 0; warmup < 3; warmup += 1) {
+      await page.evaluate(f => new Promise(resolve => {
+        window._anim.goToAndStop(f, true);
+        requestAnimationFrame(() => requestAnimationFrame(resolve));
+      }), warmup);
+    }
+
     for (let i = 0; i < framesToRender; i++) {
       const lottieFrame = effectiveStartFrame + i;
-      await page.evaluate(f => { window._anim.goToAndStop(f, true); }, lottieFrame);
+      // Double-rAF after `goToAndStop` so the SVG paint lands before we
+      // screenshot. Puppeteer otherwise races with the next browser repaint
+      // and returns a stale (often fully transparent) buffer.
+      await page.evaluate(f => new Promise(resolve => {
+        window._anim.goToAndStop(f, true);
+        requestAnimationFrame(() => requestAnimationFrame(resolve));
+      }), lottieFrame);
       const pngBuf = await page.screenshot({
         omitBackground: true,
         clip: { x: 0, y: 0, width: NATIVE_W, height: NATIVE_H },

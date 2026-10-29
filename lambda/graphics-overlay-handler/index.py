@@ -874,18 +874,24 @@ def ffmpeg_composite_overlays(persistent_mov: str, text_mov: str,
                               fps: float) -> None:
     """Composite the two overlay MOVs into a single MOV sized to `duration_seconds`.
 
-    The persistent MOV (a single settled-state frame) is extended to match
-    the clip duration via `tpad=stop_mode=clone`, then the text MOV is
-    overlayed on top from timestamp 0. The text MOV's own internal alpha
-    fade-out (built in by render_lottie.js) handles the dissolve; `overlay`'s
-    `eof_action=pass` keeps the base visible after the text overlay ends.
+    The persistent MOV carries the sidebar / logo / category label (and the
+    scrolling-text animation inside the station template's sidebar sub-comp,
+    which runs the full duration we render). The text MOV carries the title
+    / summary and bakes its own alpha fade-out via render_lottie.js. We
+    compose text on top of persistent from timestamp 0 and clip the output
+    at `duration_seconds`. If the persistent MOV is shorter than the clip,
+    `tpad=stop_mode=clone` holds its final frame to fill the remainder (the
+    sidebar scroll freezes in that case — ok for clips longer than Lottie's
+    native 180s outpoint).
 
     Output: qtrle + rgba MOV with alpha channel preserved, as MediaConvert's
     MotionImageInserter requires.
     """
-    # Pad the persistent base to the full clip duration. Pass a slightly
-    # longer duration than requested and then trim at `-t` on output so the
-    # tpad vs. output framerate math never leaves us one frame short.
+    # Pad the persistent base to the full clip duration. tpad is cheap when
+    # the persistent already covers the clip (just emits nothing). Pass a
+    # slightly longer duration than requested and then trim at `-t` on
+    # output so the tpad vs. output framerate math never leaves us one
+    # frame short.
     pad_seconds = max(0.0, duration_seconds + 1.0)
     filter_graph = (
         f'[0:v]tpad=stop_mode=clone:stop_duration={pad_seconds:.3f}[bg];'
@@ -1154,13 +1160,40 @@ def handler(event, context):
             fade_out_seconds=fade_out_seconds,
         )
 
-        # Persistent variant: a single Lottie frame captured *after* the
-        # slide-in has settled, so the sidebar/logo appears already-landed
-        # from the first output frame rather than animating in each time.
+        # Persistent variant: render the full clip duration (capped) starting
+        # at `persistent_start_frame` so the sidebar/logo appears already-
+        # landed from frame 0 of the output. We render through the whole clip
+        # rather than freezing a single frame because the station template's
+        # sidebar carries a scrolling "LOCAL NEWS" / "BREAKING NEWS" text
+        # animation that a single-frame freeze would stop dead. The sub-comp
+        # isn't built for seamless looping, so a stream_loop here would
+        # visibly pop.
+        fps = float(lottie_data['fr'])
+        # Safety cap: a long clip could push persistent render past the
+        # Lambda timeout. 60s of persistent is enough for every short-form
+        # social clip we've seen; longer clips tpad-freeze the final frame
+        # in the composite below, so the sidebar stays on screen (scroll
+        # stops) rather than disappearing.
+        PERSISTENT_FRAMES_SAFETY_CAP = int(60 * fps)
+        lottie_total_frames = int(lottie_data.get('op', 0))
+        persistent_frames_requested = int(round(video_duration_seconds * fps))
+        persistent_frames_available = max(0, lottie_total_frames - persistent_start_frame)
+        persistent_frames = min(
+            persistent_frames_requested,
+            persistent_frames_available,
+            PERSISTENT_FRAMES_SAFETY_CAP,
+        )
+        # Enforce a floor so very short clips still get a usable scroll window
+        persistent_frames = max(persistent_frames, 60)
+        logger.info(
+            f"Persistent variant: rendering {persistent_frames} frame(s) "
+            f"({persistent_frames / fps:.2f}s) starting at Lottie frame "
+            f"{persistent_start_frame} (clip duration {video_duration_seconds:.2f}s)"
+        )
         render_lottie_to_mov(
             persistent_lottie,
             persistent_mov_path,
-            max_frames=1,
+            max_frames=persistent_frames,
             fade_out_seconds=0,
             start_frame=persistent_start_frame,
         )
@@ -1173,7 +1206,7 @@ def handler(event, context):
             text_mov=text_mov_path,
             output_path=combined_mov_path,
             duration_seconds=video_duration_seconds,
-            fps=lottie_data['fr'],
+            fps=fps,
         )
         mov_path = combined_mov_path
         render_info = text_info
