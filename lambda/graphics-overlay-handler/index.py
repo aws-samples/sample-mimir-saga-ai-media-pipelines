@@ -784,18 +784,18 @@ def _hide_matte_layers(data: dict) -> None:
 # So we hide every child layer explicitly rather than relying on a parent
 # alpha blend.
 
-# Layers hidden in the TEXT variant (keeps the animating title/summary visible)
-PERSISTENT_LAYER_NAMES = frozenset([
-    'logo_placeholder',
-    'Category Label',
-    'Category Label-TextBox',
-    'Location/Courtesy',
-    'location/courtesy-TextBox',
-])
+# The pipeline has shipped two Lottie template designs across different
+# tenants: a 14-layer customer-agnostic reference (the one committed to the
+# repo) and a 33-layer station toolkit variant (the one still live in some
+# S3 buckets, carrying a full category-sidebar system + per-category gradient
+# fills + an extra TextBox copy on each label). Both share the same text
+# layer names on the animated group, so the TEXT matcher is a simple
+# frozenset. The PERSISTENT matcher is a predicate so it can also cover
+# the station variant's sidebar/gradient layers by prefix/substring.
 
-# Layers hidden in the PERSISTENT variant (keeps the sidebar/logo/category label).
-# Line 1-3 and body text have their visual content gated by opacity but
-# `breaking line` is a shape layer, so hiding it is the only way to drop it.
+# Hidden in the PERSISTENT variant → keeps the sidebar/logo/category label
+# visible. Line 1-3 and body text are already text layers; `breaking line`
+# is a shape layer so hiding it needs an explicit entry here.
 TEXT_LAYER_NAMES = frozenset([
     'Line 1',
     'Line 2',
@@ -804,13 +804,55 @@ TEXT_LAYER_NAMES = frozenset([
     'breaking line',
 ])
 
+# Exact names of persistent-group layers across both known template variants.
+_PERSISTENT_EXACT_NAMES = frozenset([
+    # Customer-agnostic reference template (14 layers)
+    'logo_placeholder',
+    'Category Label',
+    'Category Label-TextBox',
+    # Station toolkit template (33 layers) uses different names
+    'logo_wpde_abc15.png',
+    'BREAKING NEWS',             # the station variant's category label layer
+    'BREAKING NEWS-TextBox',
+    'BREAKING NEWS-TextBox 2',   # auto-sizing stub left over from After Effects
+    # Shared across both variants
+    'Location/Courtesy',
+    'location/courtesy-TextBox',
+    'location/courtesy-TextBox 2',
+])
 
-def hide_layers_by_name(data: dict, layer_names: frozenset) -> int:
-    """Set opacity to 0 on every layer whose stripped name is in `layer_names`.
 
-    Walks root layers and every asset sub-comp. Matches on exact name after
-    stripping whitespace (some template exports carry trailing spaces on
-    layer names). Returns the number of layers mutated.
+def _is_persistent_layer(name: str) -> bool:
+    """Return True for any layer that must stay visible for the full clip.
+
+    Covers both known Lottie template variants:
+      - exact-name matches for logo / category label / location-credit
+      - prefix match for the station template's `sidebar_<category> - Nmin`
+        sub-comp layers (one per category — only the matching one is visible)
+      - substring match for `<Category> Gradient` fill layers
+    """
+    stripped = (name or '').strip()
+    if stripped in _PERSISTENT_EXACT_NAMES:
+        return True
+    if stripped.startswith('sidebar_'):
+        return True
+    if stripped.endswith('Gradient'):
+        return True
+    return False
+
+
+def _is_text_layer(name: str) -> bool:
+    """Return True for any layer in the animated title/summary text group."""
+    return (name or '').strip() in TEXT_LAYER_NAMES
+
+
+def hide_layers_by_predicate(data: dict, predicate) -> int:
+    """Set opacity to 0 on every layer whose name matches `predicate`.
+
+    Walks root layers and every asset sub-comp. `predicate` receives the
+    layer's name (whitespace preserved so startswith/endswith callers can
+    handle their own normalisation) and returns True to hide. Returns the
+    number of layers mutated.
     """
     hidden = 0
     all_layer_sets = [data.get('layers', [])]
@@ -820,8 +862,8 @@ def hide_layers_by_name(data: dict, layer_names: frozenset) -> int:
 
     for layers in all_layer_sets:
         for layer in layers:
-            name = (layer.get('nm') or '').strip()
-            if name in layer_names:
+            name = layer.get('nm') or ''
+            if predicate(name):
                 layer.setdefault('ks', {})['o'] = {'a': 0, 'k': 0, 'ix': 11}
                 hidden += 1
     return hidden
@@ -1091,8 +1133,8 @@ def handler(event, context):
         # (<1 MB JSON) and keeps the patch pipeline above single-sourced.
         text_lottie = copy.deepcopy(lottie_data)
         persistent_lottie = copy.deepcopy(lottie_data)
-        hidden_in_text = hide_layers_by_name(text_lottie, PERSISTENT_LAYER_NAMES)
-        hidden_in_persistent = hide_layers_by_name(persistent_lottie, TEXT_LAYER_NAMES)
+        hidden_in_text = hide_layers_by_predicate(text_lottie, _is_persistent_layer)
+        hidden_in_persistent = hide_layers_by_predicate(persistent_lottie, _is_text_layer)
         logger.info(
             f"Dual-variant split — text variant hid {hidden_in_text} persistent layer(s); "
             f"persistent variant hid {hidden_in_persistent} text layer(s)."
