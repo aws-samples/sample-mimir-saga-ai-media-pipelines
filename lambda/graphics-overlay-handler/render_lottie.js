@@ -228,30 +228,61 @@ async function main() {
       ffmpeg.on('error', reject);
     });
 
-    // Step through the animation from frame 0 to prime lottie-web's render
-    // state. Without this, calling `goToAndStop(90, true)` cold leaves some
-    // expression-driven layers (notably the sidebar sub-comps whose opacity
-    // reads an effect value off the `sidebar control` null layer) un-
-    // evaluated, so the first captured frame is fully transparent. Walking
-    // through a handful of frames with a double-rAF between each lets the
-    // browser flush an actual paint, so by the time we jump to the real
-    // start frame every layer has been realised at least once.
-    for (let warmup = 0; warmup < 3; warmup += 1) {
-      await page.evaluate(f => new Promise(resolve => {
+    // Short per-frame paint delay (ms) applied in addition to the double-rAF.
+    // Covers paint-lag glitches after large DOM updates — notably the
+    // station template's 15s instance boundary where a whole sidebar
+    // sub-comp swaps in — where a bare double-rAF screenshots the outgoing
+    // instance for 1-2 frames before the compositor catches up.
+    const PAINT_SETTLE_MS = 50;
+
+    // Prime lottie-web at the *start frame* (not frame 0) so the very first
+    // real capture already has a painted SVG matching that frame. We also
+    // call `renderer.renderFrame(f)` explicitly after each `goToAndStop`
+    // to force a synchronous SVG mutation — otherwise lottie-web can defer
+    // the actual DOM update, leaving the first few screenshots capturing
+    // stale pixels (observed as output frames 0/1 identical with a jump
+    // at frame 2) and causing visible pops right after the station
+    // template's 15s instance boundaries.
+    const settleFrame = async (frame) => {
+      await page.evaluate((f, settleMs) => new Promise(resolve => {
+        // goToAndStop synchronously calls gotoFrame which synchronously
+        // triggers the renderer. The SVG DOM is updated by the time
+        // control returns. Force a style flush via offsetHeight so the
+        // compositor sees the mutation, then let the browser paint via
+        // setTimeout + double-rAF before resolving so Puppeteer's next
+        // screenshot captures the painted result, not the pre-paint buffer.
         window._anim.goToAndStop(f, true);
-        requestAnimationFrame(() => requestAnimationFrame(resolve));
-      }), warmup);
+        // eslint-disable-next-line no-unused-expressions
+        document.body.offsetHeight;
+        setTimeout(() => requestAnimationFrame(() => requestAnimationFrame(resolve)), settleMs);
+      }), frame, PAINT_SETTLE_MS);
+    };
+
+    // Warm up at the start frame with the full settle pipeline so the paint
+    // state the capture loop inherits is already correct.
+    for (let warmup = 0; warmup < 5; warmup += 1) {
+      await settleFrame(effectiveStartFrame);
+    }
+
+    // Puppeteer's screenshot pipeline runs on its own compositor thread and
+    // appears to return the FRAME BEFORE the one lottie just rendered — the
+    // first N screenshots after a settle lag one frame behind, which shows
+    // up in the output as a duplicate first frame followed by a visible
+    // jump. Prime the screenshot pipeline with throwaway captures BEFORE
+    // starting the real loop, so by the time we start writing frames to
+    // FFmpeg the compositor is already in lockstep with lottie-web.
+    const PRIME_CAPTURES = 2;
+    for (let p = 0; p < PRIME_CAPTURES; p += 1) {
+      await settleFrame(effectiveStartFrame);
+      await page.screenshot({
+        omitBackground: true,
+        clip: { x: 0, y: 0, width: NATIVE_W, height: NATIVE_H },
+      });
     }
 
     for (let i = 0; i < framesToRender; i++) {
       const lottieFrame = effectiveStartFrame + i;
-      // Double-rAF after `goToAndStop` so the SVG paint lands before we
-      // screenshot. Puppeteer otherwise races with the next browser repaint
-      // and returns a stale (often fully transparent) buffer.
-      await page.evaluate(f => new Promise(resolve => {
-        window._anim.goToAndStop(f, true);
-        requestAnimationFrame(() => requestAnimationFrame(resolve));
-      }), lottieFrame);
+      await settleFrame(lottieFrame);
       const pngBuf = await page.screenshot({
         omitBackground: true,
         clip: { x: 0, y: 0, width: NATIVE_W, height: NATIVE_H },
