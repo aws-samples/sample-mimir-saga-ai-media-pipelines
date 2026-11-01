@@ -40,6 +40,14 @@ exports.handler = async (event) => {
     
     console.log('Mimir API response:', JSON.stringify(details, null, 2));
     
+    // Normalise technical_media_duration onto a stable top-level field so
+    // Step Functions `.$:` references never hard-fail on items whose
+    // technicalMetadata is still being populated by Mimir's ingest pipeline.
+    // Mimir reports media duration in MILLISECONDS; keep that unit here and
+    // let callers divide if they need seconds.
+    const technicalDurationMs = details?.technicalMetadata?.formData?.technical_media_duration;
+    const videoDurationMs = typeof technicalDurationMs === 'number' ? technicalDurationMs : 0;
+
     return {
       ...event,
       proxyUrl: details.proxy,
@@ -49,6 +57,7 @@ exports.handler = async (event) => {
       ingestSourceS3Bucket: details.ingestSourceS3Bucket || '',
       ingestSourceFullPath: details.ingestSourceFullPath || '',
       sourceFileLocation: details.sourceFileLocation || details.source?.scheme || '',
+      videoDurationMs,
       mimirDetails: details
     };
   } catch (error) {

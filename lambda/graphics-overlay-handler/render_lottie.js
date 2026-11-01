@@ -6,7 +6,15 @@
  * Puppeteer + lottie-web (SVG renderer).
  *
  * Usage:
- *   node render_lottie.js <animation_json_path> <output_mov_path> <width> <height> <fps> [max_frames]
+ *   node render_lottie.js <animation_json_path> <output_mov_path> \
+ *     <width> <height> <fps> [max_frames] [fade_out_seconds] [start_frame]
+ *
+ * - fade_out_seconds > 0 ramps the output MOV's alpha from 1.0 → 0.0 over
+ *   the final N seconds via an FFmpeg `fade=t=out:alpha=1` filter, so the
+ *   overlay dissolves off screen instead of hard-cutting.
+ * - start_frame > 0 seeks past the intro before capture, so renders can
+ *   begin at a specific point in the animation timeline (e.g. frame 90
+ *   to skip a one-shot slide-in and emit only the settled state).
  *
  * Stdout: JSON { frameCount, fps, width, height }
  * Stderr: progress logs
@@ -25,10 +33,10 @@ const EMPTY_PNG = Buffer.from(
 );
 
 async function main() {
-  const [,, animJsonPath, outputMovPath, widthStr, heightStr, fpsStr, maxFramesStr] = process.argv;
+  const [,, animJsonPath, outputMovPath, widthStr, heightStr, fpsStr, maxFramesStr, fadeOutSecondsStr, startFrameStr] = process.argv;
 
   if (!animJsonPath || !outputMovPath || !widthStr || !heightStr || !fpsStr) {
-    process.stderr.write('Usage: node render_lottie.js <anim.json> <output.mov> <width> <height> <fps> [max_frames]\n');
+    process.stderr.write('Usage: node render_lottie.js <anim.json> <output.mov> <width> <height> <fps> [max_frames] [fade_out_seconds] [start_frame]\n');
     process.exit(1);
   }
 
@@ -36,6 +44,14 @@ async function main() {
   const H = parseInt(heightStr);
   const fps = parseFloat(fpsStr);
   const maxFrames = maxFramesStr ? parseInt(maxFramesStr) : null;
+  // Fade length in seconds; 0 (or absent) disables the fade entirely so the
+  // overlay ends on its final rendered frame.
+  const fadeOutSeconds = fadeOutSecondsStr ? parseFloat(fadeOutSecondsStr) : 0;
+  // Starting point in the Lottie timeline. Lets a caller request e.g. frame 90
+  // to skip past a one-shot slide-in and capture only the settled state —
+  // useful for the "persistent" overlay variant that stays on-screen for the
+  // whole clip. Default 0 renders from the very beginning as before.
+  const startFrame = startFrameStr ? parseInt(startFrameStr) : 0;
 
   const animJson = fs.readFileSync(animJsonPath, 'utf8');
   const animData = JSON.parse(animJson);
@@ -170,17 +186,38 @@ async function main() {
 
     const totalFrames = result.totalFrames;
     const animFps = result.fps;
-    const framesToRender = maxFrames ? Math.min(maxFrames, totalFrames) : totalFrames;
+    // startFrame caps against the animation's last frame so a caller asking
+    // for frame 90 of a 60-frame animation safely falls back to the end
+    // instead of rendering nothing.
+    const effectiveStartFrame = Math.max(0, Math.min(startFrame, totalFrames - 1));
+    const framesAvailable = totalFrames - effectiveStartFrame;
+    const framesToRender = maxFrames
+      ? Math.min(maxFrames, framesAvailable)
+      : framesAvailable;
 
     process.stderr.write(`Animation loaded: ${totalFrames} frames @ ${animFps}fps (${NATIVE_W}x${NATIVE_H})\n`);
-    process.stderr.write(`Rendering ${framesToRender} frames → ${outputMovPath}\n`);
+    process.stderr.write(`Rendering ${framesToRender} frames starting at frame ${effectiveStartFrame} → ${outputMovPath}\n`);
 
     // Start FFmpeg — reads PNG frames from stdin, outputs qtrle MOV with alpha
     const ffmpegArgs = [
       '-y',
       '-f', 'image2pipe', '-vcodec', 'png', '-r', String(fps), '-i', 'pipe:0',
     ];
-    if (needsScale) ffmpegArgs.push('-vf', `scale=${W}:${H}:flags=lanczos`);
+    const filters = [];
+    if (needsScale) filters.push(`scale=${W}:${H}:flags=lanczos`);
+    // Alpha fade-out ramp applied to the LAST `fadeOutSeconds` of the MOV so
+    // the overlay dissolves off instead of popping off. `alpha=1` restricts
+    // the fade to the alpha plane — RGB stays untouched, which matters once
+    // MediaConvert composites the MOV onto the smart-crop video.
+    const totalSeconds = framesToRender / fps;
+    const fadeStart = fadeOutSeconds > 0
+      ? Math.max(0, totalSeconds - fadeOutSeconds)
+      : null;
+    if (fadeStart !== null) {
+      filters.push(`fade=t=out:st=${fadeStart.toFixed(3)}:d=${fadeOutSeconds.toFixed(3)}:alpha=1`);
+      process.stderr.write(`Alpha fade-out: start=${fadeStart.toFixed(3)}s, duration=${fadeOutSeconds.toFixed(3)}s (clip ends at ${totalSeconds.toFixed(3)}s)\n`);
+    }
+    if (filters.length) ffmpegArgs.push('-vf', filters.join(','));
     ffmpegArgs.push('-vcodec', 'qtrle', '-pix_fmt', 'rgba', '-movflags', '+faststart', outputMovPath);
 
     const ffmpeg = spawn('/usr/local/bin/ffmpeg', ffmpegArgs);
@@ -191,14 +228,67 @@ async function main() {
       ffmpeg.on('error', reject);
     });
 
+    // Short per-frame paint delay (ms) applied in addition to the double-rAF.
+    // Covers paint-lag glitches after large DOM updates — notably the
+    // station template's 15s instance boundary where a whole sidebar
+    // sub-comp swaps in — where a bare double-rAF screenshots the outgoing
+    // instance for 1-2 frames before the compositor catches up.
+    const PAINT_SETTLE_MS = 50;
+
+    // Prime lottie-web at the *start frame* (not frame 0) so the very first
+    // real capture already has a painted SVG matching that frame. We also
+    // call `renderer.renderFrame(f)` explicitly after each `goToAndStop`
+    // to force a synchronous SVG mutation — otherwise lottie-web can defer
+    // the actual DOM update, leaving the first few screenshots capturing
+    // stale pixels (observed as output frames 0/1 identical with a jump
+    // at frame 2) and causing visible pops right after the station
+    // template's 15s instance boundaries.
+    const settleFrame = async (frame) => {
+      await page.evaluate((f, settleMs) => new Promise(resolve => {
+        // goToAndStop synchronously calls gotoFrame which synchronously
+        // triggers the renderer. The SVG DOM is updated by the time
+        // control returns. Force a style flush via offsetHeight so the
+        // compositor sees the mutation, then let the browser paint via
+        // setTimeout + double-rAF before resolving so Puppeteer's next
+        // screenshot captures the painted result, not the pre-paint buffer.
+        window._anim.goToAndStop(f, true);
+        // eslint-disable-next-line no-unused-expressions
+        document.body.offsetHeight;
+        setTimeout(() => requestAnimationFrame(() => requestAnimationFrame(resolve)), settleMs);
+      }), frame, PAINT_SETTLE_MS);
+    };
+
+    // Warm up at the start frame with the full settle pipeline so the paint
+    // state the capture loop inherits is already correct.
+    for (let warmup = 0; warmup < 5; warmup += 1) {
+      await settleFrame(effectiveStartFrame);
+    }
+
+    // Puppeteer's screenshot pipeline runs on its own compositor thread and
+    // appears to return the FRAME BEFORE the one lottie just rendered — the
+    // first N screenshots after a settle lag one frame behind, which shows
+    // up in the output as a duplicate first frame followed by a visible
+    // jump. Prime the screenshot pipeline with throwaway captures BEFORE
+    // starting the real loop, so by the time we start writing frames to
+    // FFmpeg the compositor is already in lockstep with lottie-web.
+    const PRIME_CAPTURES = 2;
+    for (let p = 0; p < PRIME_CAPTURES; p += 1) {
+      await settleFrame(effectiveStartFrame);
+      await page.screenshot({
+        omitBackground: true,
+        clip: { x: 0, y: 0, width: NATIVE_W, height: NATIVE_H },
+      });
+    }
+
     for (let i = 0; i < framesToRender; i++) {
-      await page.evaluate(f => { window._anim.goToAndStop(f, true); }, i);
+      const lottieFrame = effectiveStartFrame + i;
+      await settleFrame(lottieFrame);
       const pngBuf = await page.screenshot({
         omitBackground: true,
         clip: { x: 0, y: 0, width: NATIVE_W, height: NATIVE_H },
       });
       ffmpeg.stdin.write(pngBuf);
-      if (i % 50 === 0) process.stderr.write(`  Frame ${i}/${framesToRender}\n`);
+      if (i % 50 === 0) process.stderr.write(`  Frame ${i}/${framesToRender} (lottie frame ${lottieFrame})\n`);
     }
 
     ffmpeg.stdin.end();

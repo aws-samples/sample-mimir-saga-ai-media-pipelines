@@ -73,6 +73,36 @@ const corsHeaders = {
   'Access-Control-Allow-Methods': 'POST,OPTIONS',
 };
 
+/**
+ * Normalise producer-supplied overrides from the Mimir custom-action metadata
+ * form into the shape the Reframe + Graphics state machine expects. The form
+ * posts raw field keys (`title`, `summary`, `gfx_template`, `toa`); downstream
+ * Lambdas read a stable camelCase object off `$$.Execution.Input.userMetadata`.
+ *
+ * String fields are trimmed and empty strings collapse to null so the
+ * classifier can treat them as "no override, use AI-generated value".
+ * `burnCaptions` is strictly a boolean — anything other than the exact value
+ * `true` for `toa` resolves to `false` so captions stay off by default when
+ * the checkbox is unchecked or the field is absent.
+ */
+function buildReframeGraphicsOverrides(actionData) {
+  const d = actionData && typeof actionData === 'object' ? actionData : {};
+  const trimOrNull = (v) => {
+    if (typeof v !== 'string') return null;
+    const t = v.trim();
+    return t === '' ? null : t;
+  };
+  return {
+    title:        trimOrNull(d.title),
+    summary:      trimOrNull(d.summary),
+    gfxTemplate:  trimOrNull(d.gfx_template),
+    burnCaptions: d.toa === true,
+  };
+}
+
+// Exported for unit tests
+module.exports.buildReframeGraphicsOverrides = buildReframeGraphicsOverrides;
+
 exports.handler = async (event) => {
   console.log('Received Mimir request:', JSON.stringify(event, null, 2));
   
@@ -192,6 +222,13 @@ exports.handler = async (event) => {
             })
           };
         }
+        // Producer-supplied overrides from the Mimir custom-action metadata
+        // form (keyed by the field `key` values defined in
+        // register-mimir-integrations). Always built as an object so the state
+        // machine `$$.Execution.Input.userMetadata.*` paths always resolve —
+        // null entries read as "no override, use AI-generated value".
+        const userMetadata = buildReframeGraphicsOverrides(actionData);
+        console.log('reframe-with-graphics overrides:', JSON.stringify(userMetadata));
         // Start one execution per item — each gets its own classification + overlay render
         const graphicsResults = [];
         for (const item of filteredItems) {
@@ -221,6 +258,7 @@ exports.handler = async (event) => {
             },
             aspectRatios: ['9:16', '1:1', '4:5'],
             outputPrefix: `reframe-with-graphics/${item.id}/${Date.now()}`,
+            userMetadata,
             mimirApiKey,
             userToken,
             userId,
