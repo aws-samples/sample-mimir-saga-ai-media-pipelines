@@ -3540,6 +3540,15 @@ export class InfrastructureStack extends cdk.Stack {
         'aspectRatios.$': '$$.Execution.Input.aspectRatios',
         'userId.$': '$$.Execution.Input.userId',
         'userEmail.$': '$$.Execution.Input.userEmail',
+        // ReframeWithGraphics reads $$.Execution.Input.userMetadata (ClassifyCategory)
+        // and $$.Execution.Input.userMetadata.burnCaptions (StartOverlayJob), so both
+        // must resolve or the child fails with States.Runtime, so an empty object is
+        // not enough. classify-category-handler treats absent title/summary/gfxTemplate
+        // as "no override" (same as the nulls mimir-handler sends for a blank form).
+        // shortcut: Reframe Custom has no metadata form (metadataEnabled: false), so
+        // there is nothing to pass through; pass $$.Execution.Input.userMetadata here
+        // if that action ever gets one.
+        'userMetadata': { burnCaptions: false },
       }),
       integrationPattern: stepfunctions.IntegrationPattern.RUN_JOB,
       resultPath: '$.fallbackResult',

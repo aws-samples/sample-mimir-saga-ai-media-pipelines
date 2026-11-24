@@ -117,7 +117,45 @@ function buildReframeGraphicsOverrides(actionData) {
 module.exports.buildReframeGraphicsOverrides = buildReframeGraphicsOverrides;
 module.exports.redactEventForLog = redactEventForLog;
 
+/**
+ * Check the raw API Gateway body before any token or Mimir work. Returns
+ * `{ body }` for a JSON object with an `items` array, else `{ error }` with a
+ * short reason. The reason never echoes the body.
+ */
+function parseActionBody(rawBody) {
+  if (typeof rawBody !== 'string' || rawBody.trim() === '') {
+    return { error: 'Request body is required' };
+  }
+  let body;
+  try {
+    body = JSON.parse(rawBody);
+  } catch {
+    return { error: 'Request body must be valid JSON' };
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { error: 'Request body must be a JSON object' };
+  }
+  if (!Array.isArray(body.items)) {
+    return { error: 'items must be an array' };
+  }
+  return { body };
+}
+
+module.exports.parseActionBody = parseActionBody;
+
 exports.handler = async (event) => {
+  // Malformed requests (scanners send empty bodies) get a 400 before anything
+  // else, and the body is not logged.
+  const parsed = parseActionBody(event?.body);
+  if (parsed.error) {
+    console.warn('Rejected request:', JSON.stringify({ resource: event?.resource || null, reason: parsed.error }));
+    return {
+      statusCode: 400,
+      headers: corsHeaders,
+      body: JSON.stringify({ message: parsed.error, status: 'error' }),
+    };
+  }
+
   console.log('Received Mimir request:', JSON.stringify(redactEventForLog(event), null, 2));
   
   try {
@@ -130,8 +168,7 @@ exports.handler = async (event) => {
     const actionType = actionMatch ? actionMatch[1] : 'unknown';
     console.log('Action type:', actionType);
     
-    const body = JSON.parse(event.body);
-    const { items, userToken, actionData, userId, userEmail } = body;
+    const { items, userToken, actionData, userId, userEmail } = parsed.body;
 
     // Authenticate the request by verifying the Mimir-issued user JWT.
     // This proves the request came from an authenticated Mimir user without

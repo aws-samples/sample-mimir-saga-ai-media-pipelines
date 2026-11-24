@@ -11,6 +11,7 @@ const Module = require('node:module');
 const FAKE_KEY = 'FAKE-MIMIR-KEY-123';
 const startCalls = [];
 let secretReads = 0;
+let tokenChecks = 0;
 
 const fakes = {
   '@aws-sdk/client-sfn': {
@@ -22,7 +23,7 @@ const fakes = {
     GetSecretValueCommand: class { constructor(input) { this.input = input; } },
   },
   'aws-jwt-verify': {
-    JwtRsaVerifier: { create: () => ({ verify: async () => ({ email: 'producer@example.com', token_use: 'id' }) }) },
+    JwtRsaVerifier: { create: () => ({ verify: async () => { tokenChecks += 1; return { email: 'producer@example.com', token_use: 'id' }; } }) },
   },
 };
 
@@ -37,6 +38,7 @@ let handler;
 let redactEventForLog;
 const originalLoad = Module._load;
 const originalLog = console.log;
+const originalWarn = console.warn;
 let logged = '';
 
 before(() => {
@@ -55,13 +57,16 @@ before(() => {
 after(() => {
   Module._load = originalLoad;
   console.log = originalLog;
+  console.warn = originalWarn;
 });
 
 beforeEach(() => {
   startCalls.length = 0;
   secretReads = 0;
+  tokenChecks = 0;
   logged = '';
   console.log = (...args) => { logged += args.map(String).join(' ') + '\n'; };
+  console.warn = console.log;
 });
 
 function apiEvent(action, body) {
@@ -124,5 +129,42 @@ describe('redactEventForLog', () => {
 
   it('omits a body that is not JSON', () => {
     assert.equal(redactEventForLog({ body: 'not json' }).body, '[unparseable body omitted]');
+  });
+});
+
+describe('mimir-handler malformed body', () => {
+  // A body marker that must never reach the logs or the response.
+  const MARKER = 'BODY-MARKER-789';
+  const BAD = [
+    { name: 'null body', body: null, reason: 'Request body is required' },
+    { name: 'missing body', body: undefined, reason: 'Request body is required' },
+    { name: 'empty body', body: '', reason: 'Request body is required' },
+    { name: 'whitespace body', body: '   ', reason: 'Request body is required' },
+    { name: 'invalid JSON', body: `{"userToken":"${MARKER}"`, reason: 'Request body must be valid JSON' },
+    { name: 'JSON null', body: 'null', reason: 'Request body must be a JSON object' },
+    { name: 'JSON array', body: `["${MARKER}"]`, reason: 'Request body must be a JSON object' },
+    { name: 'missing items', body: JSON.stringify({ userToken: MARKER }), reason: 'items must be an array' },
+    { name: 'items is an object', body: JSON.stringify({ userToken: MARKER, items: { id: 'x' } }), reason: 'items must be an array' },
+    { name: 'items is null', body: JSON.stringify({ userToken: MARKER, items: null }), reason: 'items must be an array' },
+  ];
+
+  for (const { name, body, reason } of BAD) {
+    it(`${name}: 400 before any token or Mimir work, body not logged`, async () => {
+      const res = await handler({ resource: '/actions/summarizer', headers: {}, body });
+      assert.equal(res.statusCode, 400);
+      assert.equal(res.headers['Content-Type'], 'application/json');
+      assert.deepEqual(JSON.parse(res.body), { message: reason, status: 'error' });
+      assert.equal(tokenChecks, 0, 'token must not be checked');
+      assert.equal(startCalls.length, 0, 'no execution may start');
+      assert.equal(secretReads, 0);
+      assert.ok(!logged.includes(MARKER), 'body must not be logged');
+      assert.ok(!res.body.includes(MARKER), 'body must not be echoed');
+    });
+  }
+
+  it('an empty items array is still accepted and authenticated', async () => {
+    const res = await handler(apiEvent('summarizer', { items: [] }));
+    assert.equal(res.statusCode, 200);
+    assert.equal(tokenChecks, 1);
   });
 });
