@@ -171,6 +171,8 @@ Deploy without a local development environment. A small CloudFormation stack cre
 
    Or upload `scripts/deploy-pipeline.yaml` in the [CloudFormation console](https://console.aws.amazon.com/cloudformation/home#/stacks/create) and fill in the parameters.
 
+   The stack stores each key in its own Secrets Manager secret (see the `MimirApiKeySecretArn` and `SagaApiKeySecretArn` outputs). The CodeBuild project references those secrets as `SECRETS_MANAGER` environment variables, so no key value appears in the project or build definitions. When you update the pipeline stack later, keep the existing key values ("Use existing value" in the console, `UsePreviousValue=true` in the CLI); clearing a key deletes its secret.
+
 2. Stack creation automatically starts the first build (~30–45 minutes). Follow progress via the `BuildConsoleUrl` stack output.
 3. Your `parameters.json` is persisted as an SSM SecureString parameter (`/MimirSagaAI/DeploymentConfig/parameters`), so re-deploys are one command:
 
@@ -188,7 +190,9 @@ aws codebuild start-build --project-name MSAI-DeployPipeline-build \
     name=MSAI_PARAM_OVERRIDES,value='{"SummaryFieldName":"ai_summary"}',type=PLAINTEXT
 ```
 
-> **Note**: The CodeBuild role uses `AdministratorAccess` because CDK deploys resources across many services. Scope it down for production accounts.
+Never pass API keys in `--environment-variables-override` as `PLAINTEXT`: override values are stored on the build record. To change a key, update the `MimirApiKey`/`SagaApiKey` stack parameters (which updates the pipeline secrets) and update the same values in the SSM config parameter, which is authoritative after the first build. Then start a new build.
+
+> **Note**: The CodeBuild role uses `AdministratorAccess` because CDK deploys resources across many services. Scope it down for production accounts. The role also has an explicit `secretsmanager:GetSecretValue` grant on just the two API key secrets, so CodeBuild can still resolve them after you scope it down.
 
 ## Local Deployment (for developers)
 
