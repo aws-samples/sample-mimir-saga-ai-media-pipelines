@@ -204,7 +204,7 @@ aws codebuild start-build --project-name MSAI-DeployPipeline-build \
      { "ParameterKey": "MimirInstance", "ParameterValue": "us" }
    ]
    ```
-   Optional parameters: `SummaryFieldName`, `MimirAllowedIssuer`, `EnableTranscribeFallback` — see `parameters.example.json` for descriptions.
+   Optional parameters: `SummaryFieldName`, `MimirAllowedIssuer`, `EnableTranscribeFallback`, `EnableEmbeddingsWebhook`, `EmbeddingsFilterField`, `EmbeddingsFilterValues` — see `parameters.example.json` for descriptions and [Embeddings Filter](#embeddings-filter-optional).
 3. Install dependencies:
    ```bash
    npm install
@@ -237,9 +237,34 @@ The following are automatically registered in Mimir on every deploy via a CDK cu
 - **Reframe 9:16** custom action → `POST /actions/reframe-9-16`
 - **Reframe 1:1** custom action → `POST /actions/reframe-1-1`
 - **Reframe 4:5** custom action → `POST /actions/reframe-4-5`
-- **Embed Video Content** webhook → `POST /webhook/item-embed` (triggers on video item creation)
+- **Embed Video Content** webhook → `POST /webhook/item-embed` (triggers on video item creation; optionally filtered, see [Embeddings Filter](#embeddings-filter-optional))
 
 These are idempotent — safe to run on every deploy. If someone deletes them in the Mimir UI, the next deploy recreates them.
+
+### Embeddings Filter (Optional)
+
+By default every new video item in Mimir is embedded. Set `EnableEmbeddingsWebhook` to `false` to turn automatic embedding off entirely (the deploy then removes the webhook from Mimir). To embed only items whose metadata matches a value (for example, one station), set both parameters:
+
+| Parameter | Value | Notes |
+|---|---|---|
+| `EmbeddingsFilterField` | Mimir metadata field id, e.g. `station` | The key as it appears in the item's `metadata.formData`, not the label shown in the UI. Run `node scripts/get-mimir-metadata-fields.js` to list the default form's field ids, or `node scripts/get-mimir-item-details.js <itemId>` on an item that has the value set. |
+| `EmbeddingsFilterValues` | One value or a comma-separated list, e.g. `WXYZ` or `WXYZ,KABC` | Exact, case-sensitive match on the stored value (for choice fields, the option value, not its label). |
+
+Example, only one station:
+
+```json
+{ "ParameterKey": "EmbeddingsFilterField",  "ParameterValue": "station" },
+{ "ParameterKey": "EmbeddingsFilterValues", "ParameterValue": "WXYZ" }
+```
+
+With the CodeBuild deployment, pass them once with `MSAI_PARAM_OVERRIDES='{"EmbeddingsFilterField":"station","EmbeddingsFilterValues":"WXYZ"}'`; they are then kept in the SSM config.
+
+How it works:
+
+- **In Mimir.** Instead of the single `Embed Video Content` webhook, the deploy registers one webhook per value, labelled `Embed Video Content [<field>=<value>]`, with the condition *item type equals video AND metadata field `<field>` equals `<value>`*. Mimir webhook conditions match one value per condition and combine conditions with AND only, hence one webhook per value. The previous unfiltered webhook is removed on the same deploy; clearing both parameters restores it.
+- **In the pipeline.** The EmbedVideoContent state machine re-checks the item's current metadata before staging the video (`CheckEmbeddingsFilter`). Items that do not match end as `Succeeded` at `EmbeddingSkippedFilterMismatch`. For multi-value fields (multi-select, tree choice) an item matches when any of its values is in the list.
+- Setting only one of the two parameters fails `cdk synth` with an error.
+- The webhook fires on item creation, so the filter field must already be set when Mimir creates the item (for example by the upload form or the ingest that creates it). Items whose field is filled in later raise an item-change event instead and are not embedded. Items embedded on demand by the Rough Cut pipeline are not filtered.
 
 ### Saga Custom Actions (Manual One-Time Setup)
 

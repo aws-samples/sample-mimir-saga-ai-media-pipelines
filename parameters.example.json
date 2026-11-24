@@ -33,5 +33,20 @@
     "ParameterKey": "EnableTranscribeFallback",
     "ParameterValue": "true",
     "Description": "When 'true', the Summarize action runs AWS Transcribe on items that have no Mimir transcript, publishes the transcript back to Mimir, and includes it in the summary. Set to 'false' to keep summaries visual-only and avoid Transcribe costs."
+  },
+  {
+    "ParameterKey": "EnableEmbeddingsWebhook",
+    "ParameterValue": "true",
+    "Description": "When 'true', the deploy registers the Mimir 'Embed Video Content' webhook so new video items are embedded automatically. Set to 'false' to register no embeddings webhook (an existing one is removed on deploy)."
+  },
+  {
+    "ParameterKey": "EmbeddingsFilterField",
+    "ParameterValue": "",
+    "Description": "Optional. Mimir metadata field id (a key of the item's metadata.formData, e.g. a station field) that decides which video items get embeddings. Leave blank, together with EmbeddingsFilterValues, to embed every video item. Set both or neither."
+  },
+  {
+    "ParameterKey": "EmbeddingsFilterValues",
+    "ParameterValue": "",
+    "Description": "Optional. Comma-separated values of EmbeddingsFilterField to embed, e.g. 'WXYZ' or 'WXYZ,KABC'. Exact, case-sensitive match on the stored field value (not the display label). One Mimir webhook is registered per value."
   }
 ]

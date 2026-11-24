@@ -43,6 +43,24 @@ export class InfrastructureStack extends cdk.Stack {
     // the summary. Set to 'false' to keep summaries visual-only (avoids
     // Transcribe cost). Default: true.
     const enableTranscribeFallback = String(this.node.tryGetContext('enableTranscribeFallback') ?? 'true') !== 'false';
+    // Optional: only embed items whose Mimir metadata field `embeddingsFilterField`
+    // equals one of `embeddingsFilterValues` (comma-separated, exact,
+    // case-sensitive). Both unset = embed every video item.
+    const embeddingsFilterField = String(this.node.tryGetContext('embeddingsFilterField') ?? '').trim();
+    const embeddingsFilterValues = [...new Set(String(this.node.tryGetContext('embeddingsFilterValues') ?? '')
+      .split(',').map((v) => v.trim()).filter((v) => v !== ''))];
+    if (embeddingsFilterField && embeddingsFilterValues.length === 0) {
+      throw new Error('EmbeddingsFilterField is set but EmbeddingsFilterValues is empty. Set both (values comma-separated) or clear both to embed every video item.');
+    }
+    if (!embeddingsFilterField && embeddingsFilterValues.length > 0) {
+      throw new Error('EmbeddingsFilterValues is set but EmbeddingsFilterField is empty. Set both or clear both to embed every video item.');
+    }
+    const embeddingsFilter = embeddingsFilterField
+      ? { field: embeddingsFilterField, values: embeddingsFilterValues }
+      : undefined;
+    // 'false' = register no embed webhook in Mimir (removes an existing one).
+    // The embedding state machine stays deployed for scripts and Rough Cut.
+    const enableEmbeddingsWebhook = String(this.node.tryGetContext('enableEmbeddingsWebhook') ?? 'true') !== 'false';
 
     // S3 bucket for processed video outputs
     const outputBucket = new s3.Bucket(this, 'ReframedVideoBucket', {
@@ -1026,6 +1044,11 @@ export class InfrastructureStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(30),
       environment: {
         VIDEO_STAGING_BUCKET: videoStagingBucket.bucketName,
+        // Read by the 'filter' action (defensive check in the embedding state machine)
+        ...(embeddingsFilter ? {
+          EMBEDDINGS_FILTER_FIELD: embeddingsFilter.field,
+          EMBEDDINGS_FILTER_VALUES: JSON.stringify(embeddingsFilter.values),
+        } : {}),
       },
     });
 
@@ -2169,8 +2192,41 @@ export class InfrastructureStack extends cdk.Stack {
       comment: 'Item is not a video — skipping embedding',
     });
 
+    // Optional metadata filter (EmbeddingsFilterField/Values). The Mimir webhook
+    // already carries the filter; this is the defensive second check for
+    // executions started any other way. Non-matching items end as Succeeded.
+    let afterItemTypeCheck: stepfunctions.IChainable = checkItemReadyInitial;
+    if (embeddingsFilter) {
+      const checkEmbeddingsFilter = new stepfunctionsTasks.LambdaInvoke(this, 'CheckEmbeddingsFilter', {
+        lambdaFunction: embeddingTriggerHandler,
+        payload: stepfunctions.TaskInput.fromObject({
+          'action': 'filter',
+          'itemId.$': '$.id',
+          'metadata.$': '$.metadata',
+          'mimirDetails.$': '$.mimirDetails',
+        }),
+        resultSelector: { 'match.$': '$.Payload.match' },
+        resultPath: '$.filterResult',
+      });
+      checkEmbeddingsFilter.addRetry({
+        errors: ['Lambda.ServiceException', 'Lambda.AWSLambdaException'],
+        interval: cdk.Duration.seconds(2),
+        maxAttempts: 3,
+        backoffRate: 2,
+      });
+      checkEmbeddingsFilter.addCatch(embeddingFailed, { resultPath: '$.error' });
+      const embeddingFilteredOut = new stepfunctions.Succeed(this, 'EmbeddingSkippedFilterMismatch', {
+        comment: 'Item does not match EmbeddingsFilterField/EmbeddingsFilterValues — skipping embedding',
+      });
+      afterItemTypeCheck = checkEmbeddingsFilter.next(
+        new stepfunctions.Choice(this, 'EmbeddingsFilterChoice')
+          .when(stepfunctions.Condition.booleanEquals('$.filterResult.match', true), checkItemReadyInitial)
+          .otherwise(embeddingFilteredOut),
+      );
+    }
+
     const checkItemTypeForEmbedding = new stepfunctions.Choice(this, 'CheckItemTypeForEmbedding')
-      .when(stepfunctions.Condition.stringEquals('$.itemType', 'video'), checkItemReadyInitial)
+      .when(stepfunctions.Condition.stringEquals('$.itemType', 'video'), afterItemTypeCheck)
       .otherwise(embeddingSkipped);
 
     const embeddingDefinition = getMimirDetailsEmbed
@@ -3629,6 +3685,9 @@ export class InfrastructureStack extends cdk.Stack {
         MimirBaseUrl: mimirBaseUrl,
         ActionsApiUrl: api.url + 'actions/',
         WebhookApiUrl: webhookApi.url,
+        // '' = one unfiltered embed webhook; else one filtered webhook per value
+        EmbeddingsFilter: embeddingsFilter ? JSON.stringify(embeddingsFilter) : '',
+        EmbeddingsWebhookEnabled: String(enableEmbeddingsWebhook),
         // Force update on every deploy to keep URLs in sync
         DeployTimestamp: Date.now().toString(),
       },
