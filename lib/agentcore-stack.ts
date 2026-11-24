@@ -62,7 +62,7 @@ export class AgentCoreStack extends cdk.Stack {
             TRANSCRIPT_STAGING_BUCKET: videoStagingBucketName,
             STABILITY_BUCKET: mediaAnalysisBucketName,
             POLLY_VOICE_ID: 'Matthew',
-            AGENT_MODEL_ID: 'us.anthropic.claude-sonnet-4-20250514-v1:0',
+            AGENT_MODEL_ID: 'us.anthropic.claude-sonnet-4-6',
           },
         },
         {
