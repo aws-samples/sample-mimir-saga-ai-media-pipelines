@@ -224,7 +224,7 @@ Deploys all 5 stacks in dependency order: Observability → Infrastructure → A
 
 The rough-cut-agent model is configured via environment variables in `lib/agentcore-stack.ts`:
 
-- `AGENT_MODEL_ID` — Model for source material and timeline assembly (default: Claude Sonnet 4)
+- `AGENT_MODEL_ID` — Model for source material and timeline assembly (default: Claude Sonnet 4.6, `us.anthropic.claude-sonnet-4-6`). If it is not accessible, the agent falls back to Amazon Nova Pro (`us.amazon.nova-pro-v1:0`)
 - `SCRIPT_ANALYSIS_MODEL_ID` — Model for script analysis (falls back to `AGENT_MODEL_ID`)
 - `POLLY_VOICE_ID` — Amazon Polly voice for VO synthesis (default: `Matthew`)
 

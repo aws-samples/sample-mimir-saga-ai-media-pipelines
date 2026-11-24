@@ -336,7 +336,7 @@ def _validate_source_material(data: dict) -> None:
 # Configurable Bedrock Model Helper
 # ---------------------------------------------------------------------------
 
-_DEFAULT_MODEL_ID = "us.amazon.nova-premier-v1:0"
+_DEFAULT_MODEL_ID = "us.amazon.nova-pro-v1:0"
 _DEFAULT_MAX_TOKENS = 10000
 _CLAUDE_MAX_TOKENS = 16000
 
@@ -352,7 +352,7 @@ def _get_bedrock_model(env_key: str = "AGENT_MODEL_ID") -> BedrockModel:
     Logic:
     1. Read the model ID from ``os.environ[env_key]``, falling back to
        ``AGENT_MODEL_ID`` if empty.
-    2. If empty or not set → return BedrockModel with the default Nova Premier.
+    2. If empty or not set → return BedrockModel with the default Nova Pro.
     3. If set and contains "claude" (case-insensitive) → set max_tokens to 16000.
     4. Attempt a lightweight Bedrock validation call to verify the model is
        accessible.
