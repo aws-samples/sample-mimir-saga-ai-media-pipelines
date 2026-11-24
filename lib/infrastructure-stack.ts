@@ -1113,7 +1113,9 @@ export class InfrastructureStack extends cdk.Stack {
           "Resource": "arn:aws:states:::lambda:invoke",
           "Arguments": {
             "FunctionName": storyContextHandler.functionArn,
-            "Payload": "{% $states.input %}"
+            // The Mimir key ARN goes in the task input (not the execution
+            // input), so the handler does not depend on its env var alone.
+            "Payload": `{% $merge([$states.input, {'mimirApiKeySecretArn': '${mimirApiKeySecret.secretArn}'}]) %}`
           },
           "Retry": [
             {
@@ -1847,7 +1849,7 @@ export class InfrastructureStack extends cdk.Stack {
           Resource: 'arn:aws:states:::lambda:invoke',
           Arguments: {
             'FunctionName': storyContextHandler.functionArn,
-            'Payload': '{% $states.input %}',
+            'Payload': `{% $merge([$states.input, {'mimirApiKeySecretArn': '${mimirApiKeySecret.secretArn}'}]) %}`,
           },
           Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.AWSLambdaException'], IntervalSeconds: 2, MaxAttempts: 3, BackoffRate: 2 }],
           Assign: {
