@@ -13,6 +13,7 @@ import * as logs from 'aws-cdk-lib/aws-logs';
 import * as s3vectors from 'aws-cdk-lib/aws-s3vectors';
 import { Construct } from 'constructs';
 import * as path from 'path';
+import { valueLessSecret } from './constructs/value-less-secret';
 
 export interface InfrastructureStackProps extends cdk.StackProps {
   // Product display name, e.g. "Mimir Saga AI"
@@ -28,10 +29,9 @@ export class InfrastructureStack extends cdk.Stack {
     // Resource naming prefix derived from the product acronym (e.g. "msai")
     const resourcePrefix = props.acronym.toLowerCase();
 
-    // Read configuration from CDK context (populated from parameters.json in bin/)
-    const mimirApiKey = this.node.tryGetContext('mimirApiKey') || 'placeholder-update-after-deployment';
-    const sagaApiKey = this.node.tryGetContext('sagaApiKey') || 'placeholder-update-after-deployment';
-    const sagaApiUrl = this.node.tryGetContext('sagaApiUrl') || 'https://us.mjoll.no';
+    // Read configuration from CDK context (populated from parameters.json in bin/).
+    // MimirApiKey, SagaApiKey and SagaApiUrl are deliberately not read here:
+    // they go straight from parameters.json into Secrets Manager.
     const mimirInstance = this.node.tryGetContext('mimirInstance') || 'us';
     const summaryFieldName = this.node.tryGetContext('summaryFieldName') || 'description';
     // Optional: pin the Cognito issuer allowed to invoke custom actions.
@@ -77,22 +77,12 @@ export class InfrastructureStack extends cdk.Stack {
     });
 
 
-    // Create Mimir API key secret (for us to call Mimir)
-    const mimirApiKeySecret = new secretsmanager.Secret(this, 'MimirApiKey', {
-      description: 'API key for calling Mimir API',
-      secretStringValue: cdk.SecretValue.unsafePlainText(mimirApiKey),
-    });
-
-    // Create Saga API secrets
-    const sagaApiKeySecret = new secretsmanager.Secret(this, 'SagaApiKey', {
-      description: 'API key for calling Saga API',
-      secretStringValue: cdk.SecretValue.unsafePlainText(sagaApiKey),
-    });
-
-    const sagaApiUrlSecret = new secretsmanager.Secret(this, 'SagaApiUrl', {
-      description: 'Base URL for Saga API',
-      secretStringValue: cdk.SecretValue.unsafePlainText(sagaApiUrl),
-    });
+    // Mimir and Saga API secrets. Their values are NOT in this template:
+    // deploy.sh writes them from parameters.json after deploying this stack
+    // (scripts/sync-api-key-secrets.js). See lib/constructs/value-less-secret.ts.
+    const mimirApiKeySecret = valueLessSecret(this, 'MimirApiKey', 'API key for calling Mimir API');
+    const sagaApiKeySecret = valueLessSecret(this, 'SagaApiKey', 'API key for calling Saga API');
+    const sagaApiUrlSecret = valueLessSecret(this, 'SagaApiUrl', 'Base URL for Saga API');
 
     // Auto-generated key that Saga sends as the `x-api-key` header when triggering
     // story actions. After deploy, retrieve this value from Secrets Manager and set
@@ -3772,6 +3762,17 @@ export class InfrastructureStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'MimirApiKeyArn', {
       value: mimirApiKeySecret.secretArn,
       description: 'ARN of the Mimir API key (for us to authenticate with Mimir)',
+    });
+
+    // scripts/sync-api-key-secrets.js finds the secrets to fill through these outputs.
+    new cdk.CfnOutput(this, 'SagaApiKeyArn', {
+      value: sagaApiKeySecret.secretArn,
+      description: 'ARN of the Saga API key secret',
+    });
+
+    new cdk.CfnOutput(this, 'SagaApiUrlArn', {
+      value: sagaApiUrlSecret.secretArn,
+      description: 'ARN of the Saga API URL secret',
     });
 
     // Export Mimir API key secret ARN to Parameter Store for cross-stack reference
