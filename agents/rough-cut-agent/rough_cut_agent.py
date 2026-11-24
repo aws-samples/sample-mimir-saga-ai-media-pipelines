@@ -300,8 +300,9 @@ def _validate_source_material(data: dict) -> None:
                         f"{_VALID_AUDIO_TYPES}, got: {candidate['audioType']!r}"
                     )
 
+            # Only pkg_sot sections set it; models may send null instead of omitting it.
             if "matchConfidence" in candidate:
-                if candidate["matchConfidence"] not in _VALID_MATCH_CONFIDENCES:
+                if candidate["matchConfidence"] is not None and candidate["matchConfidence"] not in _VALID_MATCH_CONFIDENCES:
                     raise ValueError(
                         f"{cpath}.matchConfidence must be one of "
                         f"{_VALID_MATCH_CONFIDENCES}, got: {candidate['matchConfidence']!r}"

@@ -193,6 +193,18 @@ class TestValidateSourceMaterial:
         del data["candidateSegments"][0]["candidates"][0]["relevanceScore"]
         _validate_source_material(data)  # should not raise
 
+    def test_candidate_null_matchConfidence_does_not_raise(self):
+        # Claude Sonnet 4.6 sends null for non-SOT sections instead of omitting it
+        data = _valid_source_material()
+        data["candidateSegments"][0]["candidates"][0]["matchConfidence"] = None
+        _validate_source_material(data)  # should not raise
+
+    def test_candidate_invalid_matchConfidence_raises(self):
+        data = _valid_source_material()
+        data["candidateSegments"][0]["candidates"][0]["matchConfidence"] = "maybe"
+        with pytest.raises(ValueError, match="matchConfidence must be one of"):
+            _validate_source_material(data)
+
     # --- gap-level validation — lenient (defaults missing fields) ---
 
     def test_gap_missing_scriptSection_defaults(self):
