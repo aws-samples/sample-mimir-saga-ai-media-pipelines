@@ -1103,6 +1103,26 @@ export class InfrastructureStack extends cdk.Stack {
     // Uses lambda:invoke.waitForTaskToken to invoke AgentCore via a Lambda.
     // The agent calls SendTaskSuccess/SendTaskFailure when done.
     // Defined after videoToS3Handler and transcribeHandler so all Lambda ARNs are available.
+    //
+    // One asset's error (no proxy URL, a Lambda capacity error) must not fail
+    // the whole Map: a failed Map skips transcripts, classification and
+    // embeddings for EVERY asset. Each per-asset task catches into a skip state.
+    // setsItemId: the first task in an iteration, before $mimirItemId is assigned.
+    const skipAssetCatch = (next: string, setsItemId = false) => [{
+      "ErrorEquals": ["States.ALL"],
+      "Next": next,
+      "Assign": {
+        "assetError": "{% $states.errorOutput.Error & ($states.errorOutput.Cause ? ': ' & $substring($states.errorOutput.Cause, 0, 300) : '') %}",
+        ...(setsItemId ? { "mimirItemId": "{% $states.input.mimirItemId %}" } : {}),
+      },
+    }];
+    const failureCatch = (state: string) => ({
+      "ErrorEquals": ["States.ALL"],
+      "Next": "HandleFailure",
+      "Assign": {
+        "errorMessage": `{% '${state}: ' & $states.errorOutput.Error & ($states.errorOutput.Cause ? ': ' & $substring($states.errorOutput.Cause, 0, 1000) : '') %}`,
+      },
+    });
     const roughCutDefinition = {
       "Comment": "Rough Cut Timeline generation pipeline",
       "QueryLanguage": "JSONata",
@@ -1132,12 +1152,7 @@ export class InfrastructureStack extends cdk.Stack {
             "triggeredByUserId": "{% $states.input.triggeredByUserId %}",
             "roughCutType": "{% $states.input.roughCutType ? $states.input.roughCutType : 'ai-vo' %}"
           },
-          "Catch": [
-            {
-              "ErrorEquals": ["States.ALL"],
-              "Next": "HandleFailure"
-            }
-          ],
+          "Catch": [failureCatch('GatherStoryContext')],
           "Next": "NeedTranscription"
         },
         "NeedTranscription": {
@@ -1152,7 +1167,7 @@ export class InfrastructureStack extends cdk.Stack {
         },
         "TranscribeAssets": {
           "Type": "Map",
-          "Items": "{% $storyContext.assets[itemType = 'video'] %}",
+          "Items": "{% [$storyContext.assets[itemType = 'video']] %}",
           "MaxConcurrency": 5,
           "ItemSelector": {
             "mimirItemId": "{% $states.context.Map.Item.Value.mimirItemId %}",
@@ -1182,6 +1197,7 @@ export class InfrastructureStack extends cdk.Stack {
                     "BackoffRate": 2
                   }
                 ],
+                "Catch": skipAssetCatch('SkipFailedAsset', true),
                 "Assign": {
                   "mimirItemId": "{% $states.input.mimirItemId %}",
                   "hasMimirTranscript": "{% $states.input.hasMimirTranscript %}",
@@ -1229,6 +1245,7 @@ export class InfrastructureStack extends cdk.Stack {
                     "BackoffRate": 2
                   }
                 ],
+                "Catch": skipAssetCatch('SkipFailedAsset'),
                 "Assign": {
                   "importedTranscript": "{% $states.result.Payload.imported %}",
                   "transcriptS3Uri": "{% $states.result.Payload.transcriptS3Uri ? $states.result.Payload.transcriptS3Uri : '' %}"
@@ -1263,6 +1280,7 @@ export class InfrastructureStack extends cdk.Stack {
                     "BackoffRate": 2
                   }
                 ],
+                "Catch": skipAssetCatch('SkipFailedAsset'),
                 "Assign": {
                   "videoExists": "{% $states.result.Payload.exists %}",
                   "s3Uri": "{% $states.result.Payload.exists ? $states.result.Payload.s3Uri : '' %}"
@@ -1297,6 +1315,7 @@ export class InfrastructureStack extends cdk.Stack {
                     "BackoffRate": 2
                   }
                 ],
+                "Catch": skipAssetCatch('SkipFailedAsset'),
                 "Assign": {
                   "proxyUrl": "{% $states.result.Payload.proxyUrl %}"
                 },
@@ -1320,6 +1339,7 @@ export class InfrastructureStack extends cdk.Stack {
                     "BackoffRate": 2
                   }
                 ],
+                "Catch": skipAssetCatch('SkipFailedAsset'),
                 "Assign": {
                   "s3Uri": "{% $states.result.Payload.s3Uri %}"
                 },
@@ -1344,6 +1364,7 @@ export class InfrastructureStack extends cdk.Stack {
                     "BackoffRate": 2
                   }
                 ],
+                "Catch": skipAssetCatch('SkipFailedAsset'),
                 "Assign": {
                   "jobName": "{% $states.result.Payload.jobName %}"
                 },
@@ -1373,6 +1394,7 @@ export class InfrastructureStack extends cdk.Stack {
                     "BackoffRate": 2
                   }
                 ],
+                "Catch": skipAssetCatch('SkipFailedAsset'),
                 "Assign": {
                   "transcribeStatus": "{% $states.result.Payload.status %}",
                   "transcriptS3Uri": "{% $states.result.Payload.transcriptS3Uri ? $states.result.Payload.transcriptS3Uri : '' %}",
@@ -1408,7 +1430,7 @@ export class InfrastructureStack extends cdk.Stack {
                 "Output": {
                   "mimirItemId": "{% $mimirItemId %}",
                   "status": "failed",
-                  "error": "{% $transcribeError %}"
+                  "error": "{% $assetError ? $assetError : $transcribeError %}"
                 },
                 "End": true
               }
@@ -1420,7 +1442,7 @@ export class InfrastructureStack extends cdk.Stack {
           "Catch": [
             {
               "ErrorEquals": ["States.ALL"],
-              "Next": "InvokeRoughCutAgent"
+              "Next": "ClassifyAssets"
             }
           ],
           "Next": "MergeTranscriptResults"
@@ -1431,7 +1453,7 @@ export class InfrastructureStack extends cdk.Stack {
         },
         "ClassifyAssets": {
           "Type": "Map",
-          "Items": "{% $storyContext.assets[itemType = 'video'] %}",
+          "Items": "{% [$storyContext.assets[itemType = 'video']] %}",
           "MaxConcurrency": 5,
           "ItemSelector": {
             "mimirItemId": "{% $states.context.Map.Item.Value.mimirItemId %}"
@@ -1459,7 +1481,17 @@ export class InfrastructureStack extends cdk.Stack {
                     "BackoffRate": 2
                   }
                 ],
+                "Catch": skipAssetCatch('ClassifySkipped', true),
                 "Output": "{% $states.result.Payload %}",
+                "End": true
+              },
+              "ClassifySkipped": {
+                "Type": "Pass",
+                "Output": {
+                  "mimirItemId": "{% $mimirItemId %}",
+                  "status": "failed",
+                  "error": "{% $assetError %}"
+                },
                 "End": true
               }
             }
@@ -1467,7 +1499,7 @@ export class InfrastructureStack extends cdk.Stack {
           "Catch": [
             {
               "ErrorEquals": ["States.ALL"],
-              "Next": "InvokeRoughCutAgent"
+              "Next": "NeedEmbeddings"
             }
           ],
           "Next": "NeedEmbeddings"
@@ -1484,7 +1516,7 @@ export class InfrastructureStack extends cdk.Stack {
         },
         "EnsureEmbeddings": {
           "Type": "Map",
-          "Items": "{% $storyContext.assets[hasEmbeddings != true and itemType = 'video'] %}",
+          "Items": "{% [$storyContext.assets[hasEmbeddings != true and itemType = 'video']] %}",
           "MaxConcurrency": 3,
           "ItemSelector": {
             "mimirItemId": "{% $states.context.Map.Item.Value.mimirItemId %}",
@@ -1514,6 +1546,7 @@ export class InfrastructureStack extends cdk.Stack {
                     "BackoffRate": 2
                   }
                 ],
+                "Catch": skipAssetCatch('EmbedFailed', true),
                 "Assign": {
                   "mimirItemId": "{% $states.input.mimirItemId %}",
                   "title": "{% $states.input.title %}",
@@ -1550,6 +1583,7 @@ export class InfrastructureStack extends cdk.Stack {
                     "BackoffRate": 2
                   }
                 ],
+                "Catch": skipAssetCatch('EmbedFailed'),
                 "Assign": {
                   "sourceAccessible": "{% $states.result.Payload.accessible %}"
                 },
@@ -1584,6 +1618,7 @@ export class InfrastructureStack extends cdk.Stack {
                     "BackoffRate": 2
                   }
                 ],
+                "Catch": skipAssetCatch('EmbedFailed'),
                 "Assign": {
                   "videoExists": "{% $states.result.Payload.exists %}",
                   "sourceS3Uri": "{% $states.result.Payload.exists ? $states.result.Payload.s3Uri : $sourceS3Uri %}"
@@ -1618,6 +1653,7 @@ export class InfrastructureStack extends cdk.Stack {
                     "BackoffRate": 2
                   }
                 ],
+                "Catch": skipAssetCatch('EmbedFailed'),
                 "Assign": {
                   "sourceS3Uri": "{% $states.result.Payload.s3Uri %}"
                 },
@@ -1642,6 +1678,7 @@ export class InfrastructureStack extends cdk.Stack {
                     "BackoffRate": 2
                   }
                 ],
+                "Catch": skipAssetCatch('EmbedFailed'),
                 "Assign": {
                   "invocationArn": "{% $states.result.Payload.invocationArn %}"
                 },
@@ -1670,6 +1707,7 @@ export class InfrastructureStack extends cdk.Stack {
                     "BackoffRate": 2
                   }
                 ],
+                "Catch": skipAssetCatch('EmbedFailed'),
                 "Assign": {
                   "embedStatus": "{% $states.result.Payload.status %}",
                   "outputS3Uri": "{% $states.result.Payload.outputS3Uri ? $states.result.Payload.outputS3Uri : '' %}"
@@ -1709,6 +1747,7 @@ export class InfrastructureStack extends cdk.Stack {
                     "BackoffRate": 2
                   }
                 ],
+                "Catch": skipAssetCatch('EmbedFailed'),
                 "Output": {
                   "mimirItemId": "{% $mimirItemId %}",
                   "status": "completed",
@@ -1720,7 +1759,8 @@ export class InfrastructureStack extends cdk.Stack {
                 "Type": "Pass",
                 "Output": {
                   "mimirItemId": "{% $mimirItemId %}",
-                  "status": "failed"
+                  "status": "failed",
+                  "error": "{% $assetError ? $assetError : '' %}"
                 },
                 "End": true
               }
@@ -1752,12 +1792,7 @@ export class InfrastructureStack extends cdk.Stack {
             }
           },
           "TimeoutSeconds": 1800,
-          "Catch": [
-            {
-              "ErrorEquals": ["States.ALL"],
-              "Next": "HandleFailure"
-            }
-          ],
+          "Catch": [failureCatch('InvokeRoughCutAgent')],
           "Next": "HandleSuccess"
         },
         "HandleSuccess": {
@@ -1766,7 +1801,8 @@ export class InfrastructureStack extends cdk.Stack {
         "HandleFailure": {
           "Type": "Fail",
           "Error": "RoughCutPipelineError",
-          "Cause": "Rough cut timeline generation failed"
+          // Carry the failing state and the real error, not a fixed string.
+          "Cause": "{% $errorMessage ? $errorMessage : 'Rough cut timeline generation failed' %}"
         }
       }
     };

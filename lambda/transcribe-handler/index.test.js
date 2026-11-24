@@ -253,6 +253,16 @@ describe('poll-transcribe action', () => {
     assert.deepStrictEqual(result, { status: 'IN_PROGRESS' });
   });
 
+  it('returns IN_PROGRESS when job is queued', async () => {
+    mockTranscribeSendFn = () => ({ TranscriptionJob: { TranscriptionJobStatus: 'QUEUED' } });
+
+    delete require.cache[require.resolve('./index')];
+    const { handler } = require('./index');
+
+    const result = await handler({ action: 'poll-transcribe', itemId: 'item-123', jobName: 'job-1' });
+    assert.deepStrictEqual(result, { status: 'IN_PROGRESS' });
+  });
+
   it('returns FAILED with error reason when job fails', async () => {
     mockTranscribeSendFn = (command) => ({
       TranscriptionJob: {

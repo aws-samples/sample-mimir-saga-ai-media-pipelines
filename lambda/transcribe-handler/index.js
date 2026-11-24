@@ -364,7 +364,8 @@ async function handlePollTranscribe(event) {
 
   const status = jobResponse.TranscriptionJob.TranscriptionJobStatus;
 
-  if (status === 'IN_PROGRESS') {
+  // QUEUED (account job limit reached) is still pending, not an error.
+  if (status === 'IN_PROGRESS' || status === 'QUEUED') {
     return { status: 'IN_PROGRESS' };
   }
 
