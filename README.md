@@ -268,6 +268,14 @@ How it works:
 - Setting only one of `EmbeddingsFilterField` / `EmbeddingsFilterValues` fails `cdk synth` with an error.
 - The webhook fires on item creation, so the filter field must already be set when Mimir creates the item (for example by the upload form or the ingest that creates it). Items whose field is filled in later raise an item-change event instead and are not embedded. Items embedded on demand by the Rough Cut pipeline are not filtered.
 
+### Webhook Authentication
+
+The Mimir Webhooks API (`/webhook/item-embed`, `/webhook/item-change`, `/webhook/item-create`) only accepts requests that carry the `x-mimir-webhook-token` header. A Lambda authorizer compares it, in constant time, with the `MimirWebhookToken` secret that CDK generates in Secrets Manager (ARN in SSM `/infrastructure/webhook-token-secret-arn`). A request with no header gets `401`, a wrong value gets `403`, and in both cases no Lambda or Step Functions execution starts. The stage is also throttled (50 requests/second, burst 100).
+
+You do not need to configure anything in Mimir: on every deploy, the registration custom resource adds the header to each Mimir webhook whose URL points at this API, including webhooks you created yourself with `scripts/create-mimir-webhook.sh` or in the Mimir UI. CloudFormation runs that step before it deploys the API stage that enforces the header, so existing webhooks keep working through the upgrade. If you create a webhook by hand between deploys, add the header with the secret value in Mimir's **Custom headers** (header field `x-mimir-webhook-token`), or redeploy.
+
+To rotate the token, put a new value in the `MimirWebhookToken` secret and redeploy. Until the redeploy updates Mimir, webhooks are rejected (the authorizer re-reads the secret within 5 minutes).
+
 ### Saga Custom Actions (Manual One-Time Setup)
 
 The Saga custom actions (**Generate Rough Cut** and **Research Story**) must be configured manually via the Saga web UI:
@@ -392,6 +400,12 @@ S3 buckets created by this sample use `autoDeleteObjects`, so their contents are
 See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
 
 This sample is intended for evaluation in non-production environments. Review IAM policies, S3 bucket policies, and API authentication settings before adapting it for production use. API keys for Mimir and Saga are stored in AWS Secrets Manager; the `parameters.json` file containing your keys is gitignored and must never be committed.
+
+API authentication in this sample:
+
+- **Mimir Webhooks API**: every route requires the `x-mimir-webhook-token` header, checked by a Lambda authorizer before any integration runs (see [Webhook authentication](#webhook-authentication)).
+- **Mimir custom actions** (`/actions/*` handled by `mimir-handler`): each request must carry a valid Mimir-issued Cognito ID token (`includeJWT`). Set `MimirAllowedIssuer` to your Mimir tenant's issuer; if it is blank, a valid ID token from any Amazon Cognito user pool is accepted.
+- **Saga custom actions** (`/actions/generate-*`, `/actions/story-research`): the shared `SagaActionsApiKey` is checked in `saga-action-handler`.
 
 ## License
 
