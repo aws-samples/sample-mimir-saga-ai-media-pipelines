@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import boto3
+import botocore.exceptions
 
 # Configure logging so the agent's own INFO logs reach stdout (and therefore the
 # AgentCore CloudWatch runtime logs). Without an explicit handler, the root
@@ -30,6 +31,11 @@ app = BedrockAgentCoreApp()
 stepfunctions = boto3.client('stepfunctions')
 
 
+# Task tokens that already got a SendTaskSuccess/SendTaskFailure, so invoke()'s
+# outer handler only reports errors that no stage reported.
+_callback_sent: set = set()
+
+
 def send_task_success(task_token: str, timeline_item_id: str, summary: dict):
     """Send success callback to Step Functions with timeline results."""
     try:
@@ -41,6 +47,7 @@ def send_task_success(task_token: str, timeline_item_id: str, summary: dict):
             taskToken=task_token,
             output=json.dumps(output),
         )
+        _callback_sent.add(task_token)
         logger.info(f"SendTaskSuccess sent for timeline item {timeline_item_id}")
     except Exception as e:
         logger.error(f"Failed to send task success: {e}")
@@ -55,6 +62,7 @@ def send_task_failure(task_token: str, error: str, cause: str):
             error=error,
             cause=cause,
         )
+        _callback_sent.add(task_token)
         logger.info(f"SendTaskFailure sent: {error}")
     except Exception as e:
         logger.error(f"Failed to send task failure: {e}")
@@ -400,6 +408,16 @@ def _validate_source_material(data: dict) -> None:
 # Configurable Bedrock Model Helper
 # ---------------------------------------------------------------------------
 
+_TRANSIENT_BEDROCK_CODES = {
+    "ThrottlingException", "TooManyRequestsException", "ServiceUnavailableException",
+    "InternalServerException", "ModelNotReadyException", "ModelTimeoutException",
+}
+_TRANSIENT_BEDROCK_ERRORS = (
+    botocore.exceptions.ReadTimeoutError,
+    botocore.exceptions.ConnectTimeoutError,
+    botocore.exceptions.EndpointConnectionError,
+)
+
 _DEFAULT_MODEL_ID = "us.amazon.nova-pro-v1:0"
 _DEFAULT_MAX_TOKENS = 10000
 _CLAUDE_MAX_TOKENS = 16000
@@ -453,12 +471,22 @@ def _get_bedrock_model(env_key: str = "AGENT_MODEL_ID") -> BedrockModel:
         )
         logger.info(f"Model {model_id} validated successfully")
     except Exception as e:
-        logger.warning(
-            f"Model {model_id} is not accessible ({e}), "
-            f"falling back to default: {_DEFAULT_MODEL_ID}"
-        )
-        model_id = _DEFAULT_MODEL_ID
-        max_tokens = _DEFAULT_MAX_TOKENS
+        code = ((getattr(e, "response", None) or {}).get("Error") or {}).get("Code", "")
+        if code in _TRANSIENT_BEDROCK_CODES or isinstance(e, _TRANSIENT_BEDROCK_ERRORS):
+            # A busy model is still the right model: keep it. Strands retries
+            # throttling on the real calls; falling back here would silently
+            # switch the whole stage to another model for one 1-token probe.
+            logger.warning(
+                f"Model {model_id} check hit a transient error ({code or type(e).__name__}); "
+                f"keeping {model_id}"
+            )
+        else:
+            logger.error(
+                f"Model {model_id} is not accessible ({e}), "
+                f"falling back to default: {_DEFAULT_MODEL_ID}"
+            )
+            model_id = _DEFAULT_MODEL_ID
+            max_tokens = _DEFAULT_MAX_TOKENS
 
     return BedrockModel(
         model_id=model_id,
@@ -3334,8 +3362,17 @@ def invoke(payload):
     except Exception as e:
         logger.error(f"Error in Rough Cut Agent: {e}")
         # Stages 1/2 send their own SendTaskFailure before re-raising, and
-        # Stage 3 handles callbacks internally. This outer handler returns
-        # an error dict so the entrypoint always produces a response.
+        # Stage 3 handles callbacks internally. An error anywhere else (story
+        # parsing, Stage 0, the model check before Stage 3's try) sent nothing,
+        # so the execution waited out InvokeRoughCutAgent's 30-minute timeout.
+        if task_token and task_token not in _callback_sent:
+            send_task_failure(
+                task_token=task_token,
+                error="RoughCutAgentError",
+                cause=f"{type(e).__name__}: {e}"[:4000],
+            )
+        # This outer handler returns an error dict so the entrypoint always
+        # produces a response.
         return {
             "error": str(e),
             "status": "error",
