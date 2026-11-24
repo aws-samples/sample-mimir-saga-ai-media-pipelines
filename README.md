@@ -204,7 +204,7 @@ aws codebuild start-build --project-name MSAI-DeployPipeline-build \
      { "ParameterKey": "MimirInstance", "ParameterValue": "us" }
    ]
    ```
-   Optional parameters: `SummaryFieldName`, `MimirAllowedIssuer`, `EnableTranscribeFallback`, `EnableEmbeddingsWebhook`, `EmbeddingsFilterField`, `EmbeddingsFilterValues` — see `parameters.example.json` for descriptions and [Embeddings Filter](#embeddings-filter-optional).
+   Optional parameters: `SummaryFieldName`, `MimirAllowedIssuer`, `EnableTranscribeFallback`, `EnableEmbeddingsWebhook`, `EmbeddingsFilterField`, `EmbeddingsFilterValues`, `EmbeddingsFilterFieldKey` — see `parameters.example.json` for descriptions and [Embeddings Filter](#embeddings-filter-optional).
 3. Install dependencies:
    ```bash
    npm install
@@ -247,23 +247,25 @@ By default every new video item in Mimir is embedded. Set `EnableEmbeddingsWebho
 
 | Parameter | Value | Notes |
 |---|---|---|
-| `EmbeddingsFilterField` | Mimir metadata field id, e.g. `station` | The key as it appears in the item's `metadata.formData`, not the label shown in the UI. Run `node scripts/get-mimir-metadata-fields.js` to list the default form's field ids, or `node scripts/get-mimir-item-details.js <itemId>` on an item that has the value set. |
-| `EmbeddingsFilterValues` | One value or a comma-separated list, e.g. `WXYZ` or `WXYZ,KABC` | Exact, case-sensitive match on the stored value (for choice fields, the option value, not its label). |
+| `EmbeddingsFilterField` | Mimir metadata **fieldId**, e.g. `Station` | The field id from the metadata form definition (`node scripts/get-mimir-metadata-fields.js` lists the default form's fields with their UUIDs), not the label shown in the UI. The Mimir webhook condition uses this id. |
+| `EmbeddingsFilterValues` | One value or a comma-separated list, e.g. `WKEF` or `WKEF,WBFF` | Exact, case-sensitive match on the stored value (for choice fields, the option value, not its label). |
+| `EmbeddingsFilterFieldKey` | Optional, usually blank | The explicit key in the item's `metadata.formData` for the pipeline check, e.g. the field UUID. Leave blank to have the pipeline look it up (see below). |
 
-Example, only one station:
+Example, Sinclair, only WKEF. `Station` is the mandatory call-letters dropdown on the default form; its stored value equals its label:
 
 ```json
-{ "ParameterKey": "EmbeddingsFilterField",  "ParameterValue": "station" },
-{ "ParameterKey": "EmbeddingsFilterValues", "ParameterValue": "WXYZ" }
+{ "ParameterKey": "EmbeddingsFilterField",  "ParameterValue": "Station" },
+{ "ParameterKey": "EmbeddingsFilterValues", "ParameterValue": "WKEF" }
 ```
 
-With the CodeBuild deployment, pass them once with `MSAI_PARAM_OVERRIDES='{"EmbeddingsFilterField":"station","EmbeddingsFilterValues":"WXYZ"}'`; they are then kept in the SSM config.
+With the CodeBuild deployment, pass them once with `MSAI_PARAM_OVERRIDES='{"EmbeddingsFilterField":"Station","EmbeddingsFilterValues":"WKEF"}'`; they are then kept in the SSM config.
 
 How it works:
 
-- **In Mimir.** Instead of the single `Embed Video Content` webhook, the deploy registers one webhook per value, labelled `Embed Video Content [<field>=<value>]`, with the condition *item type equals video AND metadata field `<field>` equals `<value>`*. Mimir webhook conditions match one value per condition and combine conditions with AND only, hence one webhook per value. The previous unfiltered webhook is removed on the same deploy; clearing both parameters restores it.
-- **In the pipeline.** The EmbedVideoContent state machine re-checks the item's current metadata before staging the video (`CheckEmbeddingsFilter`). Items that do not match end as `Succeeded` at `EmbeddingSkippedFilterMismatch`. For multi-value fields (multi-select, tree choice) an item matches when any of its values is in the list.
-- Setting only one of the two parameters fails `cdk synth` with an error.
+- **In Mimir (the primary gate).** Instead of the single `Embed Video Content` webhook, the deploy registers one webhook per value, labelled `Embed Video Content [<field>=<value>]`, with the condition *item type equals video AND metadata field `<field>` equals `<value>`*. Mimir webhook conditions match one value per condition and combine conditions with AND only, hence one webhook per value. The previous unfiltered webhook is removed on the same deploy; clearing both parameters restores it.
+- **In the pipeline (defensive second check).** The EmbedVideoContent state machine re-checks the item's current metadata before staging the video (`CheckEmbeddingsFilter`). Items that do not match end as `Succeeded` at `EmbeddingSkippedFilterMismatch`. Mimir does not key `metadata.formData` by fieldId: default-form text and date fields use `default_<fieldId>`, choice fields use the field's UUID (for `Station`, `formData['<uuid>'] = 'WKEF'`). The check therefore tries `formData[<fieldId>]`, then `formData['default_<fieldId>']`, then `formData[<field UUID>]`, looking the UUID up once per Lambda container in the default metadata form, then in the form list (`GET /api/v1/mdfs/default`, `GET /api/v1/mdfs`). Set `EmbeddingsFilterFieldKey` to skip the lookup (needed for a field on a non-default form). Values can be plain, arrays (multiple choice, tree choice: any element matches) or `{value,label}` objects (the value is compared).
+- **Fail open.** If the pipeline cannot resolve the field (unknown fieldId or the lookup fails), it logs one line `filter field unresolved, letting item through: field=<field> …` and embeds the item, so a configuration mistake never silently stops all embeddings. The Mimir webhook remains the gate.
+- Setting only one of `EmbeddingsFilterField` / `EmbeddingsFilterValues` fails `cdk synth` with an error.
 - The webhook fires on item creation, so the filter field must already be set when Mimir creates the item (for example by the upload form or the ingest that creates it). Items whose field is filled in later raise an item-change event instead and are not embedded. Items embedded on demand by the Rough Cut pipeline are not filtered.
 
 ### Saga Custom Actions (Manual One-Time Setup)

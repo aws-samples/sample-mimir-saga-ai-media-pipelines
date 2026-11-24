@@ -58,6 +58,12 @@ export class InfrastructureStack extends cdk.Stack {
     const embeddingsFilter = embeddingsFilterField
       ? { field: embeddingsFilterField, values: embeddingsFilterValues }
       : undefined;
+    // Optional explicit metadata.formData key for the defensive check (e.g. the
+    // field UUID). Blank = the handler resolves it from the Mimir MDFs. The
+    // webhook condition always uses embeddingsFilterField (the fieldId).
+    const embeddingsFilterFieldKey = embeddingsFilter
+      ? String(this.node.tryGetContext('embeddingsFilterFieldKey') ?? '').trim()
+      : '';
     // 'false' = register no embed webhook in Mimir (removes an existing one).
     // The embedding state machine stays deployed for scripts and Rough Cut.
     const enableEmbeddingsWebhook = String(this.node.tryGetContext('enableEmbeddingsWebhook') ?? 'true') !== 'false';
@@ -1048,9 +1054,17 @@ export class InfrastructureStack extends cdk.Stack {
         ...(embeddingsFilter ? {
           EMBEDDINGS_FILTER_FIELD: embeddingsFilter.field,
           EMBEDDINGS_FILTER_VALUES: JSON.stringify(embeddingsFilter.values),
+          ...(embeddingsFilterFieldKey
+            ? { EMBEDDINGS_FILTER_FIELD_KEY: embeddingsFilterFieldKey }
+            // For the fieldId -> formData key (field UUID) lookup in the MDFs
+            : { MIMIR_API_BASE: `https://${mimirInstance}.mjoll.no`, MIMIR_API_KEY_SECRET_ARN: mimirApiKeySecret.secretArn }),
         } : {}),
       },
     });
+    // Read access only when the handler has to look the field up in Mimir.
+    if (embeddingsFilter && !embeddingsFilterFieldKey) {
+      mimirApiKeySecret.grantRead(embeddingTriggerHandler);
+    }
 
     const embeddingStoreHandler = new lambda.Function(this, 'EmbeddingStoreHandler', {
       functionName: `${resourcePrefix}-embedding-store-handler`,

@@ -42,11 +42,16 @@
   {
     "ParameterKey": "EmbeddingsFilterField",
     "ParameterValue": "",
-    "Description": "Optional. Mimir metadata field id (a key of the item's metadata.formData, e.g. a station field) that decides which video items get embeddings. Leave blank, together with EmbeddingsFilterValues, to embed every video item. Set both or neither."
+    "Description": "Optional. Mimir metadata fieldId (from the metadata form definition, not the UI label), e.g. 'Station' for Sinclair, that decides which video items get embeddings. The Mimir webhook condition uses this id. Leave blank, together with EmbeddingsFilterValues, to embed every video item. Set both or neither."
   },
   {
     "ParameterKey": "EmbeddingsFilterValues",
     "ParameterValue": "",
-    "Description": "Optional. Comma-separated values of EmbeddingsFilterField to embed, e.g. 'WXYZ' or 'WXYZ,KABC'. Exact, case-sensitive match on the stored field value (not the display label). One Mimir webhook is registered per value."
+    "Description": "Optional. Comma-separated values of EmbeddingsFilterField to embed, e.g. 'WKEF' or 'WKEF,WBFF'. Exact, case-sensitive match on the stored field value (not the display label; for Sinclair's Station they are the same). One Mimir webhook is registered per value."
+  },
+  {
+    "ParameterKey": "EmbeddingsFilterFieldKey",
+    "ParameterValue": "",
+    "Description": "Optional, usually blank. Explicit metadata.formData key (e.g. the field UUID) for the pipeline's defensive filter check. Blank = the pipeline tries formData[field], formData['default_' + field], then the field UUID looked up in the Mimir metadata forms, and lets the item through if the field cannot be resolved."
   }
 ]
