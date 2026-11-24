@@ -12,6 +12,123 @@ const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client
 
 const secretsClient = new SecretsManagerClient();
 
+// ---------------------------------------------------------------------------
+// MDF schema for the Reframe + Graphics custom action.
+//
+// Four producer-editable fields that each override one slot of the auto-
+// generated graphics overlay. The `fieldId` values here are the keys Mimir
+// posts back on the webhook as `actionData[fieldId]`, so downstream Lambdas
+// (mimir-handler, classify-category-handler, vertical-reframe-handler) read
+// them by these exact names.
+//
+// Schema shape follows Mimir's MdfField + LayoutSettings contract:
+//   fields[] carry the data model (id/fieldId/type/required/alternatives)
+//   view[]   carries the UI layout (id/fieldId/label/visible/flex)
+// Labels live on the view entry, not on the field itself. Setting a label on
+// the field is silently dropped and the admin UI then shows the Metadata tab
+// with empty rows (observed on the first deploy of this action).
+//
+// Field IDs are deterministic (fixed UUIDs) so re-registering the action in
+// place keeps a stable identity.
+// ---------------------------------------------------------------------------
+const REFRAME_WITH_GRAPHICS_FIELD_IDS = {
+  title:       'a1b2c3d4-0000-4000-8000-000000000001',
+  summary:     'a1b2c3d4-0000-4000-8000-000000000002',
+  gfxTemplate: 'a1b2c3d4-0000-4000-8000-000000000003',
+  toa:         'a1b2c3d4-0000-4000-8000-000000000004',
+};
+
+// Choice options for `gfx_template`. These values are the ONLY ones the
+// classifier Lambda is allowed to pick from when auto-selecting, so what the
+// producer sees in the dropdown and what the AI picks always align.
+const GFX_TEMPLATE_OPTIONS = [
+  'BREAKING NEWS',
+  'ENTERTAINMENT NEWS',
+  'LOCAL NEWS',
+  'NATIONAL NEWS',
+  'NEWS & POLITICS',
+  'SPORTS',
+  'WEATHER',
+  'WORLD NEWS',
+];
+
+// Exported so tests and the deploy-time dry-run can validate the shape
+// without executing the custom-resource handler.
+module.exports.REFRAME_WITH_GRAPHICS_FIELD_IDS = REFRAME_WITH_GRAPHICS_FIELD_IDS;
+module.exports.GFX_TEMPLATE_OPTIONS = GFX_TEMPLATE_OPTIONS;
+
+const REFRAME_WITH_GRAPHICS_MDF_SCHEMAS = {
+  mainSchema: {
+    id: 'a1b2c3d4-0000-4000-8000-000000000000',
+    label: 'Reframe + Graphics metadata',
+    active: true,
+    isSubtype: false,
+    fields: [
+      {
+        id: REFRAME_WITH_GRAPHICS_FIELD_IDS.title,
+        fieldId: 'title',
+        type: 'text',
+        required: false,
+      },
+      {
+        id: REFRAME_WITH_GRAPHICS_FIELD_IDS.summary,
+        fieldId: 'summary',
+        type: 'text',
+        required: false,
+      },
+      {
+        id: REFRAME_WITH_GRAPHICS_FIELD_IDS.gfxTemplate,
+        fieldId: 'gfx_template',
+        type: 'choice',
+        required: false,
+        alternatives: GFX_TEMPLATE_OPTIONS.map((v) => ({
+          value: v,
+          label: v,
+        })),
+      },
+      {
+        id: REFRAME_WITH_GRAPHICS_FIELD_IDS.toa,
+        fieldId: 'toa',
+        type: 'checkbox',
+        required: false,
+      },
+    ],
+    view: [
+      {
+        id: REFRAME_WITH_GRAPHICS_FIELD_IDS.title,
+        fieldId: 'title',
+        visible: true,
+        label: 'Title',
+        flex: 12,
+      },
+      {
+        id: REFRAME_WITH_GRAPHICS_FIELD_IDS.summary,
+        fieldId: 'summary',
+        visible: true,
+        label: 'Summary',
+        flex: 12,
+      },
+      {
+        id: REFRAME_WITH_GRAPHICS_FIELD_IDS.gfxTemplate,
+        fieldId: 'gfx_template',
+        visible: true,
+        label: 'GFX',
+        flex: 12,
+      },
+      {
+        id: REFRAME_WITH_GRAPHICS_FIELD_IDS.toa,
+        fieldId: 'toa',
+        visible: true,
+        label: 'Add Text on Scr',
+        flex: 12,
+      },
+    ],
+  },
+  subTypes: [],
+};
+
+module.exports.REFRAME_WITH_GRAPHICS_MDF_SCHEMAS = REFRAME_WITH_GRAPHICS_MDF_SCHEMAS;
+
 async function getMimirApiKey(secretArn) {
   const response = await secretsClient.send(new GetSecretValueCommand({ SecretId: secretArn }));
   return response.SecretString;
@@ -102,8 +219,12 @@ async function registerCustomActions(apiKey, mimirBaseUrl, actionsApiUrl) {
       icon: '',
       includeJWT: true,
       allowedBy: { type: 'everyone' },
-      mdfSchemas: null,
-      metadataEnabled: false
+      // Optional producer-supplied overrides for the graphics overlay.
+      // When a field is left blank the pipeline falls back to the AI-generated
+      // value (category, kicker lines, headline) for that slot. `toa` is a
+      // strict opt-in — captions are only burned in when the box is checked.
+      metadataEnabled: true,
+      mdfSchemas: REFRAME_WITH_GRAPHICS_MDF_SCHEMAS,
     },
     {
       label: 'Reframe Custom',
