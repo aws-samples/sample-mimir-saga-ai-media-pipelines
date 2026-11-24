@@ -1784,7 +1784,9 @@ export class InfrastructureStack extends cdk.Stack {
             "FunctionName": invokeRoughCutAgent.functionArn,
             "Payload": {
               "TaskToken": "{% $states.context.Task.Token %}",
-              "storyContext": "{% $merge([$storyContext, {'assets': $storyContext.assets ~> $map(function($a) { ($m := $transcribeResults[mimirItemId = $a.mimirItemId and status = 'completed']; $m ? $merge([$a, {'generatedTranscriptS3Uri': $m.transcriptS3Uri}]) : $a) })}]) %}",
+              // invoke-rough-cut-agent adds generatedTranscriptS3Uri to each asset.
+              "storyContext": "{% $storyContext %}",
+              "transcribeResults": "{% $exists($transcribeResults) ? $transcribeResults : [] %}",
               "storyId": "{% $storyId %}",
               "story": "{% $story %}",
               "triggeredByUserId": "{% $triggeredByUserId %}",

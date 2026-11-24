@@ -72,6 +72,12 @@ describe('rough-cut state machine resilience (synth)', () => {
     assert.equal(next(states.EnsureEmbeddings), 'InvokeRoughCutAgent');
   });
 
+  it('passes transcribe results to the invoke Lambda instead of merging in JSONata', () => {
+    const payload = states.InvokeRoughCutAgent.Arguments.Payload;
+    assert.equal(payload.storyContext, '{% $storyContext %}');
+    assert.match(payload.transcribeResults, /\$transcribeResults/);
+  });
+
   it('carries the failing state and error into HandleFailure', () => {
     for (const name of ['GatherStoryContext', 'InvokeRoughCutAgent']) {
       const c = states[name].Catch.find((x) => x.Next === 'HandleFailure');
