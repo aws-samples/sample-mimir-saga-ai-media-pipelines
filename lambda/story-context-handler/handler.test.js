@@ -3,12 +3,13 @@
 // The rough-cut execution input no longer carries the Mimir key, so the
 // handler must read it from Secrets Manager for the Mimir transcript checks.
 // AWS SDK clients and fetch are replaced with in-process fakes (no network).
-const { describe, it, before, after } = require('node:test');
+const { describe, it, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 const Module = require('node:module');
 
 const SECRETS = {
   'arn:fake:secret:mimir': 'FAKE-MIMIR-KEY-123',
+  'arn:fake:secret:mimir-input': 'FAKE-MIMIR-KEY-INPUT-789',
   'arn:fake:secret:saga-key': 'FAKE-SAGA-KEY-456',
   'arn:fake:secret:saga-url': 'https://saga.example.com/v1',
 };
@@ -49,7 +50,23 @@ before(() => {
 after(() => { Module._load = originalLoad; global.fetch = originalFetch; });
 
 describe('story-context-handler Mimir key', () => {
-  it('reads the key from Secrets Manager when the execution input has none', async () => {
+  beforeEach(() => { secretReads.length = 0; fetchCalls.length = 0; });
+
+  it('reads the key from the secret ARN in the task input first', async () => {
+    const out = await handler({
+      storyId: 'story-1',
+      sagaApiKeySecretArn: 'arn:fake:secret:saga-key',
+      sagaApiUrlSecretArn: 'arn:fake:secret:saga-url',
+      mimirApiKeySecretArn: 'arn:fake:secret:mimir-input',
+    });
+    assert.ok(secretReads.includes('arn:fake:secret:mimir-input'));
+    assert.ok(!secretReads.includes('arn:fake:secret:mimir'), 'env ARN is not used when the input has one');
+    const mimirCall = fetchCalls.find((c) => c.url.includes('/api/v1/items/item-1'));
+    assert.equal(mimirCall.opts.headers['x-mimir-cognito-id-token'], 'Bearer FAKE-MIMIR-KEY-INPUT-789');
+    assert.ok(!JSON.stringify(out).includes('FAKE-MIMIR-KEY-INPUT-789'), 'key is not returned into the state output');
+  });
+
+  it('falls back to MIMIR_API_KEY_SECRET_ARN when the input has no ARN', async () => {
     const out = await handler({
       storyId: 'story-1',
       sagaApiKeySecretArn: 'arn:fake:secret:saga-key',
