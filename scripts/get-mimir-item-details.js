@@ -1,4 +1,4 @@
-const fs = require('fs');
+const { getMimirApiKey, getMimirInstance } = require('./mimir-config');
 
 async function getMimirItemDetails(apiKey, itemId, mimirInstance = 'us') {
   const url = `https://${mimirInstance}.mjoll.no/api/v1/items/${itemId}`;
@@ -26,12 +26,9 @@ async function main() {
       process.exit(1);
     }
     
-    const params = JSON.parse(fs.readFileSync('./parameters.json', 'utf8'));
-    
     console.log('Getting Mimir details for item:', itemId);
     
-    const apiKey = params.mimirApiKey;
-    const details = await getMimirItemDetails(apiKey, itemId);
+    const details = await getMimirItemDetails(getMimirApiKey(), itemId, getMimirInstance());
     
     console.log(JSON.stringify(details, null, 2));
   } catch (error) {

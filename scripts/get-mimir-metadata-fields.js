@@ -1,22 +1,18 @@
 #!/usr/bin/env node
 
-const fs = require('fs');
-const path = require('path');
-
-// Load parameters
-const parametersPath = path.join(__dirname, '..', 'parameters.json');
-const parameters = JSON.parse(fs.readFileSync(parametersPath, 'utf8'));
+const { getMimirApiKey, getMimirInstance } = require('./mimir-config');
 
 async function getMimirMetadataFields() {
   try {
-    const mimirBaseUrl = 'https://us.mjoll.no';
+    const apiKey = getMimirApiKey();
+    const mimirBaseUrl = `https://${getMimirInstance()}.mjoll.no`;
     
     // Get all MDFs
     console.log('Fetching all metadata forms...');
     const mdfsResponse = await fetch(`${mimirBaseUrl}/api/v1/mdfs`, {
       headers: {
         'Accept': 'application/json',
-        'x-mimir-cognito-id-token': `Bearer ${parameters.mimirApiKey}`
+        'x-mimir-cognito-id-token': `Bearer ${apiKey}`
       }
     });
 
@@ -37,7 +33,7 @@ async function getMimirMetadataFields() {
     const defaultMdfResponse = await fetch(`${mimirBaseUrl}/api/v1/mdfs/default`, {
       headers: {
         'Accept': 'application/json',
-        'x-mimir-cognito-id-token': `Bearer ${parameters.mimirApiKey}`
+        'x-mimir-cognito-id-token': `Bearer ${apiKey}`
       }
     });
 
@@ -51,6 +47,8 @@ async function getMimirMetadataFields() {
     
     for (const field of defaultMdf.fields) {
       console.log(`- ${field.fieldId} (${field.type}) - Required: ${field.required}`);
+      // formData key: default_<fieldId> for text/date fields, this UUID for choice fields
+      if (field.id) console.log(`  Field UUID: ${field.id}`);
       if (field.label) console.log(`  Label: ${field.label}`);
       if (field.hint) console.log(`  Hint: ${field.hint}`);
       console.log('');
