@@ -265,45 +265,124 @@ async function registerCustomActions(apiKey, mimirBaseUrl, actionsApiUrl) {
   return results;
 }
 
-async function registerWebhooks(apiKey, mimirBaseUrl, webhookApiUrl) {
-  const webhooks = [
-    {
-      type: 'itemCreation',
-      label: 'Embed Video Content',
-      url: `${webhookApiUrl}webhook/item-embed`,
-      condition: { criteria: 'itemTypeEquals', itemType: 'video' },
-      headers: [
-        { headerField: 'Content-Type', headerValue: 'application/json' }
-      ],
-      protected: false
-    }
-  ];
+// ---------------------------------------------------------------------------
+// Embedding webhook ('Embed Video Content').
+//
+// Without a filter: one itemCreation webhook for every video item.
+// With a filter (EmbeddingsFilterField + EmbeddingsFilterValues): Mimir
+// webhook conditions support `metadataEquals` (one field, one value) and
+// combine multiple conditions with AND only, so we register one webhook per
+// accepted value, each with condition
+//   itemTypeEquals video AND metadataEquals <field> = <value>.
+// Labels identify our webhooks (Mimir webhooks have no externalId):
+//   'Embed Video Content'                    unfiltered
+//   'Embed Video Content [<field>=<value>]'  one per filter value
+// EnableEmbeddingsWebhook=false registers none and removes any of ours.
+// ---------------------------------------------------------------------------
+const EMBED_WEBHOOK_LABEL = 'Embed Video Content';
 
-  // Get existing webhooks
+function isEmbedWebhookLabel(label) {
+  return label === EMBED_WEBHOOK_LABEL || (typeof label === 'string' && label.startsWith(`${EMBED_WEBHOOK_LABEL} [`));
+}
+
+/**
+ * Parses the EmbeddingsFilter custom-resource property: '' / undefined means
+ * no filter, otherwise a JSON string {"field": "...", "values": ["..."]}.
+ */
+function parseEmbeddingsFilter(raw) {
+  if (raw === undefined || raw === null || raw === '') return null;
+  const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+  const field = typeof parsed?.field === 'string' ? parsed.field.trim() : '';
+  const values = Array.isArray(parsed?.values) ? parsed.values.map(String).filter((v) => v !== '') : [];
+  if (!field || values.length === 0) {
+    throw new Error('EmbeddingsFilter needs a non-empty "field" and at least one value');
+  }
+  return { field, values: [...new Set(values)] };
+}
+
+function buildEmbedWebhooks(webhookApiUrl, filter) {
+  const base = {
+    type: 'itemCreation',
+    url: `${webhookApiUrl}webhook/item-embed`,
+    headers: [
+      { headerField: 'Content-Type', headerValue: 'application/json' }
+    ],
+    protected: false
+  };
+  const videoOnly = { criteria: 'itemTypeEquals', itemType: 'video' };
+
+  if (!filter) {
+    return [{ ...base, label: EMBED_WEBHOOK_LABEL, condition: videoOnly }];
+  }
+  return filter.values.map((value) => ({
+    ...base,
+    label: `${EMBED_WEBHOOK_LABEL} [${filter.field}=${value}]`,
+    condition: {
+      criteria: 'and',
+      conditions: [
+        videoOnly,
+        { criteria: 'metadataEquals', metadataField: filter.field, value },
+      ],
+    },
+  }));
+}
+
+/**
+ * Brings Mimir's embed webhooks in line with `desired`: updates same-label
+ * webhooks in place, creates missing ones, then deletes any other webhook
+ * with one of our labels (e.g. the unfiltered one after a filter is set, or
+ * duplicates). Deletes run only when every upsert succeeded, so a failed
+ * create never leaves the stack with no embed webhook.
+ */
+async function registerWebhooks(apiKey, mimirBaseUrl, webhookApiUrl, filter = null, enabled = true) {
+  const desired = enabled ? buildEmbedWebhooks(webhookApiUrl, filter) : [];
+
   const existing = await mimirRequest('GET', '/config/api/v1/config/webhooks', apiKey, mimirBaseUrl);
-  const existingWebhooks = existing.ok && Array.isArray(existing.data) ? existing.data : [];
+  if (!existing.ok || !Array.isArray(existing.data)) {
+    throw new Error(`Could not list Mimir webhooks (status ${existing.status})`);
+  }
+  const ours = existing.data.filter((w) => isEmbedWebhookLabel(w.label));
 
   const results = [];
+  const keptIds = new Set();
+  let allOk = true;
 
-  for (const webhook of webhooks) {
-    // Match by label (webhooks don't have externalId)
-    const match = existingWebhooks.find(w => w.label === webhook.label);
-
+  for (const webhook of desired) {
+    const match = ours.find((w) => w.label === webhook.label && !keptIds.has(w.id));
+    let res;
     if (match) {
-      // Update existing webhook
-      const res = await mimirRequest('PUT', `/config/api/v1/config/webhooks/${match.id}`, apiKey, mimirBaseUrl, { ...webhook, id: match.id });
+      keptIds.add(match.id);
+      res = await mimirRequest('PUT', `/config/api/v1/config/webhooks/${match.id}`, apiKey, mimirBaseUrl, { ...webhook, id: match.id });
       results.push({ webhook: webhook.label, operation: 'updated', status: res.status });
       console.log(`Updated webhook: ${webhook.label} (id: ${match.id}) → ${res.status}`);
     } else {
-      // Create new webhook
-      const res = await mimirRequest('POST', '/config/api/v1/config/webhooks', apiKey, mimirBaseUrl, webhook);
+      res = await mimirRequest('POST', '/config/api/v1/config/webhooks', apiKey, mimirBaseUrl, webhook);
+      if (res.ok && res.data && res.data.id) keptIds.add(res.data.id);
       results.push({ webhook: webhook.label, operation: 'created', status: res.status });
       console.log(`Created webhook: ${webhook.label} → ${res.status}`);
     }
+    if (!res.ok) allOk = false;
+  }
+
+  const stale = ours.filter((w) => !keptIds.has(w.id));
+  if (!allOk) {
+    console.warn(`Skipped removing ${stale.length} stale embed webhook(s): an update or create failed`);
+    return results;
+  }
+  for (const w of stale) {
+    const res = await mimirRequest('DELETE', `/config/api/v1/config/webhooks/${w.id}`, apiKey, mimirBaseUrl);
+    results.push({ webhook: w.label, operation: 'deleted', status: res.status });
+    console.log(`Deleted stale webhook: ${w.label} (id: ${w.id}) → ${res.status}`);
   }
 
   return results;
 }
+
+module.exports.EMBED_WEBHOOK_LABEL = EMBED_WEBHOOK_LABEL;
+module.exports.isEmbedWebhookLabel = isEmbedWebhookLabel;
+module.exports.parseEmbeddingsFilter = parseEmbeddingsFilter;
+module.exports.buildEmbedWebhooks = buildEmbedWebhooks;
+module.exports.registerWebhooks = registerWebhooks;
 
 async function deleteCustomActions(apiKey, mimirBaseUrl) {
   const existing = await mimirRequest('GET', '/config/api/v1/config/customActions', apiKey, mimirBaseUrl);
@@ -323,10 +402,8 @@ async function deleteWebhooks(apiKey, mimirBaseUrl) {
   const existing = await mimirRequest('GET', '/config/api/v1/config/webhooks', apiKey, mimirBaseUrl);
   const existingWebhooks = existing.ok && Array.isArray(existing.data) ? existing.data : [];
 
-  const ourLabels = ['Embed Video Content'];
-
   for (const webhook of existingWebhooks) {
-    if (ourLabels.includes(webhook.label)) {
+    if (isEmbedWebhookLabel(webhook.label)) {
       await mimirRequest('DELETE', `/config/api/v1/config/webhooks/${webhook.id}`, apiKey, mimirBaseUrl);
       console.log(`Deleted webhook: ${webhook.label} (id: ${webhook.id})`);
     }
@@ -377,13 +454,16 @@ exports.handler = async (event, context) => {
     const apiKey = await getMimirApiKey(mimirApiKeySecretArn);
 
     if (event.RequestType === 'Create' || event.RequestType === 'Update') {
+      const embeddingsFilter = parseEmbeddingsFilter(props.EmbeddingsFilter);
+      const embeddingsWebhookEnabled = props.EmbeddingsWebhookEnabled !== 'false';
       console.log(`Registering Mimir integrations (${event.RequestType})...`);
       console.log(`  Mimir: ${mimirBaseUrl}`);
       console.log(`  Actions API: ${actionsApiUrl}`);
       console.log(`  Webhook API: ${webhookApiUrl}`);
+      console.log(`  Embeddings webhook: ${!embeddingsWebhookEnabled ? 'disabled' : embeddingsFilter ? `${embeddingsFilter.field} in ${embeddingsFilter.values.length} value(s)` : 'all video items'}`);
 
       const actionResults = await registerCustomActions(apiKey, mimirBaseUrl, actionsApiUrl);
-      const webhookResults = await registerWebhooks(apiKey, mimirBaseUrl, webhookApiUrl);
+      const webhookResults = await registerWebhooks(apiKey, mimirBaseUrl, webhookApiUrl, embeddingsFilter, embeddingsWebhookEnabled);
 
       await sendResponse(event, context, 'SUCCESS', 'Mimir integrations registered', {
         CustomActions: JSON.stringify(actionResults),

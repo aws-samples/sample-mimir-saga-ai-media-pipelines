@@ -1,5 +1,6 @@
 const { BedrockRuntimeClient, StartAsyncInvokeCommand, GetAsyncInvokeCommand } = require('@aws-sdk/client-bedrock-runtime');
 const { S3Client, HeadObjectCommand } = require('@aws-sdk/client-s3');
+const { handleFilter } = require('./filter');
 
 const bedrockClient = new BedrockRuntimeClient();
 const s3Client = new S3Client();
@@ -136,8 +137,10 @@ exports.handler = async (event) => {
     return handlePoll(event);
   } else if (action === 'check-access') {
     return handleCheckAccess(event);
+  } else if (action === 'filter') {
+    return handleFilter(event);
   } else {
-    throw new Error(`Unknown action: ${action}. Expected "start", "poll", or "check-access".`);
+    throw new Error(`Unknown action: ${action}. Expected "start", "poll", "check-access", or "filter".`);
   }
 };
 
