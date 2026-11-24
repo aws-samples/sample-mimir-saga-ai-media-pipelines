@@ -5,7 +5,9 @@ Description: >
   Store, and runs deploy.sh. The first build starts automatically on stack
   creation. Supports one-click re-deploys: start a new build to pull the latest
   code and redeploy. Configuration (parameters.json) is persisted in an SSM
-  SecureString parameter so subsequent builds are idempotent.
+  SecureString parameter so subsequent builds are idempotent. API keys are
+  stored in Secrets Manager and referenced by the CodeBuild project, so no
+  key value appears in the project definition.
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -67,17 +69,19 @@ Parameters:
     NoEcho: true
     Description: >
       Mimir API key (format: sakm.<identifier>.<secret>). Required on first
-      deploy. Leave blank on re-deploys - the value is restored from SSM.
-      Alternatively, leave blank and pre-populate the SSM config parameter
-      (see stack outputs).
+      deploy. Stored in a Secrets Manager secret that the CodeBuild project
+      references; the value is never written to the project definition.
+      Leave blank only if you pre-populate the SSM config parameter (see
+      stack outputs) - a blank value creates no secret.
 
   SagaApiKey:
     Type: String
     Default: ''
     NoEcho: true
     Description: >
-      Saga API key. Required on first deploy. Leave blank on re-deploys -
-      the value is restored from SSM.
+      Saga API key. Required on first deploy. Stored in a Secrets Manager
+      secret that the CodeBuild project references. Leave blank only if you
+      pre-populate the SSM config parameter - a blank value creates no secret.
 
   MimirInstance:
     Type: String
@@ -156,8 +160,32 @@ Parameters:
 
 Conditions:
   HasGitHubToken: !Not [!Equals [!Ref GitHubTokenSecretName, '']]
+  HasMimirApiKey: !Not [!Equals [!Ref MimirApiKey, '']]
+  HasSagaApiKey: !Not [!Equals [!Ref SagaApiKey, '']]
+  HasAnyApiKey: !Or [!Condition HasMimirApiKey, !Condition HasSagaApiKey]
 
 Resources:
+
+  # =========================================================================
+  # API key secrets. CodeBuild resolves these at build start
+  # (SECRETS_MANAGER env vars), so the keys never appear in the project
+  # definition returned by codebuild:BatchGetProjects / BatchGetBuilds.
+  # Created only when a key is supplied: an empty SecretString would make
+  # CloudFormation generate a random value instead.
+  # =========================================================================
+  MimirApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: HasMimirApiKey
+    Properties:
+      Description: !Sub Mimir API key used by ${AWS::StackName}-build to seed parameters.json
+      SecretString: !Ref MimirApiKey
+
+  SagaApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: HasSagaApiKey
+    Properties:
+      Description: !Sub Saga API key used by ${AWS::StackName}-build to seed parameters.json
+      SecretString: !Ref SagaApiKey
 
   # =========================================================================
   # IAM Role for CodeBuild - needs broad permissions for CDK deployment
@@ -180,6 +208,22 @@ Resources:
         # Bedrock AgentCore, Cognito, API Gateway, EventBridge, Secrets
         # Manager, etc.). For production, scope this down to the specific
         # services used.
+      # Explicit read on just the API key secrets, so CodeBuild can still
+      # resolve its SECRETS_MANAGER env vars after AdministratorAccess is
+      # scoped down. Secrets use the AWS-managed aws/secretsmanager key, so no
+      # kms:Decrypt grant is needed.
+      Policies: !If
+        - HasAnyApiKey
+        - - PolicyName: ReadApiKeySecrets
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource:
+                    - !If [HasMimirApiKey, !Ref MimirApiKeySecret, !Ref AWS::NoValue]
+                    - !If [HasSagaApiKey, !Ref SagaApiKeySecret, !Ref AWS::NoValue]
+        - !Ref AWS::NoValue
     Metadata:
       cdk_nag:
         rules_to_suppress:
@@ -212,10 +256,21 @@ Resources:
             Value: !Ref GitBranch
           - Name: GITHUB_TOKEN_SECRET
             Value: !If [HasGitHubToken, !Ref GitHubTokenSecretName, '']
-          - Name: MSAI_MIMIR_API_KEY
-            Value: !Ref MimirApiKey
-          - Name: MSAI_SAGA_API_KEY
-            Value: !Ref SagaApiKey
+          # API keys are SECRETS_MANAGER references (secret ARN), resolved by
+          # CodeBuild at build start and masked in build logs. Omitted when no
+          # key was supplied; the buildspec then requires the SSM config.
+          - !If
+            - HasMimirApiKey
+            - Name: MSAI_MIMIR_API_KEY
+              Type: SECRETS_MANAGER
+              Value: !Ref MimirApiKeySecret
+            - !Ref AWS::NoValue
+          - !If
+            - HasSagaApiKey
+            - Name: MSAI_SAGA_API_KEY
+              Type: SECRETS_MANAGER
+              Value: !Ref SagaApiKeySecret
+            - !Ref AWS::NoValue
           - Name: MSAI_MIMIR_INSTANCE
             Value: !Ref MimirInstance
           - Name: MSAI_SAGA_API_URL
@@ -344,6 +399,8 @@ Resources:
                 #    aws codebuild start-build --project-name <name> \
                 #      --environment-variables-override \
                 #        name=MSAI_PARAM_OVERRIDES,value='{"SummaryFieldName":"ai_summary"}',type=PLAINTEXT
+                #    Never put API keys in a PLAINTEXT override: override
+                #    values are stored on the build record. Use option 2.
                 #
                 # 2. Edit the SSM parameter directly (one-off correction):
                 #    aws ssm put-parameter --name "$SSM_CONFIG_PARAM" \
@@ -513,3 +570,13 @@ Outputs:
       SSM SecureString parameter holding parameters.json. To update config,
       fetch it with --with-decryption, edit, put it back, then start a new build.
     Value: /MimirSagaAI/DeploymentConfig/parameters
+
+  MimirApiKeySecretArn:
+    Condition: HasMimirApiKey
+    Description: Secrets Manager secret holding the Mimir API key read by the build
+    Value: !Ref MimirApiKeySecret
+
+  SagaApiKeySecretArn:
+    Condition: HasSagaApiKey
+    Description: Secrets Manager secret holding the Saga API key read by the build
+    Value: !Ref SagaApiKeySecret
