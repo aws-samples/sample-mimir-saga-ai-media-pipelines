@@ -58,7 +58,6 @@ exports.handler = async (event) => {
       notes: event.storyContext?.notes || [],
       storyId: event.storyId || '',
       triggeredByUserId: event.triggeredByUserId || '',
-      mimirApiKey: event.mimirApiKey || '',
       // Rough-cut variant selector; the agent maps this to a prompt/constraint
       // profile. Defaults to "full" when absent.
       roughCutType: event.roughCutType || 'full',

@@ -290,11 +290,9 @@ export class InfrastructureStack extends cdk.Stack {
     const storeVariablesSummarizer = new stepfunctions.Pass(this, 'StoreVariablesSummarizer', {
       parameters: {
         'items.$': '$.items',
-        'userToken.$': '$.userToken',
         'actionData.$': '$.actionData',
         'userId.$': '$.userId',
         'userEmail.$': '$.userEmail',
-        'mimirApiKey.$': '$.mimirApiKey',
         'actionType.$': '$.actionType'
       }
     });
@@ -305,7 +303,6 @@ export class InfrastructureStack extends cdk.Stack {
         'id.$': '$.id',
         'itemType.$': '$.itemType',
         'metadata.$': '$.metadata',
-        'mimirApiKey.$': '$$.Execution.Input.mimirApiKey'
       }),
       outputPath: '$.Payload'
     });
@@ -314,7 +311,6 @@ export class InfrastructureStack extends cdk.Stack {
       lambdaFunction: summarizerHandler,
       payload: stepfunctions.TaskInput.fromObject({
         'itemDetails.$': '$',
-        'mimirApiKey.$': '$$.Execution.Input.mimirApiKey'
       }),
       outputPath: '$.Payload'
     });
@@ -324,7 +320,6 @@ export class InfrastructureStack extends cdk.Stack {
       payload: stepfunctions.TaskInput.fromObject({
         'itemId.$': '$.id',
         'summary.$': '$.summary',
-        'mimirApiKey.$': '$$.Execution.Input.mimirApiKey'
       })
     });
 
@@ -443,7 +438,6 @@ export class InfrastructureStack extends cdk.Stack {
         payload: stepfunctions.TaskInput.fromObject({
           action: 'publish-transcript',
           'itemId.$': '$.id',
-          'mimirApiKey.$': '$$.Execution.Input.mimirApiKey',
         }),
         payloadResponseOnly: true,
         resultPath: '$.transcribePublish',
@@ -547,11 +541,9 @@ export class InfrastructureStack extends cdk.Stack {
     const storeVariablesChapterize = new stepfunctions.Pass(this, 'StoreVariablesChapterize', {
       parameters: {
         'items.$': '$.items',
-        'userToken.$': '$.userToken',
         'actionData.$': '$.actionData',
         'userId.$': '$.userId',
         'userEmail.$': '$.userEmail',
-        'mimirApiKey.$': '$.mimirApiKey',
         'actionType.$': '$.actionType'
       }
     });
@@ -562,7 +554,6 @@ export class InfrastructureStack extends cdk.Stack {
         'id.$': '$.item.id',
         'itemType.$': '$.item.itemType',
         'metadata.$': '$.item.metadata',
-        'mimirApiKey.$': '$.mimirApiKey'
       }),
       outputPath: '$.Payload'
     });
@@ -571,7 +562,6 @@ export class InfrastructureStack extends cdk.Stack {
       lambdaFunction: chapterizeHandler,
       payload: stepfunctions.TaskInput.fromObject({
         'itemDetails.$': '$',
-        'mimirApiKey.$': '$.mimirApiKey'
       }),
       resultPath: '$.chapterizeResult'
     });
@@ -581,7 +571,6 @@ export class InfrastructureStack extends cdk.Stack {
       payload: stepfunctions.TaskInput.fromObject({
         'itemId.$': '$.chapterizeResult.Payload.id',
         'chapters.$': '$.chapterizeResult.Payload.chapters',
-        'mimirApiKey.$': '$.mimirApiKey'
       })
     });
 
@@ -679,7 +668,6 @@ export class InfrastructureStack extends cdk.Stack {
         payload: stepfunctions.TaskInput.fromObject({
           action: 'publish-transcript',
           'itemId.$': '$.id',
-          'mimirApiKey.$': '$.mimirApiKey',
         }),
         payloadResponseOnly: true,
         resultPath: '$.transcribePublish',
@@ -746,7 +734,6 @@ export class InfrastructureStack extends cdk.Stack {
       maxConcurrency: 3,
       itemSelector: {
         'item.$': '$$.Map.Item.Value',
-        'mimirApiKey.$': '$.mimirApiKey'
       }
     }).itemProcessor(checkItemTypeChapterize);
 
@@ -772,14 +759,13 @@ export class InfrastructureStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(30),
       environment: {
         MIMIR_ALLOWED_ISSUER: mimirAllowedIssuer,
-        MIMIR_API_KEY_SECRET_ARN: mimirApiKeySecret.secretArn,
         SUMMARIZER_STATE_MACHINE_ARN: processSummarizerStateMachine.stateMachineArn,
         CHAPTERIZE_STATE_MACHINE_ARN: processChapterizeStateMachine.stateMachineArn,
       },
     });
 
-    // Grant Lambda permissions
-    mimirApiKeySecret.grantRead(mimirHandler);
+    // Grant Lambda permissions. mimir-handler no longer reads the Mimir key:
+    // it is not forwarded in execution input, each consumer reads it itself.
     processSummarizerStateMachine.grantStartExecution(mimirHandler);
     processChapterizeStateMachine.grantStartExecution(mimirHandler);
 
@@ -836,14 +822,13 @@ export class InfrastructureStack extends cdk.Stack {
       code: lambda.Code.fromAsset('lambda/saga-action-handler'),
       timeout: cdk.Duration.seconds(30),
       environment: {
-        MIMIR_API_KEY_SECRET_ARN: mimirApiKeySecret.secretArn,
         SAGA_API_KEY_SECRET_ARN: sagaApiKeySecret.secretArn,
         SAGA_API_URL_SECRET_ARN: sagaApiUrlSecret.secretArn,
         SAGA_ACTIONS_API_KEY_SECRET_ARN: sagaActionsApiKeySecret.secretArn,
         ROUGH_CUT_STATE_MACHINE_ARN: 'placeholder', // set after state machine creation
       },
     });
-    mimirApiKeySecret.grantRead(sagaActionHandler);
+    // No Mimir key grant: the key is no longer forwarded in execution input.
     sagaActionsApiKeySecret.grantRead(sagaActionHandler);
 
     // The three rough-cut actions all run the SAME state machine and agent;
@@ -1070,7 +1055,6 @@ export class InfrastructureStack extends cdk.Stack {
             "storyId": "{% $states.input.storyId %}",
             "story": "{% $states.input.story %}",
             "triggeredByUserId": "{% $states.input.triggeredByUserId %}",
-            "mimirApiKey": "{% $states.input.mimirApiKey %}",
             "roughCutType": "{% $states.input.roughCutType ? $states.input.roughCutType : 'ai-vo' %}"
           },
           "Catch": [
@@ -1160,7 +1144,6 @@ export class InfrastructureStack extends cdk.Stack {
                   "Payload": {
                     "action": "import-mimir-transcript",
                     "itemId": "{% $mimirItemId %}",
-                    "mimirApiKey": "{% $mimirApiKey %}"
                   }
                 },
                 "Retry": [
@@ -1690,7 +1673,6 @@ export class InfrastructureStack extends cdk.Stack {
               "storyId": "{% $storyId %}",
               "story": "{% $story %}",
               "triggeredByUserId": "{% $triggeredByUserId %}",
-              "mimirApiKey": "{% $mimirApiKey %}",
               "roughCutType": "{% $roughCutType %}"
             }
           },
@@ -2400,7 +2382,6 @@ export class InfrastructureStack extends cdk.Stack {
       payload: stepfunctions.TaskInput.fromObject({
         'action': 'start',
         'itemDetails.$': '$',
-        'mimirApiKey.$': '$$.Execution.Input.mimirApiKey',
         'aspectRatio.$': '$$.Execution.Input.aspectRatio'
       }),
       outputPath: '$.Payload'
@@ -2431,7 +2412,6 @@ export class InfrastructureStack extends cdk.Stack {
         'title.$': '$.title',
         'outputUri.$': '$.outputUri',
         'aspectRatio.$': '$.aspectRatio',
-        'mimirApiKey.$': '$$.Execution.Input.mimirApiKey'
       }),
       outputPath: '$.Payload'
     });
@@ -2462,7 +2442,6 @@ export class InfrastructureStack extends cdk.Stack {
         'id.$': '$.id',
         'itemType.$': '$.itemType',
         'metadata.$': '$.metadata',
-        'mimirApiKey.$': '$$.Execution.Input.mimirApiKey'
       }),
       outputPath: '$.Payload'
     });
@@ -2479,7 +2458,6 @@ export class InfrastructureStack extends cdk.Stack {
     const storeVariablesReframe = new stepfunctions.Pass(this, 'StoreVariablesReframe', {
       parameters: {
         'items.$': '$.items',
-        'mimirApiKey.$': '$.mimirApiKey',
         'actionType.$': '$.actionType'
       }
     });
@@ -2532,6 +2510,7 @@ export class InfrastructureStack extends cdk.Stack {
       environment: {
         CLASSIFY_MODEL_ID: 'us.amazon.nova-pro-v1:0',
         TRANSCRIPT_STAGING_BUCKET: videoStagingBucket.bucketName,
+        MIMIR_API_KEY_SECRET_ARN: mimirApiKeySecret.secretArn,
       },
     });
 
@@ -2541,6 +2520,9 @@ export class InfrastructureStack extends cdk.Stack {
       resources: ['*'],
     }));
     videoStagingBucket.grantRead(classifyCategoryHandler);
+    // Reads the Mimir key itself (to fetch timedTranscriptUrl); it is no longer
+    // passed in the Step Functions execution input.
+    mimirApiKeySecret.grantRead(classifyCategoryHandler);
 
     // Graphics Overlay Handler — Docker Lambda (rlottie-python + FFmpeg)
     const graphicsOverlayHandler = new lambda.DockerImageFunction(this, 'GraphicsOverlayHandler', {
@@ -2571,7 +2553,6 @@ export class InfrastructureStack extends cdk.Stack {
         'description.$': '$$.Execution.Input.description',
         'transcript.$': '$$.Execution.Input.transcript',
         'mimirDetails.$': '$.mimirDetails',
-        'mimirApiKey.$': '$$.Execution.Input.mimirApiKey',
         // Producer-supplied overrides from the Mimir custom-action metadata
         // form. Always an object (mimir-handler normalises null fields when
         // the producer leaves them blank), so classify-category-handler can
@@ -2589,7 +2570,6 @@ export class InfrastructureStack extends cdk.Stack {
         'id.$': '$$.Execution.Input.itemId',
         'itemType': 'video',
         'metadata': {},
-        'mimirApiKey.$': '$$.Execution.Input.mimirApiKey',
       }),
       // Extract mimirDetails, proxyUrl, and the normalised videoDurationMs
       // (always a number, 0 when technicalMetadata hasn't populated yet).
@@ -2798,7 +2778,6 @@ export class InfrastructureStack extends cdk.Stack {
         'title.$': '$.compositedPoll.Payload.title',
         'outputUri.$': '$.compositedPoll.Payload.outputUri',
         'aspectRatio.$': '$.aspectRatio',
-        'mimirApiKey.$': '$$.Execution.Input.mimirApiKey',
       }),
       outputPath: '$.Payload',
     });
@@ -3092,7 +3071,6 @@ export class InfrastructureStack extends cdk.Stack {
         'id.$': '$$.Execution.Input.itemId',
         'itemType': 'video',
         'metadata': {},
-        'mimirApiKey.$': '$$.Execution.Input.mimirApiKey',
       }),
       resultSelector: {
         'mimirDetails.$': '$.Payload.mimirDetails',
@@ -3111,7 +3089,6 @@ export class InfrastructureStack extends cdk.Stack {
         'description.$': '$$.Execution.Input.description',
         'transcript.$': '$$.Execution.Input.transcript',
         'mimirDetails.$': '$.mimirDetails',
-        'mimirApiKey.$': '$$.Execution.Input.mimirApiKey',
       }),
       resultPath: '$.classification',
       outputPath: '$',
@@ -3417,7 +3394,6 @@ export class InfrastructureStack extends cdk.Stack {
         'title.$': '$$.Execution.Input.title',
         'outputUri.$': '$.stitchPoll.Payload.outputUri',
         'aspectRatio': '9:16',
-        'mimirApiKey.$': '$$.Execution.Input.mimirApiKey',
       }),
       outputPath: '$.Payload',
     });
@@ -3454,8 +3430,6 @@ export class InfrastructureStack extends cdk.Stack {
         'transcript.$': '$$.Execution.Input.transcript',
         'lottieTemplates.$': '$$.Execution.Input.lottieTemplates',
         'aspectRatios.$': '$$.Execution.Input.aspectRatios',
-        'mimirApiKey.$': '$$.Execution.Input.mimirApiKey',
-        'userToken.$': '$$.Execution.Input.userToken',
         'userId.$': '$$.Execution.Input.userId',
         'userEmail.$': '$$.Execution.Input.userEmail',
       }),
