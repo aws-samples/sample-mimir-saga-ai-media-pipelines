@@ -3,7 +3,7 @@ from strands import Agent
 from strands.models import BedrockModel
 from prompts import SCRIPT_ANALYSIS_PROMPT, SOURCE_MATERIAL_PROMPT, TIMELINE_ASSEMBLY_PROMPT
 from profiles import get_profile, DEFAULT_ROUGH_CUT_TYPE, ROUGH_CUT_PROFILES
-from tools import get_transcript, get_generated_transcript, query_embeddings, get_mimir_item_details, create_timeline, update_story_status, get_word_timing, generate_voiceover, upload_voiceover_to_mimir, create_or_update_linear_instance, _build_linear_instance_slate, sanitize_for_tts
+from tools import get_transcript, get_generated_transcript, query_embeddings, get_mimir_item_details, create_timeline, update_story_status, get_word_timing, generate_voiceover, upload_voiceover_to_mimir, create_or_update_linear_instance, _build_linear_instance_slate, sanitize_for_tts, synthesize_speech_mp3
 import json
 import logging
 import os
@@ -1211,7 +1211,6 @@ def _synthesize_voiceovers(
         Dict mapping str(orderIndex) → {mimirItemId, durationMs, s3Uri, sectionIndex, voiceoverSource}
     """
     bucket = os.environ.get("TRANSCRIPT_STAGING_BUCKET", "")
-    voice_id = os.environ.get("POLLY_VOICE_ID", "Matthew")
     mimir_api_key = None
 
     if vo_tags is None:
@@ -1254,15 +1253,8 @@ def _synthesize_voiceovers(
         logger.info(f"Synthesizing Polly VO for section {section_key}")
 
         try:
-            # 1. Call Polly
-            polly = boto3.client("polly")
-            polly_resp = polly.synthesize_speech(
-                Text=spoken_text,
-                OutputFormat="mp3",
-                Engine="neural",
-                VoiceId=voice_id,
-            )
-            audio_bytes = polly_resp["AudioStream"].read()
+            # 1. Call Polly (engine/voice from POLLY_ENGINE / POLLY_VOICE_ID)
+            audio_bytes = synthesize_speech_mp3(spoken_text)
 
             # 2. Upload to S3
             if not bucket:
