@@ -166,8 +166,11 @@ Deploy without a local development environment. A small CloudFormation stack cre
      --parameters \
        ParameterKey=MimirApiKey,ParameterValue='sakm....' \
        ParameterKey=SagaApiKey,ParameterValue='...' \
-       ParameterKey=MimirInstance,ParameterValue=us
+       ParameterKey=MimirInstance,ParameterValue=us \
+       ParameterKey=MimirAllowedIssuer,ParameterValue='https://cognito-idp.us-east-1.amazonaws.com/us-east-1_XXXXXXXXX'
    ```
+
+   `MimirAllowedIssuer` is required for the Mimir custom actions; see [Mimir custom action authentication](#mimir-custom-action-authentication).
 
    Or upload `scripts/deploy-pipeline.yaml` in the [CloudFormation console](https://console.aws.amazon.com/cloudformation/home#/stacks/create) and fill in the parameters.
 
@@ -205,10 +208,11 @@ Never pass API keys in `--environment-variables-override` as `PLAINTEXT`: overri
      { "ParameterKey": "MimirApiKey",   "ParameterValue": "sakm...." },
      { "ParameterKey": "SagaApiKey",    "ParameterValue": "..." },
      { "ParameterKey": "SagaApiUrl",    "ParameterValue": "https://<your-saga-api>/v1" },
-     { "ParameterKey": "MimirInstance", "ParameterValue": "us" }
+     { "ParameterKey": "MimirInstance", "ParameterValue": "us" },
+     { "ParameterKey": "MimirAllowedIssuer", "ParameterValue": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_XXXXXXXXX" }
    ]
    ```
-   Optional parameters: `SummaryFieldName`, `MimirAllowedIssuer`, `EnableTranscribeFallback`, `EnableEmbeddingsWebhook`, `EmbeddingsFilterField`, `EmbeddingsFilterValues`, `EmbeddingsFilterFieldKey` — see `parameters.example.json` for descriptions and [Embeddings Filter](#embeddings-filter-optional).
+   `MimirAllowedIssuer` is required for the Mimir custom actions (see [Mimir custom action authentication](#mimir-custom-action-authentication)). Optional parameters: `SummaryFieldName`, `MimirAllowedAudience`, `EnableTranscribeFallback`, `EnableEmbeddingsWebhook`, `EmbeddingsFilterField`, `EmbeddingsFilterValues`, `EmbeddingsFilterFieldKey` — see `parameters.example.json` for descriptions and [Embeddings Filter](#embeddings-filter-optional).
 3. Install dependencies:
    ```bash
    npm install
@@ -244,6 +248,14 @@ The following are automatically registered in Mimir on every deploy via a CDK cu
 - **Embed Video Content** webhook → `POST /webhook/item-embed` (triggers on video item creation; optionally filtered, see [Embeddings Filter](#embeddings-filter-optional))
 
 These are idempotent — safe to run on every deploy. If someone deletes them in the Mimir UI, the next deploy recreates them.
+
+#### Mimir custom action authentication
+
+Mimir sends the user's Cognito ID token with every custom action (`includeJWT`). `mimir-handler` accepts a request only when that token is signed by, and issued from, the user pool named in `MimirAllowedIssuer`. **While `MimirAllowedIssuer` is blank, every custom action is rejected with `401`**, and `cdk synth`/`cdk deploy` print a warning. Before this check was required, a blank value accepted tokens from any Cognito user pool, so anyone with an AWS account could mint a token and start the pipelines.
+
+To find your tenant's issuer, ask Mimir support, or trigger any custom action once and look for `unverified iss "https://cognito-idp...` in the `<prefix>-mimir-handler` CloudWatch log. That value comes from an unverified token, so confirm it is your Mimir tenant's pool before you use it. Then set it in `parameters.json`, or for the CodeBuild deployment pass `MSAI_PARAM_OVERRIDES='{"MimirAllowedIssuer":"https://cognito-idp..."}'`, and redeploy.
+
+Optionally set `MimirAllowedAudience` to your Mimir app client ID (the token's `aud` claim; comma-separate several) to also pin the audience.
 
 ### Embeddings Filter (Optional)
 
@@ -412,6 +424,8 @@ API authentication in this sample:
 - **Mimir Webhooks API**: every route requires the `x-mimir-webhook-token` header, checked by a Lambda authorizer before any integration runs (see [Webhook authentication](#webhook-authentication)).
 - **Mimir custom actions** (`/actions/*` handled by `mimir-handler`): each request must carry a valid Mimir-issued Cognito ID token (`includeJWT`). Set `MimirAllowedIssuer` to your Mimir tenant's issuer; if it is blank, a valid ID token from any Amazon Cognito user pool is accepted.
 - **Saga custom actions** (`/actions/generate-*`, `/actions/story-research`): the shared `SagaActionsApiKey` is checked in `saga-action-handler`.
+
+Mimir custom actions are authenticated by the Mimir user's Cognito ID token, pinned to the issuer in `MimirAllowedIssuer`; with no issuer configured they are all rejected (see [Mimir custom action authentication](#mimir-custom-action-authentication)).
 
 ## License
 

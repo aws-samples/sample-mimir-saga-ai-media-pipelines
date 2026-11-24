@@ -1,17 +1,25 @@
-// Run with: node --test   (from lambda/mimir-handler)
+// Run with: npm ci && node --test   (from lambda/mimir-handler)
 //
-// Proves that no StartExecution input built by mimir-handler carries the Mimir
-// API key or the caller's userToken, and that the token is not logged. AWS SDK
-// clients and the JWT verifier are replaced with in-process fakes, so the test
-// needs no network, no credentials and no `npm ci`.
+// - No StartExecution input built by mimir-handler carries the Mimir API key
+//   or the caller's userToken, and the token is not logged.
+// - A missing or malformed body gets a 400 before any token work.
+// - The issuer pin fails closed: no MIMIR_ALLOWED_ISSUER, no access. The
+//   audience pin, signature and token_use checks hold.
+// Step Functions and Secrets Manager are in-process fakes, so nothing touches
+// AWS. The input and body tests also fake the JWT verifier. The issuer tests
+// use the real aws-jwt-verify with a throwaway RSA key whose JWKS is seeded
+// with cacheJwks(), so they need no network either.
 const { describe, it, before, beforeEach, after } = require('node:test');
 const assert = require('node:assert/strict');
 const Module = require('node:module');
+const crypto = require('node:crypto');
 
 const FAKE_KEY = 'FAKE-MIMIR-KEY-123';
 const startCalls = [];
 let secretReads = 0;
 let tokenChecks = 0;
+// true: aws-jwt-verify is replaced by a fake that accepts any token.
+let fakeVerifier = true;
 
 const fakes = {
   '@aws-sdk/client-sfn': {
@@ -27,46 +35,67 @@ const fakes = {
   },
 };
 
+const originalLoad = Module._load;
+Module._load = function (request, ...rest) {
+  if (request === 'aws-jwt-verify' && !fakeVerifier) return originalLoad.call(this, request, ...rest);
+  return Object.prototype.hasOwnProperty.call(fakes, request) ? fakes[request] : originalLoad.call(this, request, ...rest);
+};
+
+process.env.SUMMARIZER_STATE_MACHINE_ARN = 'arn:fake:stateMachine:summarizer';
+process.env.CHAPTERIZE_STATE_MACHINE_ARN = 'arn:fake:stateMachine:chapterize';
+process.env.VERTICAL_REFRAME_STATE_MACHINE_ARN = 'arn:fake:stateMachine:reframe';
+process.env.REFRAME_WITH_GRAPHICS_STATE_MACHINE_ARN = 'arn:fake:stateMachine:reframe-graphics';
+process.env.REFRAME_CUSTOM_STATE_MACHINE_ARN = 'arn:fake:stateMachine:reframe-custom';
+process.env.MIMIR_API_KEY_SECRET_ARN = 'arn:fake:secret:mimir';
+
+const TEST_ISSUER = 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_TESTPOOL';
+const MIMIR_ISSUER = 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_MimirPool1';
+const ATTACKER_ISSUER = 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_Attacker99';
+const CLIENT_ID = 'mimirappclient000000000001';
+
+/** Loads a fresh copy of the handler with the given env (env is read at load). */
+function load({ issuer = '', audience = '', real = false } = {}) {
+  process.env.MIMIR_ALLOWED_ISSUER = issuer;
+  process.env.MIMIR_ALLOWED_AUDIENCE = audience;
+  fakeVerifier = !real;
+  delete require.cache[require.resolve('./index.js')];
+  const mod = require('./index.js');
+  if (real && issuer) mod._getVerifier(issuer).cacheJwks({ keys: [jwk] });
+  return mod;
+}
+
 const b64url = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
 const FAKE_TOKEN = [
   b64url({ alg: 'RS256' }),
-  b64url({ iss: 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_TESTPOOL', token_use: 'id' }),
+  b64url({ iss: TEST_ISSUER, token_use: 'id' }),
   'FAKE-SIGNATURE-456',
 ].join('.');
 
-let handler;
-let redactEventForLog;
-const originalLoad = Module._load;
-const originalLog = console.log;
-const originalWarn = console.warn;
-let logged = '';
+const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+const jwk = { ...publicKey.export({ format: 'jwk' }), kid: 'test-kid', alg: 'RS256', use: 'sig' };
+function sign(claims) {
+  const now = Math.floor(Date.now() / 1000);
+  const head = b64url({ alg: 'RS256', kid: 'test-kid', typ: 'JWT' });
+  const body = b64url({ sub: 'user-1', token_use: 'id', aud: CLIENT_ID, iat: now, exp: now + 3600, ...claims });
+  const sig = crypto.sign('RSA-SHA256', Buffer.from(`${head}.${body}`), privateKey).toString('base64url');
+  return `${head}.${body}.${sig}`;
+}
 
-before(() => {
-  Module._load = function (request, ...rest) {
-    return Object.prototype.hasOwnProperty.call(fakes, request) ? fakes[request] : originalLoad.call(this, request, ...rest);
-  };
-  process.env.SUMMARIZER_STATE_MACHINE_ARN = 'arn:fake:stateMachine:summarizer';
-  process.env.CHAPTERIZE_STATE_MACHINE_ARN = 'arn:fake:stateMachine:chapterize';
-  process.env.VERTICAL_REFRAME_STATE_MACHINE_ARN = 'arn:fake:stateMachine:reframe';
-  process.env.REFRAME_WITH_GRAPHICS_STATE_MACHINE_ARN = 'arn:fake:stateMachine:reframe-graphics';
-  process.env.REFRAME_CUSTOM_STATE_MACHINE_ARN = 'arn:fake:stateMachine:reframe-custom';
-  process.env.MIMIR_API_KEY_SECRET_ARN = 'arn:fake:secret:mimir';
-  ({ handler, redactEventForLog } = require('./index.js'));
-});
+const originalConsole = { log: console.log, warn: console.warn, error: console.error, info: console.info };
+let logs = [];
+const logged = () => logs.join('\n');
 
 after(() => {
   Module._load = originalLoad;
-  console.log = originalLog;
-  console.warn = originalWarn;
+  Object.assign(console, originalConsole);
 });
 
 beforeEach(() => {
   startCalls.length = 0;
   secretReads = 0;
   tokenChecks = 0;
-  logged = '';
-  console.log = (...args) => { logged += args.map(String).join(' ') + '\n'; };
-  console.warn = console.log;
+  logs = [];
+  for (const l of ['log', 'warn', 'error', 'info']) console[l] = (...a) => logs.push(a.map(String).join(' '));
 });
 
 function apiEvent(action, body) {
@@ -90,6 +119,9 @@ const CASES = [
 ];
 
 describe('mimir-handler StartExecution input', () => {
+  let handler;
+  before(() => { ({ handler } = load({ issuer: TEST_ISSUER })); });
+
   for (const { action, keys } of CASES) {
     it(`${action}: no mimirApiKey or userToken in the execution input`, async () => {
       const res = await handler(apiEvent(action, { items: [video], actionData: { title: 'T' } }));
@@ -102,7 +134,7 @@ describe('mimir-handler StartExecution input', () => {
       assert.ok(!raw.includes(FAKE_KEY), 'API key must not be in execution input');
       assert.ok(!raw.includes(FAKE_TOKEN), 'user token must not be in execution input');
       assert.equal(secretReads, 0, 'mimir-handler no longer needs to read the Mimir key');
-      assert.ok(!logged.includes(FAKE_TOKEN), 'user token must not be logged');
+      assert.ok(!logged().includes(FAKE_TOKEN), 'user token must not be logged');
     });
   }
 
@@ -114,6 +146,9 @@ describe('mimir-handler StartExecution input', () => {
 });
 
 describe('redactEventForLog', () => {
+  let redactEventForLog;
+  before(() => { ({ redactEventForLog } = load({ issuer: TEST_ISSUER })); });
+
   it('redacts userToken in the body and credential headers', () => {
     const out = redactEventForLog({
       headers: { authorization: 'Bearer x', 'X-API-Key': 'k', Accept: 'a' },
@@ -133,6 +168,9 @@ describe('redactEventForLog', () => {
 });
 
 describe('mimir-handler malformed body', () => {
+  let handler;
+  before(() => { ({ handler } = load({ issuer: TEST_ISSUER })); });
+
   // A body marker that must never reach the logs or the response.
   const MARKER = 'BODY-MARKER-789';
   const BAD = [
@@ -157,7 +195,7 @@ describe('mimir-handler malformed body', () => {
       assert.equal(tokenChecks, 0, 'token must not be checked');
       assert.equal(startCalls.length, 0, 'no execution may start');
       assert.equal(secretReads, 0);
-      assert.ok(!logged.includes(MARKER), 'body must not be logged');
+      assert.ok(!logged().includes(MARKER), 'body must not be logged');
       assert.ok(!res.body.includes(MARKER), 'body must not be echoed');
     });
   }
@@ -166,5 +204,75 @@ describe('mimir-handler malformed body', () => {
     const res = await handler(apiEvent('summarizer', { items: [] }));
     assert.equal(res.statusCode, 200);
     assert.equal(tokenChecks, 1);
+  });
+
+  it('a malformed body is a 400 even with no issuer configured', async () => {
+    const mod = load({ issuer: '' });
+    const res = await mod.handler({ resource: '/actions/summarizer', headers: {}, body: '' });
+    assert.equal(res.statusCode, 400);
+    assert.equal(tokenChecks, 0);
+  });
+});
+
+const actionEvent = (userToken) => ({
+  resource: '/actions/summarizer',
+  body: JSON.stringify({ items: [{ id: 'i1', itemType: 'video' }], userToken, userEmail: 'u@example.com' }),
+});
+
+describe('mimir-handler issuer pin (real verifier)', () => {
+  it('no issuer configured: a valid Mimir token is rejected (fail closed)', async () => {
+    const mod = load({ issuer: '', real: true });
+    await assert.rejects(mod.validateMimirUserToken(sign({ iss: MIMIR_ISSUER })), /MIMIR_ALLOWED_ISSUER is not configured/);
+  });
+
+  it('no issuer configured: handler returns 401 and starts no execution', async () => {
+    const mod = load({ issuer: '', real: true });
+    const res = await mod.handler(actionEvent(sign({ iss: MIMIR_ISSUER })));
+    assert.equal(res.statusCode, 401);
+    assert.equal(startCalls.length, 0);
+  });
+
+  it('wrong issuer (attacker-owned Cognito pool) is rejected before any JWKS fetch', async () => {
+    const mod = load({ issuer: MIMIR_ISSUER, real: true });
+    await assert.rejects(mod.validateMimirUserToken(sign({ iss: ATTACKER_ISSUER })), /Token issuer not allowed/);
+    const res = await mod.handler(actionEvent(sign({ iss: ATTACKER_ISSUER })));
+    assert.equal(res.statusCode, 401);
+    assert.equal(startCalls.length, 0);
+  });
+
+  it('right issuer, valid signature: accepted and the execution starts', async () => {
+    const mod = load({ issuer: MIMIR_ISSUER, real: true });
+    const claims = await mod.validateMimirUserToken(sign({ iss: MIMIR_ISSUER }));
+    assert.equal(claims.iss, MIMIR_ISSUER);
+    const res = await mod.handler(actionEvent(sign({ iss: MIMIR_ISSUER })));
+    assert.equal(res.statusCode, 200);
+    assert.equal(startCalls.length, 1);
+  });
+
+  it('right issuer but forged signature is rejected', async () => {
+    const mod = load({ issuer: MIMIR_ISSUER, real: true });
+    const [h, b] = sign({ iss: MIMIR_ISSUER }).split('.');
+    const other = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey;
+    const forged = `${h}.${b}.${crypto.sign('RSA-SHA256', Buffer.from(`${h}.${b}`), other).toString('base64url')}`;
+    await assert.rejects(mod.validateMimirUserToken(forged));
+  });
+
+  it('right issuer, access token (token_use != id) is rejected', async () => {
+    const mod = load({ issuer: MIMIR_ISSUER, real: true });
+    await assert.rejects(mod.validateMimirUserToken(sign({ iss: MIMIR_ISSUER, token_use: 'access' })));
+  });
+
+  it('audience pinned: matching client ID accepted, other client ID rejected', async () => {
+    const mod = load({ issuer: MIMIR_ISSUER, audience: `other-client, ${CLIENT_ID}`, real: true });
+    await mod.validateMimirUserToken(sign({ iss: MIMIR_ISSUER }));
+    await assert.rejects(mod.validateMimirUserToken(sign({ iss: MIMIR_ISSUER, aud: 'not-mimir' })));
+  });
+
+  it('the request log never contains the signed user token', async () => {
+    const mod = load({ issuer: MIMIR_ISSUER, real: true });
+    const token = sign({ iss: MIMIR_ISSUER });
+    await mod.handler(actionEvent(token));
+    assert.ok(!logged().includes(token));
+    assert.ok(!logged().includes(token.split('.')[2]));
   });
 });

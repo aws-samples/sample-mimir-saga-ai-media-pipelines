@@ -50,7 +50,7 @@ Metadata:
       EnableTranscribeFallback:
         default: "Enable Transcribe Fallback"
       MimirAllowedIssuer:
-        default: "Allowed Cognito Issuer (optional)"
+        default: "Allowed Cognito Issuer (required for custom actions)"
       ProductName:
         default: "Product Name"
       VisibilityGroupMap:
@@ -120,10 +120,12 @@ Parameters:
   MimirAllowedIssuer:
     Type: String
     Default: ''
+    AllowedPattern: '^$|^https://cognito-idp\.[a-z0-9-]+\.amazonaws\.com/[A-Za-z0-9_-]+$'
+    ConstraintDescription: 'Must be blank or https://cognito-idp.<region>.amazonaws.com/<userPoolId>'
     Description: >
-      Optional. Pin the Cognito issuer URL allowed to invoke custom actions
-      (e.g., https://cognito-idp.us-east-1.amazonaws.com/us-east-1_XXXXXXXXX).
-      Leave blank to accept any valid AWS Cognito issuer.
+      Required for Mimir custom actions: the Cognito issuer URL of your Mimir
+      tenant (e.g., https://cognito-idp.us-east-1.amazonaws.com/us-east-1_XXXXXXXXX).
+      While blank, every custom action is rejected with 401.
 
   ProductName:
     Type: String

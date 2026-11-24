@@ -3,10 +3,20 @@ const { JwtRsaVerifier } = require('aws-jwt-verify');
 
 const sfnClient = new SFNClient();
 
-// Optional issuer pinning: if MIMIR_ALLOWED_ISSUER is set, only tokens from that
-// exact Cognito issuer are accepted. If unset, any AWS Cognito issuer is allowed
-// (the token must still be signature-valid, unexpired, and a Cognito ID token).
-const ALLOWED_ISSUER = process.env.MIMIR_ALLOWED_ISSUER || '';
+// Required: the Cognito issuer of your Mimir tenant's user pool. Only tokens from
+// this exact issuer are accepted. When it is unset, EVERY request is rejected:
+// any AWS account can create a Cognito pool and mint valid ID tokens, so
+// "any Cognito issuer" is no authentication at all.
+const ALLOWED_ISSUER = (process.env.MIMIR_ALLOWED_ISSUER || '').trim();
+// Optional: comma-separated Mimir app client IDs (the token's `aud` claim).
+// Blank means the audience is not checked.
+const ALLOWED_AUDIENCE = (process.env.MIMIR_ALLOWED_AUDIENCE || '')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+const COGNITO_ISSUER_RE = /^https:\/\/cognito-idp\.[a-z0-9-]+\.amazonaws\.com\/[A-Za-z0-9_-]+$/;
+
+if (!ALLOWED_ISSUER) {
+  console.error('MIMIR_ALLOWED_ISSUER is not set: all Mimir custom actions will be rejected (401) until MimirAllowedIssuer is configured and the stack redeployed.');
+}
 
 // Cache one JWT verifier per issuer (JWKS is fetched and cached by the verifier).
 const verifierCache = {};
@@ -15,11 +25,14 @@ function getVerifier(issuer) {
     verifierCache[issuer] = JwtRsaVerifier.create({
       issuer,
       jwksUri: `${issuer}/.well-known/jwks.json`,
-      audience: null, // Mimir app client ID varies per tenant; audience not pinned
+      audience: ALLOWED_AUDIENCE.length ? ALLOWED_AUDIENCE : null,
     });
   }
   return verifierCache[issuer];
 }
+
+// Issuer strings come from an unverified token: quote and cap them in messages.
+const quoteIssuer = (iss) => JSON.stringify(String(iss).slice(0, 200));
 
 /**
  * Validates the Mimir-issued user JWT (sent when a custom action has
@@ -37,11 +50,13 @@ async function validateMimirUserToken(userToken) {
   const claims = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf-8'));
   const issuer = claims.iss;
 
-  if (!issuer || !/^https:\/\/cognito-idp\.[a-z0-9-]+\.amazonaws\.com\/[A-Za-z0-9_-]+$/.test(issuer)) {
-    throw new Error(`Untrusted token issuer: ${issuer}`);
+  if (!ALLOWED_ISSUER) {
+    // Fail closed. The (unverified) issuer is logged so an operator can find
+    // their tenant's value; confirm it belongs to your Mimir tenant first.
+    throw new Error(`MIMIR_ALLOWED_ISSUER is not configured; rejecting token (unverified iss ${quoteIssuer(issuer)})`);
   }
-  if (ALLOWED_ISSUER && issuer !== ALLOWED_ISSUER) {
-    throw new Error(`Token issuer not allowed: ${issuer}`);
+  if (!issuer || issuer !== ALLOWED_ISSUER || !COGNITO_ISSUER_RE.test(issuer)) {
+    throw new Error(`Token issuer not allowed: ${quoteIssuer(issuer)}`);
   }
 
   // Verify signature + expiry against the issuer's JWKS.
@@ -116,6 +131,8 @@ function buildReframeGraphicsOverrides(actionData) {
 // Exported for unit tests
 module.exports.buildReframeGraphicsOverrides = buildReframeGraphicsOverrides;
 module.exports.redactEventForLog = redactEventForLog;
+module.exports.validateMimirUserToken = validateMimirUserToken;
+module.exports._getVerifier = getVerifier;
 
 /**
  * Check the raw API Gateway body before any token or Mimir work. Returns

@@ -27,7 +27,12 @@
   {
     "ParameterKey": "MimirAllowedIssuer",
     "ParameterValue": "",
-    "Description": "Optional. Pin the Cognito issuer URL allowed to invoke custom actions (e.g. https://cognito-idp.us-east-1.amazonaws.com/us-east-1_XXXXXXXXX). Leave blank to accept any valid AWS Cognito issuer — tokens must still be signature-valid, unexpired Cognito ID tokens. Set this to lock the API to your specific Mimir tenant."
+    "Description": "Required for Mimir custom actions. The Cognito issuer URL of your Mimir tenant's user pool, e.g. https://cognito-idp.us-east-1.amazonaws.com/us-east-1_XXXXXXXXX. While blank, every custom action is rejected with 401 and cdk synth/deploy prints a warning. To find it, ask Mimir support, or run a custom action once and read the 'unverified iss' value in the mimir-handler log (confirm it is your tenant's pool before using it)."
+  },
+  {
+    "ParameterKey": "MimirAllowedAudience",
+    "ParameterValue": "",
+    "Description": "Optional. Comma-separated Mimir app client IDs (the ID token's 'aud' claim) to accept. Leave blank to skip the audience check; the issuer check still applies."
   },
   {
     "ParameterKey": "EnableTranscribeFallback",
