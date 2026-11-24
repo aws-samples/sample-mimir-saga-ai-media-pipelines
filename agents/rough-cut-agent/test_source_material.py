@@ -339,3 +339,51 @@ class TestRunSourceMaterial:
         # Verify the agent was called — message contains asset info
         call_args = agent_instance.call_args[0][0]
         assert "item-x" in call_args
+
+
+class TestSourceMaterialNormalisation:
+    def test_null_optional_enums_treated_as_absent(self):
+        data = _valid_source_material()
+        cand = data["candidateSegments"][0]["candidates"][0]
+        cand.update({"trackPlacement": None, "audioType": None, "voiceoverSource": "", "matchConfidence": None})
+        _validate_source_material(data)
+        for key in ("trackPlacement", "audioType", "voiceoverSource", "matchConfidence"):
+            assert key not in cand
+
+    def test_enum_case_and_whitespace_normalised(self):
+        data = _valid_source_material()
+        cand = data["candidateSegments"][0]["candidates"][0]
+        cand.update({"trackPlacement": "V2_BROLL", "audioType": " Nats ", "matchConfidence": "High",
+                     "voiceoverSource": "Polly-Generated"})
+        _validate_source_material(data)
+        assert (cand["trackPlacement"], cand["audioType"], cand["matchConfidence"], cand["voiceoverSource"]) == \
+            ("v2_broll", "nats", "high", "polly_generated")
+
+    def test_coverage_numeric_string_and_null(self):
+        data = _valid_source_material()
+        data["coveragePercentage"] = "87.5"
+        _validate_source_material(data)
+        assert data["coveragePercentage"] == 87.5
+        data["coveragePercentage"] = None
+        _validate_source_material(data)
+        assert data["coveragePercentage"] == 0
+
+    def test_unknown_enum_still_raises(self):
+        data = _valid_source_material()
+        data["candidateSegments"][0]["candidates"][0]["audioType"] = "music"
+        with pytest.raises(ValueError, match="audioType"):
+            _validate_source_material(data)
+
+
+class TestSourceMaterialRetry:
+    @patch("rough_cut_agent.Agent")
+    @patch("rough_cut_agent.BedrockModel")
+    def test_retries_once_on_schema_violation(self, mock_bedrock_cls, mock_agent_cls):
+        agent_instance = MagicMock()
+        agent_instance.side_effect = [json.dumps({"candidateSegments": "not a list"}),
+                                      json.dumps(_valid_source_material())]
+        mock_agent_cls.return_value = agent_instance
+
+        result = run_source_material(_valid_script_analysis(), _enriched_assets())
+        assert isinstance(result["candidateSegments"], list)
+        assert agent_instance.call_count == 2
