@@ -11,6 +11,7 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import { Construct } from 'constructs';
+import { valueLessSecret } from './constructs/value-less-secret';
 
 
 export interface SagaFeedsStackProps extends cdk.StackProps {
@@ -27,23 +28,13 @@ export class SagaFeedsStack extends cdk.Stack {
     // Resource naming prefix derived from the product acronym (e.g. "msai")
     const resourcePrefix = props.acronym.toLowerCase();
 
-    // Read configuration from CDK context (populated from parameters.json in bin/)
-    const sagaApiUrl = this.node.tryGetContext('sagaApiUrl') || 'https://us.mjoll.no';
-    const sagaApiKey = this.node.tryGetContext('sagaApiKey') || 'placeholder-update-after-deployment';
-
     // Table name prefixed to avoid collisions in shared accounts
     const sagaFeedItemsTableName = `${resourcePrefix}-saga-feed-items`;
 
-    // Create Saga secrets
-    const sagaApiKeySecret = new secretsmanager.Secret(this, 'SagaApiKey', {
-      description: 'API key for calling Saga API',
-      secretStringValue: cdk.SecretValue.unsafePlainText(sagaApiKey),
-    });
-
-    const sagaApiUrlSecret = new secretsmanager.Secret(this, 'SagaApiUrl', {
-      description: 'Base URL for Saga API',
-      secretStringValue: cdk.SecretValue.unsafePlainText(sagaApiUrl),
-    });
+    // Saga secrets. Their values are NOT in this template: deploy.sh writes them
+    // from parameters.json after deploying this stack (scripts/sync-api-key-secrets.js).
+    const sagaApiKeySecret = valueLessSecret(this, 'SagaApiKey', 'API key for calling Saga API');
+    const sagaApiUrlSecret = valueLessSecret(this, 'SagaApiUrl', 'Base URL for Saga API');
 
     // Import Mimir API key secret from InfrastructureStack via Parameter Store
     const mimirApiKeySecretArn = ssm.StringParameter.valueForStringParameter(

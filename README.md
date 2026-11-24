@@ -395,11 +395,13 @@ npx cdk destroy --all
 
 S3 buckets created by this sample use `autoDeleteObjects`, so their contents are removed with the stacks. Also remove the custom actions/webhooks registered in Mimir and the custom actions configured in Saga if you no longer need them.
 
+The Mimir/Saga API key secrets are retained when the stacks are deleted, so a stack update can never delete a key. Delete them yourself when you are done (Secrets Manager console, descriptions "API key for calling Mimir API", "API key for calling Saga API" and "Base URL for Saga API").
+
 ## Security
 
 See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
 
-This sample is intended for evaluation in non-production environments. Review IAM policies, S3 bucket policies, and API authentication settings before adapting it for production use. API keys for Mimir and Saga are stored in AWS Secrets Manager; the `parameters.json` file containing your keys is gitignored and must never be committed.
+This sample is intended for evaluation in non-production environments. Review IAM policies, S3 bucket policies, and API authentication settings before adapting it for production use. API keys for Mimir and Saga are stored in AWS Secrets Manager; the `parameters.json` file containing your keys is gitignored and must never be committed. The keys are not part of any CloudFormation template: the stacks create the secrets empty, and `deploy.sh` writes the values from `parameters.json` with `PutSecretValue` (`scripts/sync-api-key-secrets.js`). To change a key, update `parameters.json` (or the SSM config parameter for the CodeBuild deployment) and redeploy. The deploying identity needs `secretsmanager:GetSecretValue` and `secretsmanager:PutSecretValue` on these secrets.
 
 API authentication in this sample:
 

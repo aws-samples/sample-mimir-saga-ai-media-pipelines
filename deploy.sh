@@ -101,13 +101,36 @@ echo "📦 Deploying ${STACK_PREFIX}-ObservabilityStack..."
 npx cdk deploy "${STACK_PREFIX}-ObservabilityStack" --require-approval never
 
 echo "📦 Deploying ${STACK_PREFIX}-CoreStack (creates secrets and SSM parameters)..."
-npx cdk deploy "${STACK_PREFIX}-CoreStack" --require-approval never
+# The API key secrets are created without a value, so the keys never land in a
+# CloudFormation template. scripts/sync-api-key-secrets.js writes them from
+# parameters.json. For an existing stack, sync before the deploy too, so the
+# Mimir registration custom resource runs with the current key.
+sync_api_keys() { AWS_REGION="${AWS_REGION:-$REGION}" node scripts/sync-api-key-secrets.js "$@"; }
+CORE_STACK="${STACK_PREFIX}-CoreStack"
+if aws cloudformation describe-stacks --stack-name "$CORE_STACK" >/dev/null 2>&1; then
+  CORE_STACK_EXISTED=true
+  echo "🔑 Syncing API keys into ${CORE_STACK} secrets (pre-deploy)..."
+  sync_api_keys "$CORE_STACK"
+else
+  CORE_STACK_EXISTED=false
+fi
+npx cdk deploy "$CORE_STACK" --require-approval never
+echo "🔑 Syncing API keys into ${CORE_STACK} secrets..."
+sync_api_keys "$CORE_STACK"
+if [ "$CORE_STACK_EXISTED" = false ]; then
+  # On a first deploy the secrets were empty while the Mimir registration custom
+  # resource ran, so it skipped registration. Deploy once more to register.
+  echo "📦 Re-deploying ${CORE_STACK} to register Mimir integrations with the API key..."
+  npx cdk deploy "$CORE_STACK" --require-approval never
+fi
 
 echo "📦 Deploying ${STACK_PREFIX}-AgentCoreStack (reads secret ARNs from SSM)..."
 npx cdk deploy "${STACK_PREFIX}-AgentCoreStack" --require-approval never
 
 echo "📦 Deploying ${STACK_PREFIX}-SagaFeedsStack (imports Mimir API key from SSM)..."
 npx cdk deploy "${STACK_PREFIX}-SagaFeedsStack" --require-approval never
+echo "🔑 Syncing Saga API key and URL into ${STACK_PREFIX}-SagaFeedsStack secrets..."
+sync_api_keys "${STACK_PREFIX}-SagaFeedsStack"
 
 echo "📦 Deploying ${STACK_PREFIX}-McpGatewayStack (AgentCore Gateway + Cognito auth)..."
 echo "⏳ Waiting for AgentCore runtimes to warm up..."
