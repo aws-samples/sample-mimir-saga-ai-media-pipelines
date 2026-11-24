@@ -896,21 +896,67 @@ export class InfrastructureStack extends cdk.Stack {
     generatePackageResource.addMethod('POST', new apigateway.LambdaIntegration(sagaActionHandler));
 
     // Mimir Webhooks API Gateway
+    //
+    // Server-to-server only: Mimir calls these routes, no browser does, so there
+    // is no CORS. Every method requires the WebhookTokenAuthorizer below, which
+    // checks the x-mimir-webhook-token header against a generated secret before
+    // any integration (Lambda or Step Functions) runs. Mimir can only send static
+    // custom headers on webhooks (no request signing), so a shared token is the
+    // strongest credential it can present; register-mimir-integrations sets it
+    // on every Mimir webhook that targets this API.
+    const webhookTokenSecret = new secretsmanager.Secret(this, 'MimirWebhookToken', {
+      description: 'Shared token Mimir sends in the x-mimir-webhook-token header on every webhook call. Set automatically on Mimir webhooks by the MimirIntegrationsRegistration custom resource.',
+      generateSecretString: {
+        excludePunctuation: true,
+        passwordLength: 64,
+      },
+    });
+
+    const webhookAuthorizerHandler = new lambda.Function(this, 'WebhookTokenAuthorizerHandler', {
+      functionName: `${resourcePrefix}-webhook-authorizer`,
+      runtime: lambda.Runtime.NODEJS_24_X,
+      handler: 'index.handler',
+      code: lambda.Code.fromAsset(path.join(__dirname, '../lambda/webhook-authorizer')),
+      timeout: cdk.Duration.seconds(10),
+      environment: {
+        WEBHOOK_TOKEN_SECRET_ARN: webhookTokenSecret.secretArn,
+      },
+    });
+    webhookTokenSecret.grantRead(webhookAuthorizerHandler);
+
+    const webhookAuthorizer = new apigateway.RequestAuthorizer(this, 'WebhookTokenAuthorizer', {
+      handler: webhookAuthorizerHandler,
+      // A missing header is rejected by API Gateway with 401 before the
+      // authorizer Lambda is even invoked.
+      identitySources: [apigateway.IdentitySource.header('x-mimir-webhook-token')],
+      resultsCacheTtl: cdk.Duration.minutes(5),
+    });
+
+    // Plain string (not a Stage Ref) so the registration custom resource can
+    // build the URL without depending on the Stage; see webhookApiBaseUrl.
+    const webhookStageName = 'prod';
     const webhookApiLogGroup = new logs.LogGroup(this, 'MimirWebhooksApiLogs', { retention: logs.RetentionDays.ONE_MONTH });
     const webhookApi = new apigateway.RestApi(this, 'ItemChangeWebhookApi', {
       restApiName: 'Mimir Webhooks API',
       description: 'API Gateway for all Mimir webhooks',
       deployOptions: {
-        stageName: 'prod',
+        stageName: webhookStageName,
         accessLogDestination: new apigateway.LogGroupLogDestination(webhookApiLogGroup),
         accessLogFormat: apigateway.AccessLogFormat.jsonWithStandardFields(),
         loggingLevel: apigateway.MethodLoggingLevel.INFO,
+        // Never log full request data: it would put the token header in CloudWatch.
+        dataTraceEnabled: false,
         tracingEnabled: true,
+        // Second guard behind the authorizer: caps what anyone, including a
+        // caller with a leaked token, can push into the pipelines.
+        // shortcut: fixed limits sized for webhook traffic; raise them for
+        // large bulk ingests (Mimir gets 429s above the burst).
+        throttlingRateLimit: 50,
+        throttlingBurstLimit: 100,
       },
-      defaultCorsPreflightOptions: {
-        allowOrigins: apigateway.Cors.ALL_ORIGINS,
-        allowMethods: apigateway.Cors.ALL_METHODS,
-        allowHeaders: ['Content-Type', 'X-API-Key', 'Authorization'],
+      defaultMethodOptions: {
+        authorizer: webhookAuthorizer,
+        authorizationType: apigateway.AuthorizationType.CUSTOM,
       },
     });
 
@@ -3691,14 +3737,23 @@ export class InfrastructureStack extends cdk.Stack {
       },
     });
     mimirApiKeySecret.grantRead(registerIntegrationsHandler);
+    webhookTokenSecret.grantRead(registerIntegrationsHandler);
+
+    // Built from the RestApi id rather than webhookApi.url so the custom resource
+    // does not depend on the webhook Stage. That lets the Stage depend on the
+    // custom resource (below): CloudFormation first puts the token header on the
+    // Mimir webhooks, and only then deploys the Stage that starts enforcing it.
+    // The old Stage ignores the extra header, so no webhook is rejected in between.
+    const webhookApiBaseUrl = `https://${webhookApi.restApiId}.execute-api.${this.region}.${this.urlSuffix}/${webhookStageName}/`;
 
     const registerIntegrations = new cdk.CustomResource(this, 'MimirIntegrationsRegistration', {
       serviceToken: registerIntegrationsHandler.functionArn,
       properties: {
         MimirApiKeySecretArn: mimirApiKeySecret.secretArn,
+        WebhookTokenSecretArn: webhookTokenSecret.secretArn,
         MimirBaseUrl: mimirBaseUrl,
         ActionsApiUrl: api.url + 'actions/',
-        WebhookApiUrl: webhookApi.url,
+        WebhookApiUrl: webhookApiBaseUrl,
         // '' = one unfiltered embed webhook; else one filtered webhook per value
         EmbeddingsFilter: embeddingsFilter ? JSON.stringify(embeddingsFilter) : '',
         EmbeddingsWebhookEnabled: String(enableEmbeddingsWebhook),
@@ -3706,6 +3761,7 @@ export class InfrastructureStack extends cdk.Stack {
         DeployTimestamp: Date.now().toString(),
       },
     });
+    webhookApi.deploymentStage.node.addDependency(registerIntegrations);
 
     // Outputs
 
@@ -3791,6 +3847,13 @@ export class InfrastructureStack extends cdk.Stack {
       parameterName: '/infrastructure/webhook-api-base-url',
       stringValue: webhookApi.url,
       description: 'Base URL of the Mimir Webhooks API Gateway',
+    });
+
+    // ARN (not value) of the webhook token, for scripts/create-mimir-webhook.sh
+    new ssm.StringParameter(this, 'WebhookTokenSecretArnParameter', {
+      parameterName: '/infrastructure/webhook-token-secret-arn',
+      stringValue: webhookTokenSecret.secretArn,
+      description: 'ARN of the secret Mimir sends in the x-mimir-webhook-token header',
     });
 
     new cdk.CfnOutput(this, 'OutputBucketName', {

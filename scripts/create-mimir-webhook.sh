@@ -132,36 +132,44 @@ if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
     exit 0
 fi
 
-# Create the webhook
-RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "https://${MIMIR_INSTANCE}.mjoll.no/config/api/v1/config/webhooks" \
-  -H "Accept: application/json" \
-  -H "Content-Type: application/json" \
-  -H "x-mimir-cognito-id-token: Bearer $API_KEY" \
-  -d '{
-    "protected": false,
-    "type": "'"$WEBHOOK_TYPE"'",
-    "url": "'"$WEBHOOK_URL"'",
-    "label": "'"$LABEL"'",
-    "condition": {
-      "criteria": "always"
-    },
-    "headers": [
-      {
-        "headerField": "Content-Type",
-        "headerValue": "application/json"
-      }
-    ]
-  }')
+# The webhook API rejects requests without the x-mimir-webhook-token header.
+# Read the token from Secrets Manager. It is passed to curl on stdin, never
+# printed or put on a command line.
+TOKEN_SECRET_ARN=$(aws ssm get-parameter --name "/infrastructure/webhook-token-secret-arn" --query "Parameter.Value" --output text 2>/dev/null) || true
+if [ -z "$TOKEN_SECRET_ARN" ] || [ "$TOKEN_SECRET_ARN" = "None" ]; then
+    echo "Error: could not read /infrastructure/webhook-token-secret-arn from Parameter Store."
+    echo "Deploy the stack first (each deploy also adds the header to existing webhooks)."
+    exit 1
+fi
+WEBHOOK_TOKEN=$(aws secretsmanager get-secret-value --secret-id "$TOKEN_SECRET_ARN" --query SecretString --output text)
+
+# Create the webhook. jq builds the JSON so the label and URL are escaped.
+RESPONSE=$(WEBHOOK_TOKEN="$WEBHOOK_TOKEN" jq -n \
+    --arg type "$WEBHOOK_TYPE" --arg url "$WEBHOOK_URL" --arg label "$LABEL" \
+    '{protected: false, type: $type, url: $url, label: $label,
+      condition: {criteria: "always"},
+      headers: [
+        {headerField: "Content-Type", headerValue: "application/json"},
+        {headerField: "x-mimir-webhook-token", headerValue: env.WEBHOOK_TOKEN}
+      ]}' \
+  | curl -s -w "\n%{http_code}" -X POST "https://${MIMIR_INSTANCE}.mjoll.no/config/api/v1/config/webhooks" \
+      -H "Accept: application/json" \
+      -H "Content-Type: application/json" \
+      -H "x-mimir-cognito-id-token: Bearer $API_KEY" \
+      --data-binary @-)
+unset WEBHOOK_TOKEN
 
 HTTP_CODE=$(echo "$RESPONSE" | tail -1)
 BODY=$(echo "$RESPONSE" | sed '$d')
 
 echo ""
+# The response echoes the webhook, headers included, so mask header values.
+MASK='if type == "object" and has("headers") then .headers |= map(.headerValue = "***") else . end'
 if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
     echo "Webhook created successfully (HTTP $HTTP_CODE):"
-    echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+    echo "$BODY" | jq "$MASK" 2>/dev/null || echo "(response not shown: not JSON)"
 else
     echo "Error creating webhook (HTTP $HTTP_CODE):"
-    echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+    echo "$BODY" | jq "$MASK" 2>/dev/null || echo "$BODY"
     exit 1
 fi

@@ -11,6 +11,14 @@ async function createMimirWebhook() {
     }
     
     const webhookUrl = "https://your-api-gateway-url.execute-api.us-east-1.amazonaws.com/prod/webhook/item-create";
+
+    // The webhook API rejects calls without this header. Export the value of
+    // the MimirWebhookToken secret (SSM /infrastructure/webhook-token-secret-arn)
+    // as MIMIR_WEBHOOK_TOKEN before running; it is never printed.
+    const webhookToken = process.env.MIMIR_WEBHOOK_TOKEN;
+    if (!webhookToken) {
+      throw new Error('MIMIR_WEBHOOK_TOKEN is not set');
+    }
     
     const response = await fetch('https://us.mjoll.no/config/api/v1/config/webhooks', {
       method: 'POST',
@@ -35,12 +43,20 @@ async function createMimirWebhook() {
           {
             "headerField": "x-webhook-source", 
             "headerValue": "mimir-staging"
+          },
+          {
+            "headerField": "x-mimir-webhook-token",
+            "headerValue": webhookToken
           }
         ]
       })
     });
     
     const result = await response.json();
+    // The response echoes the headers, token included: mask them before printing.
+    if (result && Array.isArray(result.headers)) {
+      result.headers = result.headers.map((h) => ({ ...h, headerValue: '***' }));
+    }
     
     if (!response.ok) {
       console.error('Error:', response.status, response.statusText);
