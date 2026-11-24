@@ -72,6 +72,15 @@ echo "🔨 Building CDK..."
 rm -rf cdk.out
 npm run build
 
+# mimir-handler only accepts tokens from MimirAllowedIssuer. When parameters.json
+# leaves it (or MimirAllowedAudience) blank, read both from Mimir's public config
+# (https://<MimirInstance>.mjoll.no/api/v1) and pass them as CDK context. Explicit
+# values win. If the lookup fails the issuer stays blank and custom actions fail closed.
+MIMIR_AUTH_CONTEXT=()
+while IFS= read -r ctx; do
+  [ -n "$ctx" ] && MIMIR_AUTH_CONTEXT+=(-c "$ctx")
+done < <(node scripts/derive-mimir-auth.js parameters.json)
+
 # Configure MediaConvert queue in us-west-2 for Smart Cropping (Elemental Inference)
 echo "🎬 Configuring MediaConvert Smart Cropping queue (us-west-2)..."
 MC_ENDPOINT=$(aws mediaconvert describe-endpoints --region us-west-2 --query "Endpoints[0].Url" --output text 2>/dev/null)
@@ -98,7 +107,7 @@ echo "📋 Stack prefix: ${STACK_PREFIX}"
 # Deploy stacks in dependency order
 echo "🚀 Deploying stacks in dependency order..."
 echo "📦 Deploying ${STACK_PREFIX}-ObservabilityStack..."
-npx cdk deploy "${STACK_PREFIX}-ObservabilityStack" --require-approval never
+npx cdk deploy "${STACK_PREFIX}-ObservabilityStack" --require-approval never "${MIMIR_AUTH_CONTEXT[@]}"
 
 echo "📦 Deploying ${STACK_PREFIX}-CoreStack (creates secrets and SSM parameters)..."
 # The API key secrets are created without a value, so the keys never land in a
@@ -114,27 +123,27 @@ if aws cloudformation describe-stacks --stack-name "$CORE_STACK" >/dev/null 2>&1
 else
   CORE_STACK_EXISTED=false
 fi
-npx cdk deploy "$CORE_STACK" --require-approval never
+npx cdk deploy "$CORE_STACK" --require-approval never "${MIMIR_AUTH_CONTEXT[@]}"
 echo "🔑 Syncing API keys into ${CORE_STACK} secrets..."
 sync_api_keys "$CORE_STACK"
 if [ "$CORE_STACK_EXISTED" = false ]; then
   # On a first deploy the secrets were empty while the Mimir registration custom
   # resource ran, so it skipped registration. Deploy once more to register.
   echo "📦 Re-deploying ${CORE_STACK} to register Mimir integrations with the API key..."
-  npx cdk deploy "$CORE_STACK" --require-approval never
+  npx cdk deploy "$CORE_STACK" --require-approval never "${MIMIR_AUTH_CONTEXT[@]}"
 fi
 
 echo "📦 Deploying ${STACK_PREFIX}-AgentCoreStack (reads secret ARNs from SSM)..."
-npx cdk deploy "${STACK_PREFIX}-AgentCoreStack" --require-approval never
+npx cdk deploy "${STACK_PREFIX}-AgentCoreStack" --require-approval never "${MIMIR_AUTH_CONTEXT[@]}"
 
 echo "📦 Deploying ${STACK_PREFIX}-SagaFeedsStack (imports Mimir API key from SSM)..."
-npx cdk deploy "${STACK_PREFIX}-SagaFeedsStack" --require-approval never
+npx cdk deploy "${STACK_PREFIX}-SagaFeedsStack" --require-approval never "${MIMIR_AUTH_CONTEXT[@]}"
 echo "🔑 Syncing Saga API key and URL into ${STACK_PREFIX}-SagaFeedsStack secrets..."
 sync_api_keys "${STACK_PREFIX}-SagaFeedsStack"
 
 echo "📦 Deploying ${STACK_PREFIX}-McpGatewayStack (AgentCore Gateway + Cognito auth)..."
 echo "⏳ Waiting for AgentCore runtimes to warm up..."
 sleep 30
-npx cdk deploy "${STACK_PREFIX}-McpGatewayStack" --require-approval never
+npx cdk deploy "${STACK_PREFIX}-McpGatewayStack" --require-approval never "${MIMIR_AUTH_CONTEXT[@]}"
 
 echo "✅ Deployment complete!"

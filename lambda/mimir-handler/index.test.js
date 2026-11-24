@@ -5,10 +5,12 @@
 // - A missing or malformed body gets a 400 before any token work.
 // - The issuer pin fails closed: no MIMIR_ALLOWED_ISSUER, no access. The
 //   audience pin, signature and token_use checks hold.
+// - The tenant pin (MIMIR_ALLOWED_TENANT) runs on verified claims: 403 for
+//   another, missing or disagreeing tenant.
 // Step Functions and Secrets Manager are in-process fakes, so nothing touches
-// AWS. The input and body tests also fake the JWT verifier. The issuer tests
-// use the real aws-jwt-verify with a throwaway RSA key whose JWKS is seeded
-// with cacheJwks(), so they need no network either.
+// AWS. The input and body tests also fake the JWT verifier. The issuer and
+// tenant tests use the real aws-jwt-verify with a throwaway RSA key whose
+// JWKS is seeded with cacheJwks(), so they need no network either.
 const { describe, it, before, beforeEach, after } = require('node:test');
 const assert = require('node:assert/strict');
 const Module = require('node:module');
@@ -31,7 +33,7 @@ const fakes = {
     GetSecretValueCommand: class { constructor(input) { this.input = input; } },
   },
   'aws-jwt-verify': {
-    JwtRsaVerifier: { create: () => ({ verify: async () => { tokenChecks += 1; return { email: 'producer@example.com', token_use: 'id' }; } }) },
+    JwtRsaVerifier: { create: () => ({ verify: async () => { tokenChecks += 1; return { email: 'producer@example.com', token_use: 'id', 'mimir:tenant_id': TENANT, 'custom:tenant_id': TENANT }; } }) },
   },
 };
 
@@ -52,11 +54,14 @@ const TEST_ISSUER = 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_TESTP
 const MIMIR_ISSUER = 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_MimirPool1';
 const ATTACKER_ISSUER = 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_Attacker99';
 const CLIENT_ID = 'mimirappclient000000000001';
+const TENANT = 'tenant-a';
+const TENANT_B = 'tenant-b';
 
 /** Loads a fresh copy of the handler with the given env (env is read at load). */
-function load({ issuer = '', audience = '', real = false } = {}) {
+function load({ issuer = '', audience = '', tenant = '', real = false } = {}) {
   process.env.MIMIR_ALLOWED_ISSUER = issuer;
   process.env.MIMIR_ALLOWED_AUDIENCE = audience;
+  process.env.MIMIR_ALLOWED_TENANT = tenant;
   fakeVerifier = !real;
   delete require.cache[require.resolve('./index.js')];
   const mod = require('./index.js');
@@ -76,7 +81,7 @@ const jwk = { ...publicKey.export({ format: 'jwk' }), kid: 'test-kid', alg: 'RS2
 function sign(claims) {
   const now = Math.floor(Date.now() / 1000);
   const head = b64url({ alg: 'RS256', kid: 'test-kid', typ: 'JWT' });
-  const body = b64url({ sub: 'user-1', token_use: 'id', aud: CLIENT_ID, iat: now, exp: now + 3600, ...claims });
+  const body = b64url({ sub: 'user-1', token_use: 'id', aud: CLIENT_ID, iat: now, exp: now + 3600, 'mimir:tenant_id': TENANT, 'custom:tenant_id': TENANT, ...claims });
   const sig = crypto.sign('RSA-SHA256', Buffer.from(`${head}.${body}`), privateKey).toString('base64url');
   return `${head}.${body}.${sig}`;
 }
@@ -274,5 +279,71 @@ describe('mimir-handler issuer pin (real verifier)', () => {
     await mod.handler(actionEvent(token));
     assert.ok(!logged().includes(token));
     assert.ok(!logged().includes(token.split('.')[2]));
+  });
+});
+
+describe('mimir-handler tenant pin (real verifier)', () => {
+  const run = async (mod, claims) => mod.handler(actionEvent(sign({ iss: MIMIR_ISSUER, ...claims })));
+
+  it('tenant pinned, matching mimir:tenant_id (and custom:tenant_id): 200, execution starts', async () => {
+    const mod = load({ issuer: MIMIR_ISSUER, tenant: TENANT, real: true });
+    const res = await run(mod, {});
+    assert.equal(res.statusCode, 200);
+    assert.equal(startCalls.length, 1);
+  });
+
+  it('tenant pinned, other tenant (same regional pool): 403, no execution', async () => {
+    const mod = load({ issuer: MIMIR_ISSUER, tenant: TENANT, real: true });
+    const res = await run(mod, { 'mimir:tenant_id': TENANT_B, 'custom:tenant_id': TENANT_B });
+    assert.equal(res.statusCode, 403);
+    assert.equal(JSON.parse(res.body).message, 'Forbidden');
+    assert.equal(startCalls.length, 0);
+  });
+
+  it('tenant pinned, mimir:tenant_id missing: 403 even when custom:tenant_id matches', async () => {
+    const mod = load({ issuer: MIMIR_ISSUER, tenant: TENANT, real: true });
+    const res = await run(mod, { 'mimir:tenant_id': undefined, 'custom:tenant_id': TENANT });
+    assert.equal(res.statusCode, 403);
+    assert.equal(startCalls.length, 0);
+  });
+
+  it('tenant pinned, the two tenant claims disagree: 403', async () => {
+    const mod = load({ issuer: MIMIR_ISSUER, tenant: TENANT, real: true });
+    for (const claims of [{ 'custom:tenant_id': TENANT_B }, { 'mimir:tenant_id': TENANT_B, 'custom:tenant_id': TENANT }]) {
+      assert.equal((await run(mod, claims)).statusCode, 403);
+    }
+    assert.equal(startCalls.length, 0);
+  });
+
+  it('tenant pinned, only mimir:tenant_id present (no custom claim): 200', async () => {
+    const mod = load({ issuer: MIMIR_ISSUER, tenant: TENANT, real: true });
+    assert.equal((await run(mod, { 'custom:tenant_id': undefined })).statusCode, 200);
+  });
+
+  it('tenant unset: allowed with a warning that names the token tenant', async () => {
+    const mod = load({ issuer: MIMIR_ISSUER, tenant: '', real: true });
+    const res = await run(mod, { 'mimir:tenant_id': TENANT_B, 'custom:tenant_id': TENANT_B });
+    assert.equal(res.statusCode, 200);
+    assert.ok(logs.some((l) => l.includes('MIMIR_ALLOWED_TENANT is not set') && l.includes(`"${TENANT_B}"`)));
+  });
+
+  it('tenant unset: missing or disagreeing tenant claims are still rejected (403)', async () => {
+    const mod = load({ issuer: MIMIR_ISSUER, tenant: '', real: true });
+    assert.equal((await run(mod, { 'mimir:tenant_id': undefined })).statusCode, 403);
+    assert.equal((await run(mod, { 'custom:tenant_id': TENANT_B })).statusCode, 403);
+    assert.equal(startCalls.length, 0);
+  });
+
+  it('tenant check runs only after signature verification (forged token with right tenant: 401)', async () => {
+    const mod = load({ issuer: MIMIR_ISSUER, tenant: TENANT, real: true });
+    const [h, b] = sign({ iss: MIMIR_ISSUER }).split('.');
+    const res = await mod.handler(actionEvent(`${h}.${b}.${'A'.repeat(342)}`));
+    assert.equal(res.statusCode, 401);
+  });
+
+  it('a malformed body is a 400 before the tenant check', async () => {
+    const mod = load({ issuer: MIMIR_ISSUER, tenant: TENANT, real: true });
+    const res = await mod.handler({ resource: '/actions/summarizer', headers: {}, body: '{' });
+    assert.equal(res.statusCode, 400);
   });
 });
