@@ -767,10 +767,11 @@ def _hide_matte_layers(data: dict) -> None:
 #
 # The overlay has two visual groups that need different on-screen lifetimes:
 #
-#   TEXT GROUP      — animates in with the clip, holds, then dissolves.
+#   TEXT GROUP      — animates in with the clip, holds, then dissolves
+#                      (title, summary, category badge, gradient wash).
 #   PERSISTENT GROUP — appears from the first frame and stays on-screen for
-#                      the entire clip (sidebar colour wash + logo bug +
-#                      category label + optional location/credit).
+#                      the entire clip (sidebar + logo bug + optional
+#                      location/credit).
 #
 # MediaConvert's MotionImageInserter only allows one MOV overlay per output,
 # so we render two patched clones of the Lottie — one with each group hidden
@@ -793,28 +794,32 @@ def _hide_matte_layers(data: dict) -> None:
 # frozenset. The PERSISTENT matcher is a predicate so it can also cover
 # the station variant's sidebar/gradient layers by prefix/substring.
 
-# Hidden in the PERSISTENT variant → keeps the sidebar/logo/category label
+# Hidden in the PERSISTENT variant → keeps the sidebar/logo/location
 # visible. Line 1-3 and body text are already text layers; `breaking line`
-# is a shape layer so hiding it needs an explicit entry here.
+# is a shape layer so hiding it needs an explicit entry here. The category
+# badge (and its background boxes) is parented to Line 1 and fades out with
+# the title, so it belongs to this group too.
 TEXT_LAYER_NAMES = frozenset([
     'Line 1',
     'Line 2',
     'Line 3',
     'body text',
     'breaking line',
+    # Category badge: reference template (14 layers)
+    'Category Label',
+    'Category Label-TextBox',
+    # Category badge: station toolkit template (33 layers)
+    'BREAKING NEWS',
+    'BREAKING NEWS-TextBox',
+    'BREAKING NEWS-TextBox 2',   # auto-sizing stub left over from After Effects
 ])
 
 # Exact names of persistent-group layers across both known template variants.
 _PERSISTENT_EXACT_NAMES = frozenset([
     # Customer-agnostic reference template (14 layers)
     'logo_placeholder',
-    'Category Label',
-    'Category Label-TextBox',
     # Station toolkit template (33 layers) uses different names
     'logo_wpde_abc15.png',
-    'BREAKING NEWS',             # the station variant's category label layer
-    'BREAKING NEWS-TextBox',
-    'BREAKING NEWS-TextBox 2',   # auto-sizing stub left over from After Effects
     # Shared across both variants
     'Location/Courtesy',
     'location/courtesy-TextBox',
@@ -826,7 +831,7 @@ def _is_persistent_layer(name: str) -> bool:
     """Return True for any layer that must stay visible for the full clip.
 
     Covers both known Lottie template variants:
-      - exact-name matches for logo / category label / location-credit
+      - exact-name matches for logo / location-credit
       - prefix match for the station template's `sidebar_<category> - Nmin`
         sub-comp layers (one per category — only the matching one is visible)
     """
@@ -1244,9 +1249,8 @@ def handler(event, context):
         )
 
         # Shift the title/summary block vertically in the TEXT variant only.
-        # The persistent variant keeps its own Line 1 position so the
-        # Category Label (parented to Line 1) stays where the designer put
-        # it next to the sidebar/logo.
+        # The category badge is parented to Line 1, so it moves with the
+        # title and keeps its designed place directly above it.
         if text_y_offset:
             moved = shift_text_block_down(text_lottie, text_y_offset)
             logger.info(
