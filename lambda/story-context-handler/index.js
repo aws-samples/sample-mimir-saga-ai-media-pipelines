@@ -255,8 +255,10 @@ exports.handler = async (event) => {
 
   console.log(`Notes: ${notes.length} total, ${enrichedNotes.length} with content`);
 
-  // Enrich assets with embedding and transcript availability
-  const enrichedAssets = await enrichAssets(assets, mimirApiKey);
+  // Enrich assets with embedding and transcript availability. The Mimir key is
+  // no longer in the execution input; read it from Secrets Manager.
+  const mimirKey = mimirApiKey || await getSecretValue(process.env.MIMIR_API_KEY_SECRET_ARN);
+  const enrichedAssets = await enrichAssets(assets, mimirKey);
 
   return {
     story,

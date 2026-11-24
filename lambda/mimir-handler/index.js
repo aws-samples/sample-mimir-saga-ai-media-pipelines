@@ -1,11 +1,7 @@
-const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
 const { SFNClient, StartExecutionCommand } = require('@aws-sdk/client-sfn');
 const { JwtRsaVerifier } = require('aws-jwt-verify');
 
-const secretsClient = new SecretsManagerClient();
 const sfnClient = new SFNClient();
-
-let cachedMimirApiKey = null;
 
 // Optional issuer pinning: if MIMIR_ALLOWED_ISSUER is set, only tokens from that
 // exact Cognito issuer are accepted. If unset, any AWS Cognito issuer is allowed
@@ -56,14 +52,31 @@ async function validateMimirUserToken(userToken) {
   return payload;
 }
 
-async function getMimirApiKey() {
-  if (cachedMimirApiKey) return cachedMimirApiKey;
-  
-  const response = await secretsClient.send(
-    new GetSecretValueCommand({ SecretId: process.env.MIMIR_API_KEY_SECRET_ARN })
-  );
-  cachedMimirApiKey = response.SecretString;
-  return cachedMimirApiKey;
+// Redact credentials before logging the raw API Gateway event: the body
+// carries the caller's Mimir ID token (`userToken`) and the headers may carry
+// an Authorization / X-API-Key value.
+const REDACTED = '***REDACTED***';
+const SENSITIVE_HEADERS = new Set(['authorization', 'x-api-key', 'cookie', 'x-mimir-cognito-id-token']);
+function redactEventForLog(event) {
+  const redacted = { ...event };
+  for (const field of ['headers', 'multiValueHeaders']) {
+    if (event[field]) {
+      redacted[field] = {};
+      for (const [k, v] of Object.entries(event[field])) {
+        redacted[field][k] = SENSITIVE_HEADERS.has(k.toLowerCase()) ? REDACTED : v;
+      }
+    }
+  }
+  if (typeof event.body === 'string') {
+    try {
+      const body = JSON.parse(event.body);
+      if (body && typeof body === 'object' && 'userToken' in body) body.userToken = REDACTED;
+      redacted.body = body;
+    } catch {
+      redacted.body = '[unparseable body omitted]';
+    }
+  }
+  return redacted;
 }
 
 const corsHeaders = {
@@ -102,9 +115,10 @@ function buildReframeGraphicsOverrides(actionData) {
 
 // Exported for unit tests
 module.exports.buildReframeGraphicsOverrides = buildReframeGraphicsOverrides;
+module.exports.redactEventForLog = redactEventForLog;
 
 exports.handler = async (event) => {
-  console.log('Received Mimir request:', JSON.stringify(event, null, 2));
+  console.log('Received Mimir request:', JSON.stringify(redactEventForLog(event), null, 2));
   
   try {
     // Extract action type from the resource path
@@ -138,9 +152,13 @@ exports.handler = async (event) => {
     console.log('Items received:', items.length);
     console.log('Action type:', actionType);
     
-    // Get Mimir API key
-    const mimirApiKey = await getMimirApiKey();
-    
+    // The Mimir API key and the caller's userToken are deliberately NOT put in
+    // the Step Functions execution input: input is stored in execution history
+    // (readable via DescribeExecution / GetExecutionHistory and the console for
+    // 90 days). Downstream Lambdas read the key from Secrets Manager
+    // (MIMIR_API_KEY_SECRET_ARN); no downstream state uses userToken, which is
+    // only needed for the authentication check above.
+
     // Determine which state machine to use based on action type
     let stateMachineArn;
     let filteredItems = items;
@@ -259,8 +277,6 @@ exports.handler = async (event) => {
             aspectRatios: ['9:16', '1:1', '4:5'],
             outputPrefix: `reframe-with-graphics/${item.id}/${Date.now()}`,
             userMetadata,
-            mimirApiKey,
-            userToken,
             userId,
             userEmail,
           };
@@ -325,8 +341,6 @@ exports.handler = async (event) => {
             aspectRatios: ['9:16'],
             varianceThreshold: 5000,
             executionTimestamp: Date.now(),
-            mimirApiKey,
-            userToken,
             userId,
             userEmail,
           };
@@ -367,11 +381,9 @@ exports.handler = async (event) => {
     const executionName = `${actionType}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     const input = {
       items: filteredItems,
-      userToken,
       actionData,
       userId,
       userEmail,
-      mimirApiKey,
       actionType,
       ...extraInput
     };
