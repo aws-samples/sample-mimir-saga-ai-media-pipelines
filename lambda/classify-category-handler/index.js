@@ -23,9 +23,24 @@
 
 const { BedrockRuntimeClient, ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
 
 const bedrockClient = new BedrockRuntimeClient({ region: process.env.AWS_REGION || 'us-east-1' });
 const s3Client = new S3Client();
+const secretsClient = new SecretsManagerClient();
+
+let cachedMimirApiKey = null;
+
+// The Mimir key is not passed in the Step Functions execution input (it would
+// be kept in execution history), so read it from Secrets Manager.
+async function getMimirApiKey() {
+  if (cachedMimirApiKey) return cachedMimirApiKey;
+  const response = await secretsClient.send(
+    new GetSecretValueCommand({ SecretId: process.env.MIMIR_API_KEY_SECRET_ARN })
+  );
+  cachedMimirApiKey = response.SecretString;
+  return cachedMimirApiKey;
+}
 
 const MODEL_ID = process.env.CLASSIFY_MODEL_ID || 'us.amazon.nova-pro-v1:0';
 const TRANSCRIPT_BUCKET = process.env.TRANSCRIPT_STAGING_BUCKET || '';
@@ -269,11 +284,10 @@ exports.handler = async (event) => {
   const title = event.title || '';
   const description = event.description || '';
   const itemId = event.itemId || '';
-  const mimirApiKey = event.mimirApiKey || '';
-
   // Priority: caller-provided text → Mimir timedTranscriptUrl → S3 staging bucket
   let transcript = (event.transcript || '').substring(0, 3000);
   if (!transcript && event.mimirDetails?.timedTranscriptUrl) {
+    const mimirApiKey = event.mimirApiKey || await getMimirApiKey();
     transcript = await fetchTranscriptFromUrl(event.mimirDetails.timedTranscriptUrl, mimirApiKey);
   }
   if (!transcript && itemId) {

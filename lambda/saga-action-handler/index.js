@@ -12,7 +12,6 @@ const { SFNClient, StartExecutionCommand } = require('@aws-sdk/client-sfn');
 const secretsClient = new SecretsManagerClient();
 const sfnClient = new SFNClient();
 
-let cachedMimirApiKey = null;
 let cachedSagaActionsApiKey = null;
 
 async function getSagaActionsApiKey() {
@@ -23,15 +22,6 @@ async function getSagaActionsApiKey() {
   // Secret is generated as JSON: { "apiKey": "..." }
   cachedSagaActionsApiKey = JSON.parse(response.SecretString).apiKey;
   return cachedSagaActionsApiKey;
-}
-
-async function getMimirApiKey() {
-  if (cachedMimirApiKey) return cachedMimirApiKey;
-  const response = await secretsClient.send(
-    new GetSecretValueCommand({ SecretId: process.env.MIMIR_API_KEY_SECRET_ARN })
-  );
-  cachedMimirApiKey = response.SecretString;
-  return cachedMimirApiKey;
 }
 
 const corsHeaders = {
@@ -112,8 +102,6 @@ exports.handler = async (event) => {
     const actionType = actionMatch ? actionMatch[1] : 'unknown';
     console.log(`Saga action: ${actionType}, story: ${body.story.mTitle} (${storyId})`);
 
-    const mimirApiKey = await getMimirApiKey();
-
     // Rough-cut variants all run the SAME rough-cut state machine/agent; the
     // action only changes the "roughCutType", which the agent uses to select a
     // prompt/constraint profile (e.g. a stripped-down VO-only cut).
@@ -152,7 +140,8 @@ exports.handler = async (event) => {
       storyId,
       sagaApiKeySecretArn: process.env.SAGA_API_KEY_SECRET_ARN,
       sagaApiUrlSecretArn: process.env.SAGA_API_URL_SECRET_ARN,
-      mimirApiKey,
+      // No mimirApiKey here: execution input is kept in execution history.
+      // Downstream Lambdas read it from Secrets Manager (MIMIR_API_KEY_SECRET_ARN).
       story: body.story,
       triggeredByUserId: body.triggeredByUserId,
       actionType,

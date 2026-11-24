@@ -163,7 +163,7 @@ async function enrichAssets(assets, mimirApiKey) {
 exports.handler = async (event) => {
   console.log('Story context handler received:', JSON.stringify(event, null, 2));
 
-  const { storyId, sagaApiKeySecretArn, sagaApiUrlSecretArn, mimirApiKey } = event;
+  const { storyId, sagaApiKeySecretArn, sagaApiUrlSecretArn, mimirApiKeySecretArn, mimirApiKey } = event;
 
   // Retrieve secrets (cached after first invocation)
   const sagaApiKey = await getSecretValue(sagaApiKeySecretArn);
@@ -255,8 +255,12 @@ exports.handler = async (event) => {
 
   console.log(`Notes: ${notes.length} total, ${enrichedNotes.length} with content`);
 
-  // Enrich assets with embedding and transcript availability
-  const enrichedAssets = await enrichAssets(assets, mimirApiKey);
+  // Enrich assets with embedding and transcript availability. The Mimir key is
+  // no longer in the execution input; read it from Secrets Manager. The state
+  // machine passes the secret ARN in the task input; the env var is a fallback.
+  const mimirKey = mimirApiKey
+    || await getSecretValue(mimirApiKeySecretArn || process.env.MIMIR_API_KEY_SECRET_ARN);
+  const enrichedAssets = await enrichAssets(assets, mimirKey);
 
   return {
     story,
