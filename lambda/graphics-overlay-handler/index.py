@@ -767,10 +767,11 @@ def _hide_matte_layers(data: dict) -> None:
 #
 # The overlay has two visual groups that need different on-screen lifetimes:
 #
-#   TEXT GROUP      — animates in with the clip, holds, then dissolves.
+#   TEXT GROUP      — animates in with the clip, holds, then dissolves
+#                      (title, summary, category badge, gradient wash).
 #   PERSISTENT GROUP — appears from the first frame and stays on-screen for
-#                      the entire clip (sidebar colour wash + logo bug +
-#                      category label + optional location/credit).
+#                      the entire clip (sidebar + logo bug + optional
+#                      location/credit).
 #
 # MediaConvert's MotionImageInserter only allows one MOV overlay per output,
 # so we render two patched clones of the Lottie — one with each group hidden
@@ -793,28 +794,32 @@ def _hide_matte_layers(data: dict) -> None:
 # frozenset. The PERSISTENT matcher is a predicate so it can also cover
 # the station variant's sidebar/gradient layers by prefix/substring.
 
-# Hidden in the PERSISTENT variant → keeps the sidebar/logo/category label
+# Hidden in the PERSISTENT variant → keeps the sidebar/logo/location
 # visible. Line 1-3 and body text are already text layers; `breaking line`
-# is a shape layer so hiding it needs an explicit entry here.
+# is a shape layer so hiding it needs an explicit entry here. The category
+# badge (and its background boxes) is parented to Line 1 and fades out with
+# the title, so it belongs to this group too.
 TEXT_LAYER_NAMES = frozenset([
     'Line 1',
     'Line 2',
     'Line 3',
     'body text',
     'breaking line',
+    # Category badge: reference template (14 layers)
+    'Category Label',
+    'Category Label-TextBox',
+    # Category badge: station toolkit template (33 layers)
+    'BREAKING NEWS',
+    'BREAKING NEWS-TextBox',
+    'BREAKING NEWS-TextBox 2',   # auto-sizing stub left over from After Effects
 ])
 
 # Exact names of persistent-group layers across both known template variants.
 _PERSISTENT_EXACT_NAMES = frozenset([
     # Customer-agnostic reference template (14 layers)
     'logo_placeholder',
-    'Category Label',
-    'Category Label-TextBox',
     # Station toolkit template (33 layers) uses different names
     'logo_wpde_abc15.png',
-    'BREAKING NEWS',             # the station variant's category label layer
-    'BREAKING NEWS-TextBox',
-    'BREAKING NEWS-TextBox 2',   # auto-sizing stub left over from After Effects
     # Shared across both variants
     'Location/Courtesy',
     'location/courtesy-TextBox',
@@ -826,7 +831,7 @@ def _is_persistent_layer(name: str) -> bool:
     """Return True for any layer that must stay visible for the full clip.
 
     Covers both known Lottie template variants:
-      - exact-name matches for logo / category label / location-credit
+      - exact-name matches for logo / location-credit
       - prefix match for the station template's `sidebar_<category> - Nmin`
         sub-comp layers (one per category — only the matching one is visible)
     """
@@ -962,19 +967,221 @@ def hide_layers_by_predicate(data: dict, predicate) -> int:
     return hidden
 
 
+# ---------------------------------------------------------------------------
+# Seamless persistent loop
+#
+# The station template's sidebar ticker is a text layer holding one phrase
+# repeated many times ("BREAKING NEWS     BREAKING NEWS ..."), scrolled
+# linearly inside a 15s precomp that the 2-min comp tiles back to back. The
+# picture repeats every time the text has moved by one phrase width (the
+# "pitch"), so a short loop of the persistent variant can stand in for any
+# clip length if the loop length is a whole number of pitches of travel.
+#
+# Bodymovin keyframes are close to, but not exactly, a whole number of
+# pitches per 15s segment (BREAKING NEWS 3.0002, LOCAL NEWS 4.975, SPORTS
+# 6.61). snap_scrollers_to_pitch() nudges each scroll segment's end keyframe
+# to the nearest whole number of pitches (a speed change of under 1% for
+# most categories, up to 6% for SPORTS/POLITICS). That also removes the
+# small jump the template itself has at every 15s instance boundary. The
+# loop length is then segment_frames / k rounded up to whole frames:
+# 150 frames for BREAKING NEWS, 90 for LOCAL NEWS, 450 at most.
+# ---------------------------------------------------------------------------
+
+# Longest persistent loop we accept. One 15s scroll segment at 29.97fps.
+PERSISTENT_LOOP_MAX_FRAMES = 450
+
+
+def _dropdown_value(data: dict, layer_name: str, effect_name: str):
+    for layer in data.get('layers', []):
+        if (layer.get('nm') or '').strip() != layer_name:
+            continue
+        for effect in layer.get('ef', []):
+            if effect.get('nm') == effect_name:
+                for sub in effect.get('ef', []):
+                    if sub.get('nm') == 'Menu':
+                        return sub.get('v', {}).get('k')
+    return None
+
+
+def _deselected_by_dropdown(layer: dict, dropdown) -> bool:
+    """True when the layer's opacity expression hides it for this dropdown value.
+
+    Matches the station template's sidebar selector:
+      myIndex = 2; $bm_rt = $bm_mul(value, dropdown == myIndex ? 2 : 0);
+    """
+    import re
+    expr = layer.get('ks', {}).get('o', {}).get('x')
+    if dropdown is None or not isinstance(expr, str) or 'dropdown == myIndex' not in expr:
+        return False
+    m = re.search(r'myIndex\s*=\s*(\d+)', expr)
+    return bool(m) and int(m.group(1)) != int(dropdown)
+
+
+def _text_repeat_pitch(data: dict, layer: dict):
+    """Advance width of the repeating unit of a text layer, or None.
+
+    The text must be one phrase repeated at least twice (a trailing partial
+    copy is fine). Widths come from the exported `chars` table, the same way
+    lottie-web lays the glyphs out: w * size / 100 plus tracking * size / 1000.
+    """
+    try:
+        doc = layer['t']['d']['k'][0]['s']
+    except (KeyError, IndexError, TypeError):
+        return None
+    if len(layer['t']['d']['k']) != 1:
+        return None  # animated source text
+    text = doc.get('t') or ''
+    unit = None
+    for n in range(1, len(text) // 2 + 1):
+        if text[n:] == text[:len(text) - n]:
+            unit = text[:n]
+            break
+    if not unit or not unit.strip():
+        return None
+    font = next((f for f in data.get('fonts', {}).get('list', [])
+                 if f.get('fName') == doc.get('f')), None)
+    if font is None:
+        return None
+    widths = {c['ch']: c['w'] for c in data.get('chars', [])
+              if c.get('fFamily') == font.get('fFamily') and c.get('style') == font.get('fStyle')}
+    size = float(doc.get('s', 0))
+    track = float(doc.get('tr', 0))
+    if not size or any(ch not in widths for ch in unit):
+        return None
+    return sum(widths[ch] * size / 100.0 + track * size / 1000.0 for ch in unit)
+
+
+def _scroll_segment_loop_frames(duration: float, k: int):
+    """Smallest whole frame count that covers whole pitches of a segment."""
+    for m in range(1, k + 1):
+        frames = m * duration / k
+        if abs(frames - round(frames)) < 1e-3:
+            return int(round(frames))
+    return None
+
+
+def snap_scrollers_to_pitch(data: dict, start_frame: int,
+                            max_frames: int = PERSISTENT_LOOP_MAX_FRAMES):
+    """Make the visible sidebar ticker tile cleanly; return the loop length.
+
+    Walks the visible layer tree over root frames [start_frame,
+    start_frame + max_frames] (mapping time through each precomp's st/sr and
+    skipping `hd` layers and sidebars the category dropdown deselects). For
+    every scrolling repeated-phrase text layer it finds, each linear scroll
+    segment active in that window is snapped to a whole number of pitches.
+
+    Returns the loop length in frames (the least common multiple of the
+    segments' loop lengths), or None when the persistent variant has no
+    such scroller, the scroller is not a straight linear move along its
+    baseline, a precomp uses time remapping, or the loop would exceed
+    `max_frames`. None means: fall back to rendering the clip length.
+
+    shortcut: assumes the scroller's precomp instances are tiled back to back
+    (as in the station toolkit). Instances that overlap or leave gaps inside
+    the loop window would need their timing checked too.
+    """
+    import math
+    # Work on a copy so a template we cannot loop is rendered untouched.
+    work = copy.deepcopy(data)
+    assets = {a['id']: a for a in work.get('assets', []) if 'layers' in a}
+    dropdown = _dropdown_value(work, 'sidebar control', 'Choose News Type')
+    periods = []
+    seen_layers = set()
+
+    def visit(layers, t0, t1, is_root):
+        for layer in layers:
+            if layer.get('hd'):
+                continue
+            if is_root and _deselected_by_dropdown(layer, dropdown):
+                continue
+            lo = max(t0, layer.get('ip', 0))
+            hi = min(t1, layer.get('op', 0))
+            if lo >= hi:
+                continue
+            st = layer.get('st', 0)
+            sr = layer.get('sr', 1) or 1
+            l0, l1 = (lo - st) / sr, (hi - st) / sr
+            ty = layer.get('ty')
+            if ty == 0:
+                if 'tm' in layer:
+                    return False
+                comp = assets.get(layer.get('refId'))
+                if comp is not None and visit(comp['layers'], l0, l1, False) is False:
+                    return False
+            elif ty == 5:
+                if snap_layer(layer, l0, l1) is False:
+                    return False
+        return True
+
+    def snap_layer(layer, l0, l1):
+        pos = layer.get('ks', {}).get('p', {})
+        if not isinstance(pos, dict) or pos.get('a') != 1 or pos.get('s') is True:
+            return None
+        pitch = _text_repeat_pitch(work, layer)
+        if not pitch:
+            return None
+        kfs = pos['k']
+        if len(kfs) < 2 or any(not isinstance(kf.get('s'), list) for kf in kfs):
+            return None
+        for kf in kfs:
+            if kf.get('h') == 1 or any(abs(v) > 1e-6 for v in (kf.get('to') or []) + (kf.get('ti') or [])):
+                return False  # hold or curved path: not a steady scroll
+        rot = layer.get('ks', {}).get('r', {}).get('k', 0)
+        if not isinstance(rot, (int, float)):
+            return False
+        ux, uy = math.cos(math.radians(rot)), math.sin(math.radians(rot))
+        values = [list(kf['s']) for kf in kfs]
+        key = id(layer)
+        snapped = values[:1]
+        for i in range(len(kfs) - 1):
+            t_a, t_b = kfs[i]['t'], kfs[i + 1]['t']
+            dx, dy = values[i + 1][0] - values[i][0], values[i + 1][1] - values[i][1]
+            dist = math.hypot(dx, dy)
+            new_end = [snapped[i][0] + dx, snapped[i][1] + dy] + values[i + 1][2:]
+            active = t_b > l0 and t_a < l1
+            if dist >= pitch / 2 and abs(dx * uy - dy * ux) <= 1e-3 * dist:
+                k = int(round(dist / pitch))
+                scale = k * pitch / dist
+                new_end = [snapped[i][0] + dx * scale, snapped[i][1] + dy * scale] + values[i + 1][2:]
+                if active and key not in seen_layers:
+                    loop = _scroll_segment_loop_frames(t_b - t_a, k)
+                    if loop is None:
+                        return False
+                    periods.append(loop)
+            elif active and dist > 0:
+                return False  # moving, but not along the baseline
+            snapped.append(new_end)
+        seen_layers.add(key)
+        for kf, value in zip(kfs, snapped):
+            kf['s'] = value
+        return True
+
+    if visit(work.get('layers', []), start_frame, start_frame + max_frames, True) is False:
+        return None
+    if not periods:
+        return None
+    loop = 1
+    for p in periods:
+        loop = loop * p // math.gcd(loop, p)
+    if loop > max_frames:
+        return None
+    data.clear()
+    data.update(work)
+    return loop
+
+
 def ffmpeg_composite_overlays(persistent_mov: str, text_mov: str,
                               output_path: str, duration_seconds: float,
                               fps: float) -> None:
     """Composite the two overlay MOVs into a single MOV sized to `duration_seconds`.
 
-    The persistent MOV carries the sidebar / logo / category label plus the
-    station template's scrolling "LOCAL NEWS" text, rendered for one full
-    15-second scroll cycle. We `-stream_loop -1` it so the loop restarts
-    seamlessly: at both ends of the cycle the scrolling text is off-screen
-    (Y=4064 below, Y=-893 above), so there's no visible pop at the
-    boundary. The text MOV carries the title / summary and bakes its own
-    alpha fade-out via render_lottie.js. We compose text on top of
-    persistent from timestamp 0 and clip the output at `duration_seconds`.
+    The persistent MOV carries the sidebar / logo / location credit. When the
+    template has a loopable sidebar ticker it is one seamless loop (see
+    snap_scrollers_to_pitch), so `-stream_loop -1` repeats it with no visible
+    seam for any clip length. The text MOV carries the title / summary /
+    category badge and bakes its own alpha fade-out via render_lottie.js. We
+    compose text on top of persistent from timestamp 0 and clip the output at
+    `duration_seconds`.
 
     Output: qtrle + rgba MOV with alpha channel preserved, as MediaConvert's
     MotionImageInserter requires.
@@ -1244,9 +1451,8 @@ def handler(event, context):
         )
 
         # Shift the title/summary block vertically in the TEXT variant only.
-        # The persistent variant keeps its own Line 1 position so the
-        # Category Label (parented to Line 1) stays where the designer put
-        # it next to the sidebar/logo.
+        # The category badge is parented to Line 1, so it moves with the
+        # title and keeps its designed place directly above it.
         if text_y_offset:
             moved = shift_text_block_down(text_lottie, text_y_offset)
             logger.info(
@@ -1283,35 +1489,33 @@ def handler(event, context):
             fade_out_seconds=fade_out_seconds,
         )
 
-        # Persistent variant: render the full clip duration (capped) starting
-        # at `persistent_start_frame` so the sidebar/logo appears already-
-        # landed from frame 0 of the output. We render through the whole clip
-        # rather than freezing a single frame because the station template's
-        # sidebar carries a scrolling "LOCAL NEWS" / "BREAKING NEWS" text
-        # animation that a single-frame freeze would stop dead. The sub-comp
-        # isn't built for seamless looping, so a stream_loop here would
-        # visibly pop.
+        # Persistent variant: render ONE seamless loop of the sidebar/logo,
+        # starting at `persistent_start_frame` (past the slide-in), and let
+        # the composite `-stream_loop` it for the whole clip. The loop length
+        # comes from the template (see snap_scrollers_to_pitch), not from the
+        # clip duration, so the render cost is the same for any clip length.
         fps = float(lottie_data['fr'])
-        # Safety cap: Lambda's hard 15-min timeout caps how many
-        # persistent frames we can produce in a single invocation. Puppeteer
-        # + lottie-web renders the station toolkit at ~5 fps when text-group
-        # layers are hidden with `hd: True`, so a 40-second ceiling (1200
-        # frames @ 29.97) leaves comfortable headroom. Clips longer than
-        # 40s loop the final 40s via `-stream_loop -1` in the composite
-        # below — with the hidden-layer speedup the full-render path
-        # covers every short-form social clip we care about, and the
-        # longer-clip loop still shows a continuous (if looping) scroll.
-        PERSISTENT_FRAMES_SAFETY_CAP = int(40 * fps)
-        lottie_total_frames = int(lottie_data.get('op', 0))
-        persistent_frames_requested = int(round(video_duration_seconds * fps))
-        persistent_frames_available = max(0, lottie_total_frames - persistent_start_frame)
-        persistent_frames = min(
-            persistent_frames_requested,
-            persistent_frames_available,
-            PERSISTENT_FRAMES_SAFETY_CAP,
-        )
-        # Enforce a floor so very short clips still get a usable scroll window
-        persistent_frames = max(persistent_frames, 60)
+        loop_frames = snap_scrollers_to_pitch(persistent_lottie, persistent_start_frame)
+        if loop_frames:
+            persistent_frames = loop_frames
+            logger.info(f"Persistent variant: seamless loop of {loop_frames} frame(s)")
+        else:
+            # No loopable scroller found: render the clip length as before.
+            # Safety cap: Lambda's hard 15-min timeout caps how many
+            # persistent frames one invocation can produce; clips longer
+            # than 40s loop the rendered 40s with a visible jump.
+            PERSISTENT_FRAMES_SAFETY_CAP = int(40 * fps)
+            lottie_total_frames = int(lottie_data.get('op', 0))
+            persistent_frames_requested = int(round(video_duration_seconds * fps))
+            persistent_frames_available = max(0, lottie_total_frames - persistent_start_frame)
+            persistent_frames = min(
+                persistent_frames_requested,
+                persistent_frames_available,
+                PERSISTENT_FRAMES_SAFETY_CAP,
+            )
+            # Enforce a floor so very short clips still get a usable scroll window
+            persistent_frames = max(persistent_frames, 60)
+            logger.warning("Persistent variant: no seamless loop found, rendering the clip length")
         logger.info(
             f"Persistent variant: rendering {persistent_frames} frame(s) "
             f"({persistent_frames / fps:.2f}s) starting at Lottie frame "

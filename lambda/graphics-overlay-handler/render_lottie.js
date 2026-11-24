@@ -258,11 +258,22 @@ async function main() {
       }), frame, PAINT_SETTLE_MS);
     };
 
-    // Warm up at the start frame with the full settle pipeline so the paint
-    // state the capture loop inherits is already correct.
-    for (let warmup = 0; warmup < 5; warmup += 1) {
-      await settleFrame(effectiveStartFrame);
+    // Warm up by rendering a few DISTINCT frames that lead into the start
+    // frame. lottie-web's SVG renderer returns early from renderFrame when
+    // the frame number equals the last one it rendered, so repeated warm-ups
+    // at the same frame are a single render. And on a fresh player the first
+    // two renders leave layers unpainted (expression-driven opacity, image
+    // and precomp layers settle one render late), which is what made output
+    // frames 0-1 of the persistent MOV blank and the logo/sidebar pop on at
+    // frame 2. Three distinct renders followed by the start frame give a
+    // fully painted start frame.
+    const warmupFrames = effectiveStartFrame >= 3
+      ? [effectiveStartFrame - 3, effectiveStartFrame - 2, effectiveStartFrame - 1]
+      : [effectiveStartFrame + 3, effectiveStartFrame + 2, effectiveStartFrame + 1];
+    for (const f of warmupFrames) {
+      await settleFrame(Math.min(f, totalFrames - 1));
     }
+    await settleFrame(effectiveStartFrame);
 
     // Puppeteer's screenshot pipeline runs on its own compositor thread and
     // appears to return the FRAME BEFORE the one lottie just rendered — the
