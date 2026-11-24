@@ -134,6 +134,58 @@ async function getMimirApiKey(secretArn) {
   return response.SecretString;
 }
 
+// ---------------------------------------------------------------------------
+// Webhook authentication.
+//
+// The Mimir Webhooks API rejects any request without this header (see
+// lambda/webhook-authorizer). Every webhook we register, and every other Mimir
+// webhook that points at our webhook API (for example ones created with
+// scripts/create-mimir-webhook.sh), gets the header on each deploy. The header
+// VALUE is a secret: it is never logged, and never returned to CloudFormation.
+// ---------------------------------------------------------------------------
+const WEBHOOK_TOKEN_HEADER = 'x-mimir-webhook-token';
+module.exports.WEBHOOK_TOKEN_HEADER = WEBHOOK_TOKEN_HEADER;
+
+/** Returns `headers` with exactly one WEBHOOK_TOKEN_HEADER entry set to `token`. */
+function withWebhookToken(headers, token) {
+  const others = (Array.isArray(headers) ? headers : [])
+    .filter((h) => String(h.headerField || '').toLowerCase() !== WEBHOOK_TOKEN_HEADER);
+  return [...others, { headerField: WEBHOOK_TOKEN_HEADER, headerValue: token }];
+}
+
+function hasWebhookToken(headers, token) {
+  return (Array.isArray(headers) ? headers : []).some(
+    (h) => String(h.headerField || '').toLowerCase() === WEBHOOK_TOKEN_HEADER && h.headerValue === token
+  );
+}
+
+/**
+ * Adds the token header to every existing Mimir webhook whose URL is on our
+ * webhook API and does not already carry the current token. Matching is by
+ * URL prefix, not label, so webhooks created outside this Lambda are covered.
+ */
+async function ensureWebhookTokenOnApiWebhooks(apiKey, mimirBaseUrl, webhookApiUrl, token) {
+  const existing = await mimirRequest('GET', '/config/api/v1/config/webhooks', apiKey, mimirBaseUrl);
+  if (!existing.ok || !Array.isArray(existing.data)) {
+    throw new Error(`Could not list Mimir webhooks to set the auth header (status ${existing.status})`);
+  }
+  const results = [];
+  for (const w of existing.data) {
+    if (typeof w.url !== 'string' || !w.url.startsWith(webhookApiUrl)) continue;
+    if (hasWebhookToken(w.headers, token)) continue;
+    const res = await mimirRequest('PUT', `/config/api/v1/config/webhooks/${w.id}`, apiKey, mimirBaseUrl, {
+      ...w,
+      headers: withWebhookToken(w.headers, token),
+    });
+    results.push({ webhook: w.label, operation: 'auth-header-added', status: res.status });
+    console.log(`Added ${WEBHOOK_TOKEN_HEADER} header to webhook: ${w.label} (id: ${w.id}) → ${res.status}`);
+  }
+  return results;
+}
+
+module.exports.withWebhookToken = withWebhookToken;
+module.exports.ensureWebhookTokenOnApiWebhooks = ensureWebhookTokenOnApiWebhooks;
+
 async function mimirRequest(method, path, apiKey, mimirBaseUrl, body = null) {
   const url = `${mimirBaseUrl}${path}`;
   const options = {
@@ -300,13 +352,13 @@ function parseEmbeddingsFilter(raw) {
   return { field, values: [...new Set(values)] };
 }
 
-function buildEmbedWebhooks(webhookApiUrl, filter) {
+function buildEmbedWebhooks(webhookApiUrl, filter, webhookToken) {
+  const contentType = [{ headerField: 'Content-Type', headerValue: 'application/json' }];
   const base = {
     type: 'itemCreation',
     url: `${webhookApiUrl}webhook/item-embed`,
-    headers: [
-      { headerField: 'Content-Type', headerValue: 'application/json' }
-    ],
+    // The webhook API rejects calls without the token header.
+    headers: webhookToken ? withWebhookToken(contentType, webhookToken) : contentType,
     protected: false
   };
   const videoOnly = { criteria: 'itemTypeEquals', itemType: 'video' };
@@ -334,8 +386,8 @@ function buildEmbedWebhooks(webhookApiUrl, filter) {
  * duplicates). Deletes run only when every upsert succeeded, so a failed
  * create never leaves the stack with no embed webhook.
  */
-async function registerWebhooks(apiKey, mimirBaseUrl, webhookApiUrl, filter = null, enabled = true) {
-  const desired = enabled ? buildEmbedWebhooks(webhookApiUrl, filter) : [];
+async function registerWebhooks(apiKey, mimirBaseUrl, webhookApiUrl, filter = null, enabled = true, webhookToken = null) {
+  const desired = enabled ? buildEmbedWebhooks(webhookApiUrl, filter, webhookToken) : [];
 
   const existing = await mimirRequest('GET', '/config/api/v1/config/webhooks', apiKey, mimirBaseUrl);
   if (!existing.ok || !Array.isArray(existing.data)) {
@@ -449,6 +501,7 @@ exports.handler = async (event, context) => {
   const mimirBaseUrl = props.MimirBaseUrl;
   const actionsApiUrl = props.ActionsApiUrl;
   const webhookApiUrl = props.WebhookApiUrl;
+  const webhookTokenSecretArn = props.WebhookTokenSecretArn;
 
   try {
     const apiKey = await getMimirApiKey(mimirApiKeySecretArn);
@@ -462,12 +515,17 @@ exports.handler = async (event, context) => {
       console.log(`  Webhook API: ${webhookApiUrl}`);
       console.log(`  Embeddings webhook: ${!embeddingsWebhookEnabled ? 'disabled' : embeddingsFilter ? `${embeddingsFilter.field} in ${embeddingsFilter.values.length} value(s)` : 'all video items'}`);
 
+      // Same secret read as the Mimir key; the value stays in memory only.
+      const webhookToken = await getMimirApiKey(webhookTokenSecretArn);
+      if (!webhookToken) throw new Error('Webhook token secret is empty');
+
       const actionResults = await registerCustomActions(apiKey, mimirBaseUrl, actionsApiUrl);
-      const webhookResults = await registerWebhooks(apiKey, mimirBaseUrl, webhookApiUrl, embeddingsFilter, embeddingsWebhookEnabled);
+      const webhookResults = await registerWebhooks(apiKey, mimirBaseUrl, webhookApiUrl, embeddingsFilter, embeddingsWebhookEnabled, webhookToken);
+      const authHeaderResults = await ensureWebhookTokenOnApiWebhooks(apiKey, mimirBaseUrl, webhookApiUrl, webhookToken);
 
       await sendResponse(event, context, 'SUCCESS', 'Mimir integrations registered', {
         CustomActions: JSON.stringify(actionResults),
-        Webhooks: JSON.stringify(webhookResults)
+        Webhooks: JSON.stringify([...webhookResults, ...authHeaderResults])
       });
 
     } else if (event.RequestType === 'Delete') {
