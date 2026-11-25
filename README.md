@@ -166,8 +166,11 @@ Deploy without a local development environment. A small CloudFormation stack cre
      --parameters \
        ParameterKey=MimirApiKey,ParameterValue='sakm....' \
        ParameterKey=SagaApiKey,ParameterValue='...' \
-       ParameterKey=MimirInstance,ParameterValue=us
+       ParameterKey=MimirInstance,ParameterValue=us \
+       ParameterKey=MimirAllowedTenant,ParameterValue='<your-mimir-tenant-id>'
    ```
+
+   The Mimir token issuer and audience are derived from `MimirInstance` at deploy time. Set `MimirAllowedTenant`, or any Mimir user in your region can trigger your custom actions; see [Mimir custom action authentication](#mimir-custom-action-authentication).
 
    Or upload `scripts/deploy-pipeline.yaml` in the [CloudFormation console](https://console.aws.amazon.com/cloudformation/home#/stacks/create) and fill in the parameters.
 
@@ -205,10 +208,11 @@ Never pass API keys in `--environment-variables-override` as `PLAINTEXT`: overri
      { "ParameterKey": "MimirApiKey",   "ParameterValue": "sakm...." },
      { "ParameterKey": "SagaApiKey",    "ParameterValue": "..." },
      { "ParameterKey": "SagaApiUrl",    "ParameterValue": "https://<your-saga-api>/v1" },
-     { "ParameterKey": "MimirInstance", "ParameterValue": "us" }
+     { "ParameterKey": "MimirInstance", "ParameterValue": "us" },
+     { "ParameterKey": "MimirAllowedTenant", "ParameterValue": "<your-mimir-tenant-id>" }
    ]
    ```
-   Optional parameters: `SummaryFieldName`, `MimirAllowedIssuer`, `EnableTranscribeFallback`, `EnableEmbeddingsWebhook`, `EmbeddingsFilterField`, `EmbeddingsFilterValues`, `EmbeddingsFilterFieldKey`, `PollyEngine`, `PollyVoiceId` — see `parameters.example.json` for descriptions and [Embeddings Filter](#embeddings-filter-optional).
+   Set `MimirAllowedTenant` (see [Mimir custom action authentication](#mimir-custom-action-authentication)); `MimirAllowedIssuer` and `MimirAllowedAudience` are derived at deploy time. Optional parameters: `SummaryFieldName`, `EnableTranscribeFallback`, `EnableEmbeddingsWebhook`, `EmbeddingsFilterField`, `EmbeddingsFilterValues`, `EmbeddingsFilterFieldKey`, `PollyEngine`, `PollyVoiceId` — see `parameters.example.json` for descriptions and [Embeddings Filter](#embeddings-filter-optional).
 3. Install dependencies:
    ```bash
    npm install
@@ -244,6 +248,26 @@ The following are automatically registered in Mimir on every deploy via a CDK cu
 - **Embed Video Content** webhook → `POST /webhook/item-embed` (triggers on video item creation; optionally filtered, see [Embeddings Filter](#embeddings-filter-optional))
 
 These are idempotent — safe to run on every deploy. If someone deletes them in the Mimir UI, the next deploy recreates them.
+
+#### Mimir custom action authentication
+
+Mimir sends the user's Cognito ID token with every custom action (`includeJWT`). `mimir-handler` verifies it in three steps:
+
+| Check | Parameter | Set by | Fails with |
+|---|---|---|---|
+| Token issued and signed by your Mimir region's user pool | `MimirAllowedIssuer` | derived by `./deploy.sh` | `401` (every action, while blank) |
+| Token audience is Mimir's web-app client | `MimirAllowedAudience` | derived by `./deploy.sh` | `401` |
+| Token belongs to **your** Mimir tenant (`mimir:tenant_id` claim) | `MimirAllowedTenant` | **you** | `403` |
+
+Mimir uses one Cognito user pool and one app client for **all tenants in a region** (published at `https://<MimirInstance>.mjoll.no/api/v1`). The issuer and audience checks therefore only prove the caller is *some* Mimir user in that region. **Without `MimirAllowedTenant`, any Mimir user in the same region, in any tenant, can trigger your custom actions.** Each such request is allowed and logs a warning naming the caller's tenant; `cdk synth`/`deploy` also warn.
+
+Deployer steps:
+
+1. Set `MimirInstance` (e.g. `us`). `./deploy.sh` reads `https://<MimirInstance>.mjoll.no/api/v1` (public, no login) and passes the issuer and audience to CDK. Values you put in `MimirAllowedIssuer` / `MimirAllowedAudience` win. If your Mimir host is not `<instance>.mjoll.no`, export `MIMIR_API_BASE=https://<your-mimir-host>` before `./deploy.sh`.
+2. Set `MimirAllowedTenant` to your Mimir tenant id. If you don't know it, either ask Mimir support, or deploy once without it, run any custom action (e.g. **Summarize**), and search the `<prefix>-mimir-handler` CloudWatch log for `MIMIR_ALLOWED_TENANT is not set; allowing tenant`. The quoted value is the tenant of the user who ran the action; confirm it is yours.
+3. Redeploy. For the CodeBuild deployment, pass `MSAI_PARAM_OVERRIDES='{"MimirAllowedTenant":"<id>"}'` to `start-build`.
+
+If the issuer lookup fails at deploy time, `./deploy.sh` prints a warning and deploys with the issuer blank: every custom action is then rejected with `401` until you set `MimirAllowedIssuer` (the `clientConfig.cognitoEndpoint` value at that URL) and redeploy. Deploying with plain `cdk deploy` skips the lookup, so set both values yourself.
 
 ### Embeddings Filter (Optional)
 
@@ -368,6 +392,7 @@ Two constraints worth knowing before you design anything:
 | `backfill-stability.sh` | Run camera-stability analysis for clips ingested before the feature existed |
 | `upload-video-to-mimir.py` | Upload a video from S3 into an existing Mimir item |
 | `create-mimir-webhook.sh` | Interactive webhook creation |
+| `derive-mimir-auth.js` | Called by `deploy.sh`: reads the Mimir token issuer and audience from `https://<MimirInstance>.mjoll.no/api/v1` when `parameters.json` leaves them blank |
 | `clear-timed-metadata.js` | Clear chapter/marker data from a Mimir item (for testing) |
 | `test-vector-search.js` | Test embedding search queries |
 | `get-mimir-item-details.js` | Fetch item details from Mimir API |
@@ -410,7 +435,7 @@ This sample is intended for evaluation in non-production environments. Review IA
 API authentication in this sample:
 
 - **Mimir Webhooks API**: every route requires the `x-mimir-webhook-token` header, checked by a Lambda authorizer before any integration runs (see [Webhook authentication](#webhook-authentication)).
-- **Mimir custom actions** (`/actions/*` handled by `mimir-handler`): each request must carry a valid Mimir-issued Cognito ID token (`includeJWT`). Set `MimirAllowedIssuer` to your Mimir tenant's issuer; if it is blank, a valid ID token from any Amazon Cognito user pool is accepted.
+- **Mimir custom actions** (`/actions/*` handled by `mimir-handler`): each request must carry a valid Mimir-issued Cognito ID token (`includeJWT`), pinned to your Mimir region's issuer and, with `MimirAllowedTenant`, to your tenant. With no issuer configured every action is rejected; without a tenant any Mimir user in your region is accepted (see [Mimir custom action authentication](#mimir-custom-action-authentication)).
 - **Saga custom actions** (`/actions/generate-*`, `/actions/story-research`): the shared `SagaActionsApiKey` is checked in `saga-action-handler`.
 
 ## License

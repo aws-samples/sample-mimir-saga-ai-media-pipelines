@@ -34,10 +34,26 @@ export class InfrastructureStack extends cdk.Stack {
     // they go straight from parameters.json into Secrets Manager.
     const mimirInstance = this.node.tryGetContext('mimirInstance') || 'us';
     const summaryFieldName = this.node.tryGetContext('summaryFieldName') || 'description';
-    // Optional: pin the Cognito issuer allowed to invoke custom actions.
-    // Leave blank to accept any valid AWS Cognito issuer (token must still be
-    // signature-valid, unexpired, and a Cognito ID token).
-    const mimirAllowedIssuer = this.node.tryGetContext('mimirAllowedIssuer') || '';
+    // Required for Mimir custom actions: the Cognito issuer of your Mimir
+    // tenant. mimir-handler rejects every request (401) while it is blank,
+    // because any AWS account can mint valid tokens from its own Cognito pool.
+    const mimirAllowedIssuer = String(this.node.tryGetContext('mimirAllowedIssuer') || '').trim();
+    if (!mimirAllowedIssuer) {
+      cdk.Annotations.of(this).addWarningV2('msai:mimirAllowedIssuerUnset',
+        'MimirAllowedIssuer is not set: every Mimir custom action (Summarize, Chapterize, Reframe...) will be rejected with 401 until it is set. ./deploy.sh derives it from https://<MimirInstance>.mjoll.no/api/v1; when deploying another way, set it to clientConfig.cognitoEndpoint from that URL and redeploy. See README "Mimir custom action authentication".');
+    } else if (!/^https:\/\/cognito-idp\.[a-z0-9-]+\.amazonaws\.com\/[A-Za-z0-9_-]+$/.test(mimirAllowedIssuer)) {
+      throw new Error(`MimirAllowedIssuer must look like https://cognito-idp.<region>.amazonaws.com/<userPoolId>, got ${JSON.stringify(mimirAllowedIssuer)}`);
+    }
+    // Optional: comma-separated Mimir app client IDs to pin the token audience.
+    const mimirAllowedAudience = String(this.node.tryGetContext('mimirAllowedAudience') || '').trim();
+    // Recommended: your Mimir tenant id. The regional Mimir user pool and app
+    // client are shared by every tenant in the region, so without this any
+    // Mimir user in the region can trigger these custom actions.
+    const mimirAllowedTenant = String(this.node.tryGetContext('mimirAllowedTenant') || '').trim();
+    if (!mimirAllowedTenant) {
+      cdk.Annotations.of(this).addWarningV2('msai:mimirAllowedTenantUnset',
+        'MimirAllowedTenant is not set: any Mimir user in your Mimir region (not just your tenant) can trigger these custom actions. Set it to your Mimir tenant id (the mimir-handler log prints it after one action). See README "Mimir custom action authentication".');
+    }
     // When true, the Summarize action runs AWS Transcribe on items that lack a
     // Mimir transcript, publishes the transcript back to Mimir, and uses it in
     // the summary. Set to 'false' to keep summaries visual-only (avoids
@@ -773,6 +789,8 @@ export class InfrastructureStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(30),
       environment: {
         MIMIR_ALLOWED_ISSUER: mimirAllowedIssuer,
+        MIMIR_ALLOWED_AUDIENCE: mimirAllowedAudience,
+        MIMIR_ALLOWED_TENANT: mimirAllowedTenant,
         SUMMARIZER_STATE_MACHINE_ARN: processSummarizerStateMachine.stateMachineArn,
         CHAPTERIZE_STATE_MACHINE_ARN: processChapterizeStateMachine.stateMachineArn,
       },
