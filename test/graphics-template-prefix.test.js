@@ -21,7 +21,7 @@ describe('resolveGraphicsTemplatePrefix', () => {
   });
 
   it('accepts safe names', () => {
-    for (const ok of ['graphics-overlay', 'sinclair-demo', 'WPDE_v2.1', 'a']) {
+    for (const ok of ['graphics-overlay', 'sinclair-demo', 'station_v2.1', 'a']) {
       assert.equal(resolveGraphicsTemplatePrefix(ok), ok);
     }
     assert.equal(resolveGraphicsTemplatePrefix('  sinclair-demo '), 'sinclair-demo');
