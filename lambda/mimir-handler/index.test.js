@@ -347,3 +347,35 @@ describe('mimir-handler tenant pin (real verifier)', () => {
     assert.equal(res.statusCode, 400);
   });
 });
+
+describe('Lottie template keys (GraphicsTemplatePrefix)', () => {
+  const DEFAULT_KEYS = {
+    '9:16': 'templates/graphics-overlay-1080x1920-9x16.json',
+    '1:1': 'templates/graphics-overlay-1080x1080-1x1.json',
+    '4:5': 'templates/graphics-overlay-1080x1350-4x5.json',
+  };
+
+  let handler;
+  before(() => { ({ handler } = load({ issuer: TEST_ISSUER })); });
+  after(() => { delete process.env.LOTTIE_TEMPLATE_PREFIX; });
+
+  for (const action of ['reframe-with-graphics', 'reframe-custom']) {
+    it(`${action}: default prefix keeps today's graphics-overlay keys`, async () => {
+      delete process.env.LOTTIE_TEMPLATE_PREFIX;
+      const res = await handler(apiEvent(action, { items: [video], actionData: { title: 'T' } }));
+      assert.equal(res.statusCode, 200);
+      assert.deepEqual(JSON.parse(startCalls[0].input).lottieTemplates, DEFAULT_KEYS);
+    });
+
+    it(`${action}: a custom prefix names the customer template's keys`, async () => {
+      process.env.LOTTIE_TEMPLATE_PREFIX = 'sinclair-demo';
+      const res = await handler(apiEvent(action, { items: [video], actionData: { title: 'T' } }));
+      assert.equal(res.statusCode, 200);
+      assert.deepEqual(JSON.parse(startCalls[0].input).lottieTemplates, {
+        '9:16': 'templates/sinclair-demo-1080x1920-9x16.json',
+        '1:1': 'templates/sinclair-demo-1080x1080-1x1.json',
+        '4:5': 'templates/sinclair-demo-1080x1350-4x5.json',
+      });
+    });
+  }
+});

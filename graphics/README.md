@@ -32,7 +32,7 @@ Use them to verify the pipeline end to end before building anything bespoke: a
 fresh clone plus `cdk deploy` produces a deployment that can render an overlay.
 
 Naming convention: `{template-name}-{width}x{height}-{w}x{h}.json`
-(e.g. `graphics-overlay-1080x1920-9x16.json`). The Step Functions execution input maps each aspect ratio to a template key, so any naming works as long as it's consistent.
+(e.g. `graphics-overlay-1080x1920-9x16.json`). The pipeline builds each aspect ratio's key from the `GraphicsTemplatePrefix` deploy setting, so a template needs exactly these three suffixes: `-1080x1920-9x16.json`, `-1080x1080-1x1.json` and `-1080x1350-4x5.json`.
 
 Use `9x16` rather than `9:16` in filenames. Colons are illegal in Windows filenames, and these files get shared with customers who may be on Windows. Some existing templates still use colons for historical reasons.
 
@@ -41,6 +41,8 @@ Use `9x16` rather than `9:16` in filenames. Colons are illegal in Windows filena
 Templates in this directory are uploaded to the `{prefix}-lottie-templates-{account}-{region}` S3 bucket automatically on every `cdk deploy` (see `LottieTemplatesDeployment` in `lib/infrastructure-stack.ts`). The graphics overlay Lambda downloads the template at render time using the `templateKey` passed in the Step Functions execution input.
 
 > **Note:** `graphics/templates/*.json` is git-ignored. Make sure the template files are present locally before deploying, otherwise the bucket deployment will sync an empty folder.
+
+> **Do not upload a customer template over the reference keys** (`templates/graphics-overlay-*.json`) by hand. The bucket deployment owns those keys: the next deploy that changes anything in `graphics/templates/` re-syncs the folder and puts the reference template back. Give a customer template its own name, keep the file in your local `graphics/templates/`, and set the `GraphicsTemplatePrefix` deploy setting to that name (see the top-level README, *Choosing the template*).
 
 ## Template anatomy
 
@@ -297,8 +299,9 @@ export constraints, which is most of the work.
 6. **Name the files** following the convention and place them in
    `graphics/templates/`
 7. **Deploy** (`npx cdk deploy`) — templates upload to S3 automatically
-8. **Pass the template key** per aspect ratio in the `lottieTemplates` map of the
-   Step Functions execution input
+8. **Set `GraphicsTemplatePrefix`** in `parameters.json` to your template's base
+   name (e.g. `sinclair-demo` for `sinclair-demo-1080x1920-9x16.json`).
+   `mimir-handler` builds the per-aspect `lottieTemplates` keys from it
 
 If you change a structural layer name, change the matching string in
 `index.py` too. The name *is* the interface between the template and the
