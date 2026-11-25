@@ -384,6 +384,30 @@ class TestRunTimelineAssembly:
         assert mock_fail.call_args.kwargs["task_token"] == "token-abc"
         assert mock_fail.call_args.kwargs["error"] == "TimelineAssemblyError"
         mock_success.assert_not_called()
+        assert agent_instance.call_count == 2  # one retry before giving up
+
+    @patch("rough_cut_agent._save_artifact")
+    @patch("rough_cut_agent.update_story_status")
+    @patch("rough_cut_agent.create_timeline")
+    @patch("rough_cut_agent.send_task_success")
+    @patch("rough_cut_agent.send_task_failure")
+    @patch("rough_cut_agent.Agent")
+    @patch("rough_cut_agent.BedrockModel")
+    def test_retries_once_on_invalid_json(self, mock_bedrock_cls, mock_agent_cls, mock_fail, mock_success, mock_create, mock_update, mock_save):
+        # 2026-09-03: "Expecting ',' delimiter" from the model failed a run.
+        agent_instance = MagicMock()
+        agent_instance.side_effect = ['{"sequenceDetails": {"tracks": [}', json.dumps(_valid_assembly())]
+        mock_agent_cls.return_value = agent_instance
+        mock_create.return_value = json.dumps({"id": "timeline-001"})
+
+        result = run_timeline_assembly(
+            _valid_script_analysis(), _valid_source_material(), [],
+            "story-1", "Fire Story", "token-abc",
+        )
+        assert result["timelineItemId"] == "timeline-001"
+        assert agent_instance.call_count == 2
+        mock_fail.assert_not_called()
+        mock_success.assert_called_once()
 
     @patch("rough_cut_agent._save_artifact")
     @patch("rough_cut_agent.update_story_status")

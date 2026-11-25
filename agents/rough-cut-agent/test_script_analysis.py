@@ -298,3 +298,80 @@ class TestRunScriptAnalysis:
         # Pass an empty dict — all keys should default gracefully
         result = run_script_analysis({})
         assert result == valid
+
+
+# ---------------------------------------------------------------------------
+# Formatting differences between models are normalised, not fatal
+# ---------------------------------------------------------------------------
+
+class TestScriptAnalysisNormalisation:
+    def test_enum_case_and_whitespace_normalised(self):
+        data = _valid_analysis()
+        data["scriptFormat"] = " Broadcast Script "
+        data["parsedSections"][0]["sectionType"] = "PKG-VO"
+        _validate_script_analysis(data)
+        assert data["scriptFormat"] == "broadcast_script"
+        assert data["parsedSections"][0]["sectionType"] == "pkg_vo"
+
+    def test_numeric_strings_accepted(self):
+        data = _valid_analysis()
+        data["parsedSections"][0]["estimatedDurationMs"] = " 5000 "
+        data["totalEstimatedDurationMs"] = "12500.5"
+        _validate_script_analysis(data)
+        assert data["parsedSections"][0]["estimatedDurationMs"] == 5000
+        assert data["totalEstimatedDurationMs"] == 12500.5
+
+    def test_null_arrays_become_empty(self):
+        data = _valid_analysis()
+        data["soundbites"] = None
+        data["interviewSegments"] = None
+        data["body"]["mainPoints"] = None
+        _validate_script_analysis(data)
+        assert data["soundbites"] == [] and data["interviewSegments"] == []
+        assert data["body"]["mainPoints"] == []
+
+    def test_unknown_enum_and_non_numeric_still_raise(self):
+        data = _valid_analysis()
+        data["parsedSections"][0]["sectionType"] = "weather"
+        with pytest.raises(ValueError, match="sectionType"):
+            _validate_script_analysis(data)
+        data = _valid_analysis()
+        data["totalEstimatedDurationMs"] = "about a minute"
+        with pytest.raises(ValueError, match="must be a number"):
+            _validate_script_analysis(data)
+
+
+class TestScriptAnalysisRetry:
+    @patch("rough_cut_agent.Agent")
+    @patch("rough_cut_agent.BedrockModel")
+    def test_retries_once_on_invalid_json(self, mock_bedrock_cls, mock_agent_cls):
+        agent_instance = MagicMock()
+        agent_instance.side_effect = ['{"lead": {', json.dumps(_valid_analysis())]
+        mock_agent_cls.return_value = agent_instance
+
+        result = run_script_analysis({"title": "T", "description": "", "script": "", "notes": []})
+        assert result["scriptFormat"] == _valid_analysis()["scriptFormat"]
+        assert agent_instance.call_count == 2
+        assert mock_agent_cls.call_count == 2  # a fresh agent for the retry
+
+    @patch("rough_cut_agent.Agent")
+    @patch("rough_cut_agent.BedrockModel")
+    def test_gives_up_after_two_attempts(self, mock_bedrock_cls, mock_agent_cls):
+        agent_instance = MagicMock()
+        agent_instance.return_value = "not json"
+        mock_agent_cls.return_value = agent_instance
+
+        with pytest.raises(ValueError, match="invalid JSON"):
+            run_script_analysis({"title": "T", "description": "", "script": "", "notes": []})
+        assert agent_instance.call_count == 2
+
+    @patch("rough_cut_agent.Agent")
+    @patch("rough_cut_agent.BedrockModel")
+    def test_model_errors_are_not_retried(self, mock_bedrock_cls, mock_agent_cls):
+        agent_instance = MagicMock()
+        agent_instance.side_effect = RuntimeError("ResourceNotFoundException: end of its life")
+        mock_agent_cls.return_value = agent_instance
+
+        with pytest.raises(RuntimeError):
+            run_script_analysis({"title": "T", "description": "", "script": "", "notes": []})
+        assert agent_instance.call_count == 1
