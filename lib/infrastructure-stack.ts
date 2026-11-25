@@ -934,6 +934,9 @@ export class InfrastructureStack extends cdk.Stack {
         authorizationType: apigateway.AuthorizationType.CUSTOM,
       },
     });
+    // The CloudFormation-owned Deployment predates the removal of the OPTIONS
+    // mocks and still serves them; salting the logical id forces a clean one.
+    webhookApi.latestDeployment?.addToLogicalId({ snapshot: 'no-options-mocks-f1' });
 
     // Create Lambda for item change webhook
     const itemChangeHandler = new lambda.Function(this, 'ItemChangeWebhookHandler', {
