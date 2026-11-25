@@ -42,6 +42,8 @@ Templates in this directory are uploaded to the `{prefix}-lottie-templates-{acco
 
 > **Note:** `graphics/templates/*.json` is git-ignored. Make sure the template files are present locally before deploying, otherwise the bucket deployment will sync an empty folder.
 
+> **Do not upload a customer template over the reference keys** (`templates/graphics-overlay-*.json`) by hand. The bucket deployment owns those keys: the next deploy that changes anything in `graphics/templates/` re-syncs the folder and puts the reference template back. Give a customer template its own name, keep the file in your local `graphics/templates/`, and point `lottieTemplates` at it.
+
 ## Template anatomy
 
 A template is one After Effects project containing **one composition per delivery aspect ratio**, each at final pixel dimensions. Every comp is self-contained: it holds its own copy of the text layers, control nulls and category artwork, and shares only the category sidebar precomps.
