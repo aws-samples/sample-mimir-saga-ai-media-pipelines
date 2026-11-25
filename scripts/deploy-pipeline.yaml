@@ -152,7 +152,7 @@ Parameters:
       Base name of the Reframe + Graphics Lottie templates in the templates
       bucket (templates/<prefix>-1080x1920-9x16.json and the 1x1 / 4x5
       files). Default graphics-overlay is the reference template every deploy
-      uploads. Use your own name (e.g. sinclair-demo) for a customer template
+      uploads. Use your own name (e.g. my-station) for a customer template
       you upload yourself, so the deploy never overwrites it. Seeds SSM on
       the first build only; later, change it with MSAI_PARAM_OVERRIDES.
 

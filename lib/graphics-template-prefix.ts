@@ -16,7 +16,7 @@ export function resolveGraphicsTemplatePrefix(raw: unknown): string {
     throw new Error(
       `GraphicsTemplatePrefix ${JSON.stringify(value)} is not a valid template name. ` +
       'Use 1-100 letters, digits, ".", "_" or "-", starting with a letter or digit, ' +
-      'with no "/" or "..", e.g. "graphics-overlay" or "sinclair-demo".');
+      'with no "/" or "..", e.g. "graphics-overlay" or "my-station".');
   }
   return value;
 }

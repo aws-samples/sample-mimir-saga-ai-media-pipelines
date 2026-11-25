@@ -300,7 +300,7 @@ export constraints, which is most of the work.
    `graphics/templates/`
 7. **Deploy** (`npx cdk deploy`) — templates upload to S3 automatically
 8. **Set `GraphicsTemplatePrefix`** in `parameters.json` to your template's base
-   name (e.g. `sinclair-demo` for `sinclair-demo-1080x1920-9x16.json`).
+   name (e.g. `my-station` for `my-station-1080x1920-9x16.json`).
    `mimir-handler` builds the per-aspect `lottieTemplates` keys from it
 
 If you change a structural layer name, change the matching string in

@@ -21,10 +21,10 @@ describe('resolveGraphicsTemplatePrefix', () => {
   });
 
   it('accepts safe names', () => {
-    for (const ok of ['graphics-overlay', 'sinclair-demo', 'station_v2.1', 'a']) {
+    for (const ok of ['graphics-overlay', 'my-station', 'station_v2.1', 'a']) {
       assert.equal(resolveGraphicsTemplatePrefix(ok), ok);
     }
-    assert.equal(resolveGraphicsTemplatePrefix('  sinclair-demo '), 'sinclair-demo');
+    assert.equal(resolveGraphicsTemplatePrefix('  my-station '), 'my-station');
   });
 
   it('rejects slashes, "..", spaces and other unsafe characters', () => {
@@ -36,7 +36,7 @@ describe('resolveGraphicsTemplatePrefix', () => {
 });
 
 describe('InfrastructureStack synth', () => {
-  for (const bad of ['../sinclair-demo', 'templates/sinclair-demo']) {
+  for (const bad of ['../my-station', 'templates/my-station']) {
     it(`rejects GraphicsTemplatePrefix ${JSON.stringify(bad)}`, () => {
       const app = new cdk.App({ context: { graphicsTemplatePrefix: bad } });
       assert.throws(

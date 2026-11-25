@@ -187,13 +187,13 @@ describe('Lottie template keys (GraphicsTemplatePrefix)', () => {
     });
 
     it(`${action}: a custom prefix names the customer template's keys`, async () => {
-      process.env.LOTTIE_TEMPLATE_PREFIX = 'sinclair-demo';
+      process.env.LOTTIE_TEMPLATE_PREFIX = 'my-station';
       const res = await handler(apiEvent(action, { items: [video], actionData: { title: 'T' } }));
       assert.equal(res.statusCode, 200);
       assert.deepEqual(JSON.parse(startCalls[0].input).lottieTemplates, {
-        '9:16': 'templates/sinclair-demo-1080x1920-9x16.json',
-        '1:1': 'templates/sinclair-demo-1080x1080-1x1.json',
-        '4:5': 'templates/sinclair-demo-1080x1350-4x5.json',
+        '9:16': 'templates/my-station-1080x1920-9x16.json',
+        '1:1': 'templates/my-station-1080x1080-1x1.json',
+        '4:5': 'templates/my-station-1080x1350-4x5.json',
       });
     });
   }

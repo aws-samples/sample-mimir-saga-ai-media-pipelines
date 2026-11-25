@@ -37,7 +37,7 @@
   {
     "ParameterKey": "GraphicsTemplatePrefix",
     "ParameterValue": "graphics-overlay",
-    "Description": "Base name of the Reframe + Graphics Lottie templates in the templates bucket: templates/<prefix>-1080x1920-9x16.json, -1080x1080-1x1.json and -1080x1350-4x5.json. Default 'graphics-overlay' is the reference template that every deploy uploads from graphics/templates/. For a customer template use its own name (e.g. 'sinclair-demo') so the deploy never overwrites it. Letters, digits, '.', '_' and '-' only; no '/' or '..'."
+    "Description": "Base name of the Reframe + Graphics Lottie templates in the templates bucket: templates/<prefix>-1080x1920-9x16.json, -1080x1080-1x1.json and -1080x1350-4x5.json. Default 'graphics-overlay' is the reference template that every deploy uploads from graphics/templates/. For a customer template use its own name (e.g. 'my-station') so the deploy never overwrites it. Letters, digits, '.', '_' and '-' only; no '/' or '..'."
   },
   {
     "ParameterKey": "EnableEmbeddingsWebhook",
