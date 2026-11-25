@@ -63,5 +63,15 @@
     "ParameterKey": "EmbeddingsFilterFieldKey",
     "ParameterValue": "",
     "Description": "Optional, usually blank. Explicit metadata.formData key (e.g. the field UUID) for the pipeline's defensive filter check. Blank = the pipeline tries formData[field], formData['default_' + field], then the field UUID looked up in the Mimir metadata forms, and lets the item through if the field cannot be resolved."
+  },
+  {
+    "ParameterKey": "PollyEngine",
+    "ParameterValue": "generative",
+    "Description": "Amazon Polly engine for AI voice-over narration: 'generative' (default, most natural, $30 per 1M characters), 'neural' ($16), 'long-form' ($100, us-east-1 only) or 'standard'. If the voice has no variant on this engine, narration falls back to neural Matthew."
+  },
+  {
+    "ParameterKey": "PollyVoiceId",
+    "ParameterValue": "Stephen",
+    "Description": "Amazon Polly voice ID for AI voice-over narration (default: Stephen). Must support PollyEngine. For about half the cost, set PollyVoiceId to Matthew and PollyEngine to neural. US English generative voices: Matthew, Stephen, Kenneth, Nate (male); Ruth, Danielle, Joanna, Salli, Tiffany (female). Long-form: Gregory, Patrick (male); Ruth, Danielle (female). A cloned (custom) voice ID also works with the generative engine."
   }
 ]

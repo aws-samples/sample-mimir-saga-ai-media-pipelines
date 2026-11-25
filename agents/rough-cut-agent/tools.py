@@ -952,6 +952,87 @@ def get_word_timing(mimir_item_id: str, start_time: float, end_time: float) -> s
 
 
 # ---------------------------------------------------------------------------
+# Amazon Polly synthesis (shared by generate_voiceover and the Python VO stage)
+# ---------------------------------------------------------------------------
+
+_POLLY_ENGINES = {"standard", "neural", "long-form", "generative"}
+# Used when the configured engine/voice pair is rejected (e.g. a voice that has
+# no generative variant, or an engine not offered in the deploy Region).
+_POLLY_FALLBACK_ENGINE = "neural"
+_POLLY_FALLBACK_VOICE = "Matthew"
+# SynthesizeSpeech accepts at most 3,000 billed characters per request, on every
+# engine. Text is sent as plain text, so engine-specific SSML limits don't apply.
+_POLLY_MAX_CHARS = 3000
+
+
+def _chunk_for_polly(text: str, limit: int = _POLLY_MAX_CHARS) -> list[str]:
+    """Split *text* into pieces of at most *limit* chars, at sentence breaks when possible."""
+    chunks: list[str] = []
+    current = ""
+    for sentence in re.split(r"(?<=[.!?])\s+", text.strip()):
+        while len(sentence) > limit:  # one run-on sentence longer than the limit
+            cut = sentence.rfind(" ", 0, limit)
+            cut = cut if cut > 0 else limit
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(sentence[:cut].strip())
+            sentence = sentence[cut:].strip()
+        candidate = f"{current} {sentence}".strip()
+        if len(candidate) > limit:
+            chunks.append(current)
+            current = sentence
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def polly_voice_config() -> tuple[str, str]:
+    """Return the (engine, voice_id) configured through POLLY_ENGINE / POLLY_VOICE_ID."""
+    engine = os.environ.get("POLLY_ENGINE", "generative").strip().lower()
+    voice_id = os.environ.get("POLLY_VOICE_ID", "Stephen").strip()
+    if engine not in _POLLY_ENGINES:
+        logger.warning(f"Unknown POLLY_ENGINE '{engine}', using '{_POLLY_FALLBACK_ENGINE}'")
+        engine = _POLLY_FALLBACK_ENGINE
+    return engine, voice_id or _POLLY_FALLBACK_VOICE
+
+
+def synthesize_speech_mp3(text: str) -> bytes:
+    """Synthesize *text* to MP3 (24 kHz, 48 kbps on every engine) with the configured voice.
+
+    Text longer than one request allows is split at sentence breaks and the MP3
+    pieces are joined. If Polly rejects the configured engine/voice pair, the
+    request is retried once with the neural Matthew voice so a bad setting
+    degrades the voice instead of dropping the narration.
+    """
+    engine, voice_id = polly_voice_config()
+    polly_client = boto3.client("polly")
+
+    def _synthesize(eng: str, voice: str) -> bytes:
+        return b"".join(
+            polly_client.synthesize_speech(
+                Text=chunk, OutputFormat="mp3", Engine=eng, VoiceId=voice,
+            )["AudioStream"].read()
+            for chunk in _chunk_for_polly(text)
+        )
+
+    try:
+        return _synthesize(engine, voice_id)
+    except Exception as e:
+        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        fallback = (_POLLY_FALLBACK_ENGINE, _POLLY_FALLBACK_VOICE)
+        if code != "ValidationException" or (engine, voice_id) == fallback:
+            raise
+        logger.warning(
+            f"Polly rejected engine={engine} voice={voice_id} ({e}); "
+            f"retrying with engine={fallback[0]} voice={fallback[1]}"
+        )
+        return _synthesize(*fallback)
+
+
+# ---------------------------------------------------------------------------
 # Tool 8: generate_voiceover
 # ---------------------------------------------------------------------------
 
@@ -959,8 +1040,8 @@ def get_word_timing(mimir_item_id: str, start_time: float, end_time: float) -> s
 def generate_voiceover(text: str, story_id: str, section_index: int) -> str:
     """Synthesize voice-over audio from text using Amazon Polly.
 
-    Calls Polly SynthesizeSpeech with neural engine, mp3 output,
-    and configurable voice ID. Stores the result in S3 at
+    Calls Polly SynthesizeSpeech with the engine and voice configured
+    through POLLY_ENGINE / POLLY_VOICE_ID, mp3 output. Stores the result in S3 at
     voiceover/{story_id}/{section_index}.mp3.
 
     Args:
@@ -971,7 +1052,7 @@ def generate_voiceover(text: str, story_id: str, section_index: int) -> str:
     Returns:
         JSON with s3Uri, durationMs, and sectionIndex.
     """
-    voice_id = os.environ.get("POLLY_VOICE_ID", "Matthew")
+    engine, voice_id = polly_voice_config()
     bucket = os.environ.get("TRANSCRIPT_STAGING_BUCKET")
 
     if not bucket:
@@ -985,18 +1066,10 @@ def generate_voiceover(text: str, story_id: str, section_index: int) -> str:
         return json.dumps({"error": "No speakable text after cue sanitization", "sectionIndex": section_index})
 
     s3_key = f"voiceover/{story_id}/{section_index}.mp3"
-    logger.info(f"Generating voiceover for story {story_id}, section {section_index} with voice {voice_id}")
+    logger.info(f"Generating voiceover for story {story_id}, section {section_index} with {engine} voice {voice_id}")
 
     try:
-        polly_client = boto3.client("polly")
-        response = polly_client.synthesize_speech(
-            Text=spoken_text,
-            OutputFormat="mp3",
-            Engine="neural",
-            VoiceId=voice_id,
-        )
-
-        audio_bytes = response["AudioStream"].read()
+        audio_bytes = synthesize_speech_mp3(spoken_text)
 
         # Store audio in S3
         s3_client = boto3.client("s3")
@@ -1007,7 +1080,7 @@ def generate_voiceover(text: str, story_id: str, section_index: int) -> str:
             ContentType="audio/mpeg",
         )
 
-        # Estimate duration: Polly neural mp3 is ~48kbps → 48000 bits/s → 6000 bytes/s
+        # Estimate duration: Polly mp3 is 48kbps on every engine → 6000 bytes/s
         duration_ms = len(audio_bytes) / (48000 / 8) * 1000
         s3_uri = f"s3://{bucket}/{s3_key}"
 

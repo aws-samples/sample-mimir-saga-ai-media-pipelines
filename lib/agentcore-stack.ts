@@ -40,6 +40,13 @@ export class AgentCoreStack extends cdk.Stack {
       this, '/infrastructure/media-analysis-bucket-name'
     );
 
+    // AI voice-over voice (parameters.json: PollyEngine / PollyVoiceId).
+    const pollyEngine = String(this.node.tryGetContext('pollyEngine') || 'generative').toLowerCase();
+    const pollyVoiceId = String(this.node.tryGetContext('pollyVoiceId') || 'Stephen');
+    if (!['standard', 'neural', 'long-form', 'generative'].includes(pollyEngine)) {
+      throw new Error(`PollyEngine must be standard, neural, long-form or generative (got '${pollyEngine}')`);
+    }
+
     // Deploy agents on AgentCore Runtime
     this.multiAgentCore = new MultiAgentCore(this, 'MultiAgentCore', {
       projectName: 'fonn-group-custom-actions',
@@ -61,7 +68,8 @@ export class AgentCoreStack extends cdk.Stack {
             VECTOR_INDEX_NAME: 'video-embeddings-index',
             TRANSCRIPT_STAGING_BUCKET: videoStagingBucketName,
             STABILITY_BUCKET: mediaAnalysisBucketName,
-            POLLY_VOICE_ID: 'Matthew',
+            POLLY_VOICE_ID: pollyVoiceId,
+            POLLY_ENGINE: pollyEngine,
             AGENT_MODEL_ID: 'us.anthropic.claude-sonnet-4-6',
           },
         },
