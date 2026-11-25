@@ -3,10 +3,63 @@ const { JwtRsaVerifier } = require('aws-jwt-verify');
 
 const sfnClient = new SFNClient();
 
-// Optional issuer pinning: if MIMIR_ALLOWED_ISSUER is set, only tokens from that
-// exact Cognito issuer are accepted. If unset, any AWS Cognito issuer is allowed
-// (the token must still be signature-valid, unexpired, and a Cognito ID token).
-const ALLOWED_ISSUER = process.env.MIMIR_ALLOWED_ISSUER || '';
+// Required: the Cognito issuer of your Mimir tenant's user pool. Only tokens from
+// this exact issuer are accepted. When it is unset, EVERY request is rejected:
+// any AWS account can create a Cognito pool and mint valid ID tokens, so
+// "any Cognito issuer" is no authentication at all.
+const ALLOWED_ISSUER = (process.env.MIMIR_ALLOWED_ISSUER || '').trim();
+// Optional: comma-separated Mimir app client IDs (the token's `aud` claim).
+// Blank means the audience is not checked.
+const ALLOWED_AUDIENCE = (process.env.MIMIR_ALLOWED_AUDIENCE || '')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+const COGNITO_ISSUER_RE = /^https:\/\/cognito-idp\.[a-z0-9-]+\.amazonaws\.com\/[A-Za-z0-9_-]+$/;
+
+if (!ALLOWED_ISSUER) {
+  console.error('MIMIR_ALLOWED_ISSUER is not set: all Mimir custom actions will be rejected (401) until MimirAllowedIssuer is configured and the stack redeployed.');
+}
+
+// Recommended: your Mimir tenant id. The regional Mimir user pool and app
+// client are shared by every tenant in that region, so the issuer (and
+// audience) pin only proves "some Mimir user in this region". When set, the
+// verified token's `mimir:tenant_id` must equal it (403 otherwise).
+// shortcut: blank still allows any tenant (with a warning) so the issuer
+// rollout does not break existing deploys; make it required in a later release.
+const ALLOWED_TENANT = (process.env.MIMIR_ALLOWED_TENANT || '').trim();
+// Mimir's own web app reads the tenant from `mimir:tenant_id` first. The
+// `custom:` claim is a Cognito user attribute, which an app client can allow
+// users to write, so it is only cross-checked, never trusted on its own.
+const TENANT_CLAIM = 'mimir:tenant_id';
+const CUSTOM_TENANT_CLAIM = 'custom:tenant_id';
+
+if (!ALLOWED_TENANT) {
+  console.warn('MIMIR_ALLOWED_TENANT is not set: any Mimir user in this region can trigger these custom actions. Set MimirAllowedTenant (see the README).');
+}
+
+class ForbiddenError extends Error {}
+
+/**
+ * Tenant check on VERIFIED claims. Throws ForbiddenError (-> 403) when the
+ * tenant claim is missing, the two tenant claims disagree, or the tenant is
+ * not MIMIR_ALLOWED_TENANT. Returns the tenant id.
+ */
+function checkTenant(claims) {
+  const tenant = claims[TENANT_CLAIM];
+  const custom = claims[CUSTOM_TENANT_CLAIM];
+  if (typeof tenant !== 'string' || tenant === '') {
+    throw new ForbiddenError(`Token has no ${TENANT_CLAIM} claim`);
+  }
+  if (custom !== undefined && custom !== tenant) {
+    throw new ForbiddenError(`Token tenant claims disagree (${TENANT_CLAIM} ${quoteIssuer(tenant)}, ${CUSTOM_TENANT_CLAIM} ${quoteIssuer(custom)})`);
+  }
+  if (!ALLOWED_TENANT) {
+    console.warn(`MIMIR_ALLOWED_TENANT is not set; allowing tenant ${quoteIssuer(tenant)}. Set MimirAllowedTenant to this value if it is your Mimir tenant.`);
+    return tenant;
+  }
+  if (tenant !== ALLOWED_TENANT) {
+    throw new ForbiddenError(`Tenant not allowed: ${quoteIssuer(tenant)}`);
+  }
+  return tenant;
+}
 
 // Lottie template key per aspect ratio in the templates bucket. The base name
 // comes from the GraphicsTemplatePrefix deploy setting (validated at synth);
@@ -26,11 +79,14 @@ function getVerifier(issuer) {
     verifierCache[issuer] = JwtRsaVerifier.create({
       issuer,
       jwksUri: `${issuer}/.well-known/jwks.json`,
-      audience: null, // Mimir app client ID varies per tenant; audience not pinned
+      audience: ALLOWED_AUDIENCE.length ? ALLOWED_AUDIENCE : null,
     });
   }
   return verifierCache[issuer];
 }
+
+// Issuer strings come from an unverified token: quote and cap them in messages.
+const quoteIssuer = (iss) => JSON.stringify(String(iss).slice(0, 200));
 
 /**
  * Validates the Mimir-issued user JWT (sent when a custom action has
@@ -48,11 +104,13 @@ async function validateMimirUserToken(userToken) {
   const claims = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf-8'));
   const issuer = claims.iss;
 
-  if (!issuer || !/^https:\/\/cognito-idp\.[a-z0-9-]+\.amazonaws\.com\/[A-Za-z0-9_-]+$/.test(issuer)) {
-    throw new Error(`Untrusted token issuer: ${issuer}`);
+  if (!ALLOWED_ISSUER) {
+    // Fail closed. The (unverified) issuer is logged so an operator can find
+    // their tenant's value; confirm it belongs to your Mimir tenant first.
+    throw new Error(`MIMIR_ALLOWED_ISSUER is not configured; rejecting token (unverified iss ${quoteIssuer(issuer)})`);
   }
-  if (ALLOWED_ISSUER && issuer !== ALLOWED_ISSUER) {
-    throw new Error(`Token issuer not allowed: ${issuer}`);
+  if (!issuer || issuer !== ALLOWED_ISSUER || !COGNITO_ISSUER_RE.test(issuer)) {
+    throw new Error(`Token issuer not allowed: ${quoteIssuer(issuer)}`);
   }
 
   // Verify signature + expiry against the issuer's JWKS.
@@ -127,6 +185,9 @@ function buildReframeGraphicsOverrides(actionData) {
 // Exported for unit tests
 module.exports.buildReframeGraphicsOverrides = buildReframeGraphicsOverrides;
 module.exports.redactEventForLog = redactEventForLog;
+module.exports.validateMimirUserToken = validateMimirUserToken;
+module.exports.checkTenant = checkTenant;
+module.exports._getVerifier = getVerifier;
 module.exports.lottieTemplateKeys = lottieTemplateKeys;
 
 /**
@@ -187,13 +248,15 @@ exports.handler = async (event) => {
     // relying on a shared API key / Mimir custom-header configuration.
     try {
       const claims = await validateMimirUserToken(userToken);
-      console.log(`Authenticated Mimir user: ${claims.email || claims.sub} (tenant: ${claims['mimir:tenant_id'] || claims['custom:tenant_id'] || 'unknown'})`);
+      const tenant = checkTenant(claims);
+      console.log(`Authenticated Mimir user: ${claims.email || claims.sub} (tenant: ${tenant})`);
     } catch (authErr) {
-      console.error('Token validation failed:', authErr.message);
+      const forbidden = authErr instanceof ForbiddenError;
+      console.error(`Token validation failed${forbidden ? ' (tenant)' : ''}:`, authErr.message);
       return {
-        statusCode: 401,
+        statusCode: forbidden ? 403 : 401,
         headers: corsHeaders,
-        body: JSON.stringify({ message: 'Unauthorized', status: 'error' }),
+        body: JSON.stringify({ message: forbidden ? 'Forbidden' : 'Unauthorized', status: 'error' }),
       };
     }
     

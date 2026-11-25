@@ -27,7 +27,17 @@
   {
     "ParameterKey": "MimirAllowedIssuer",
     "ParameterValue": "",
-    "Description": "Optional. Pin the Cognito issuer URL allowed to invoke custom actions (e.g. https://cognito-idp.us-east-1.amazonaws.com/us-east-1_XXXXXXXXX). Leave blank to accept any valid AWS Cognito issuer — tokens must still be signature-valid, unexpired Cognito ID tokens. Set this to lock the API to your specific Mimir tenant."
+    "Description": "Usually leave blank: ./deploy.sh derives it from Mimir's public config at https://<MimirInstance>.mjoll.no/api/v1 (clientConfig.cognitoEndpoint). Set it only to override, e.g. https://cognito-idp.us-east-1.amazonaws.com/us-east-1_XXXXXXXXX. If it is blank at deploy time (derivation failed, or you deploy without deploy.sh), every Mimir custom action is rejected with 401."
+  },
+  {
+    "ParameterKey": "MimirAllowedAudience",
+    "ParameterValue": "",
+    "Description": "Usually leave blank: ./deploy.sh derives it from the same public config (clientConfig.appClientId). Comma-separated Mimir app client IDs (the ID token's 'aud' claim). The client is shared by all tenants in a Mimir region, so this is not a tenant check."
+  },
+  {
+    "ParameterKey": "MimirAllowedTenant",
+    "ParameterValue": "",
+    "Description": "Recommended. Your Mimir tenant id (the token's mimir:tenant_id claim). Mimir shares one Cognito user pool across all tenants in a region, so while this is blank ANY Mimir user in your region can trigger your custom actions. To find it, run any custom action once and read the 'MIMIR_ALLOWED_TENANT is not set; allowing tenant ...' line in the mimir-handler log, or ask Mimir support."
   },
   {
     "ParameterKey": "EnableTranscribeFallback",
@@ -58,5 +68,15 @@
     "ParameterKey": "EmbeddingsFilterFieldKey",
     "ParameterValue": "",
     "Description": "Optional, usually blank. Explicit metadata.formData key (e.g. the field UUID) for the pipeline's defensive filter check. Blank = the pipeline tries formData[field], formData['default_' + field], then the field UUID looked up in the Mimir metadata forms, and lets the item through if the field cannot be resolved."
+  },
+  {
+    "ParameterKey": "PollyEngine",
+    "ParameterValue": "generative",
+    "Description": "Amazon Polly engine for AI voice-over narration: 'generative' (default, most natural, $30 per 1M characters), 'neural' ($16), 'long-form' ($100, us-east-1 only) or 'standard'. If the voice has no variant on this engine, narration falls back to neural Matthew."
+  },
+  {
+    "ParameterKey": "PollyVoiceId",
+    "ParameterValue": "Stephen",
+    "Description": "Amazon Polly voice ID for AI voice-over narration (default: Stephen). Must support PollyEngine. For about half the cost, set PollyVoiceId to Matthew and PollyEngine to neural. US English generative voices: Matthew, Stephen, Kenneth, Nate (male); Ruth, Danielle, Joanna, Salli, Tiffany (female). Long-form: Gregory, Patrick (male); Ruth, Danielle (female). A cloned (custom) voice ID also works with the generative engine."
   }
 ]
