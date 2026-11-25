@@ -14,6 +14,7 @@ import * as s3vectors from 'aws-cdk-lib/aws-s3vectors';
 import { Construct } from 'constructs';
 import * as path from 'path';
 import { valueLessSecret } from './constructs/value-less-secret';
+import { resolveGraphicsTemplatePrefix } from './graphics-template-prefix';
 
 export interface InfrastructureStackProps extends cdk.StackProps {
   // Product display name, e.g. "Mimir Saga AI"
@@ -67,6 +68,11 @@ export class InfrastructureStack extends cdk.Stack {
     // 'false' = register no embed webhook in Mimir (removes an existing one).
     // The embedding state machine stays deployed for scripts and Rough Cut.
     const enableEmbeddingsWebhook = String(this.node.tryGetContext('enableEmbeddingsWebhook') ?? 'true') !== 'false';
+    // Base name of the Reframe + Graphics Lottie templates in the templates
+    // bucket (`templates/<prefix>-<w>x<h>-<aspect>.json`). Default
+    // 'graphics-overlay' is the reference template the bucket deployment
+    // uploads; give a customer template its own prefix. Throws on a bad value.
+    const graphicsTemplatePrefix = resolveGraphicsTemplatePrefix(this.node.tryGetContext('graphicsTemplatePrefix'));
 
     // S3 bucket for processed video outputs
     const outputBucket = new s3.Bucket(this, 'ReframedVideoBucket', {
@@ -773,6 +779,7 @@ export class InfrastructureStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(30),
       environment: {
         MIMIR_ALLOWED_ISSUER: mimirAllowedIssuer,
+        LOTTIE_TEMPLATE_PREFIX: graphicsTemplatePrefix,
         SUMMARIZER_STATE_MACHINE_ARN: processSummarizerStateMachine.stateMachineArn,
         CHAPTERIZE_STATE_MACHINE_ARN: processChapterizeStateMachine.stateMachineArn,
       },
@@ -3282,7 +3289,7 @@ export class InfrastructureStack extends cdk.Stack {
       lambdaFunction: graphicsOverlayHandler,
       payload: stepfunctions.TaskInput.fromObject({
         'templateBucket': lottieTemplatesBucket.bucketName,
-        'templateKey': 'templates/graphics-overlay-1080x1920-9x16.json',
+        'templateKey': `templates/${graphicsTemplatePrefix}-1080x1920-9x16.json`,
         'outputBucket': outputBucket.bucketName,
         'itemId.$': '$$.Execution.Input.itemId',
         'baseFilename.$': '$$.Execution.Input.baseFilename',

@@ -14,7 +14,8 @@ Pipeline:
   7. Upload MOV to S3, return the S3 URI
 
 Templates: one Lottie JSON per aspect ratio, in the LOTTIE_TEMPLATES_BUCKET
-under templates/ —
+under templates/. The caller passes the key; `graphics-overlay` below is the
+default GraphicsTemplatePrefix deploy setting —
   - graphics-overlay-1080x1920-9x16.json   (9:16)
   - graphics-overlay-1080x1080-1x1.json    (1:1)
   - graphics-overlay-1080x1350-4x5.json    (4:5)

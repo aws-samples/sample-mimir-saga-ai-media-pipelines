@@ -8,6 +8,17 @@ const sfnClient = new SFNClient();
 // (the token must still be signature-valid, unexpired, and a Cognito ID token).
 const ALLOWED_ISSUER = process.env.MIMIR_ALLOWED_ISSUER || '';
 
+// Lottie template key per aspect ratio in the templates bucket. The base name
+// comes from the GraphicsTemplatePrefix deploy setting (validated at synth);
+// 'graphics-overlay' is the reference template the bucket deployment uploads.
+function lottieTemplateKeys(prefix = process.env.LOTTIE_TEMPLATE_PREFIX || 'graphics-overlay') {
+  return {
+    '9:16': `templates/${prefix}-1080x1920-9x16.json`,
+    '1:1':  `templates/${prefix}-1080x1080-1x1.json`,
+    '4:5':  `templates/${prefix}-1080x1350-4x5.json`,
+  };
+}
+
 // Cache one JWT verifier per issuer (JWKS is fetched and cached by the verifier).
 const verifierCache = {};
 function getVerifier(issuer) {
@@ -116,6 +127,7 @@ function buildReframeGraphicsOverrides(actionData) {
 // Exported for unit tests
 module.exports.buildReframeGraphicsOverrides = buildReframeGraphicsOverrides;
 module.exports.redactEventForLog = redactEventForLog;
+module.exports.lottieTemplateKeys = lottieTemplateKeys;
 
 /**
  * Check the raw API Gateway body before any token or Mimir work. Returns
@@ -306,11 +318,7 @@ exports.handler = async (event) => {
             description: itemDesc,
             transcript: '',
             // Per-aspect-ratio template keys — each size has its own Lottie JSON
-            lottieTemplates: {
-              '9:16': 'templates/graphics-overlay-1080x1920-9x16.json',
-              '1:1':  'templates/graphics-overlay-1080x1080-1x1.json',
-              '4:5':  'templates/graphics-overlay-1080x1350-4x5.json',
-            },
+            lottieTemplates: lottieTemplateKeys(),
             aspectRatios: ['9:16', '1:1', '4:5'],
             outputPrefix: `reframe-with-graphics/${item.id}/${Date.now()}`,
             userMetadata,
@@ -370,11 +378,7 @@ exports.handler = async (event) => {
             title: itemTitle,
             description: itemDesc,
             transcript: '',
-            lottieTemplates: {
-              '9:16': 'templates/graphics-overlay-1080x1920-9x16.json',
-              '1:1':  'templates/graphics-overlay-1080x1080-1x1.json',
-              '4:5':  'templates/graphics-overlay-1080x1350-4x5.json',
-            },
+            lottieTemplates: lottieTemplateKeys(),
             aspectRatios: ['9:16'],
             varianceThreshold: 5000,
             executionTimestamp: Date.now(),

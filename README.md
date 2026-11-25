@@ -208,7 +208,7 @@ Never pass API keys in `--environment-variables-override` as `PLAINTEXT`: overri
      { "ParameterKey": "MimirInstance", "ParameterValue": "us" }
    ]
    ```
-   Optional parameters: `SummaryFieldName`, `MimirAllowedIssuer`, `EnableTranscribeFallback`, `EnableEmbeddingsWebhook`, `EmbeddingsFilterField`, `EmbeddingsFilterValues`, `EmbeddingsFilterFieldKey` — see `parameters.example.json` for descriptions and [Embeddings Filter](#embeddings-filter-optional).
+   Optional parameters: `SummaryFieldName`, `MimirAllowedIssuer`, `EnableTranscribeFallback`, `EnableEmbeddingsWebhook`, `EmbeddingsFilterField`, `EmbeddingsFilterValues`, `EmbeddingsFilterFieldKey`, `GraphicsTemplatePrefix` — see `parameters.example.json` for descriptions, [Embeddings Filter](#embeddings-filter-optional) and [Choosing the template](#choosing-the-template).
 3. Install dependencies:
    ```bash
    npm install
@@ -336,6 +336,19 @@ The full table, with the reason behind each, is in
 After exporting, name the files per the convention in
 [graphics/README.md](graphics/README.md), drop them in `graphics/templates/`,
 and deploy.
+
+### Choosing the template
+
+The pipeline reads `templates/<GraphicsTemplatePrefix>-1080x1920-9x16.json`,
+`-1080x1080-1x1.json` and `-1080x1350-4x5.json` from the templates bucket.
+The default prefix, `graphics-overlay`, is the committed reference template,
+and every deploy that changes `graphics/templates/` re-uploads it. For a
+customer template, export it under its own name (for example
+`sinclair-demo-1080x1920-9x16.json`) and set `GraphicsTemplatePrefix` to that
+name (`sinclair-demo`). With the CodeBuild deployment, pass
+`MSAI_PARAM_OVERRIDES='{"GraphicsTemplatePrefix":"sinclair-demo"}'` once; it
+is then kept in the SSM config. The value must be 1-100 letters, digits, `.`,
+`_` or `-` with no `/` or `..`, or `cdk synth` fails.
 
 ### Authoring guidelines
 
