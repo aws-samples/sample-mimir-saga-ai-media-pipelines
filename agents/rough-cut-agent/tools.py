@@ -992,7 +992,7 @@ def _chunk_for_polly(text: str, limit: int = _POLLY_MAX_CHARS) -> list[str]:
 def polly_voice_config() -> tuple[str, str]:
     """Return the (engine, voice_id) configured through POLLY_ENGINE / POLLY_VOICE_ID."""
     engine = os.environ.get("POLLY_ENGINE", "generative").strip().lower()
-    voice_id = os.environ.get("POLLY_VOICE_ID", "Matthew").strip()
+    voice_id = os.environ.get("POLLY_VOICE_ID", "Stephen").strip()
     if engine not in _POLLY_ENGINES:
         logger.warning(f"Unknown POLLY_ENGINE '{engine}', using '{_POLLY_FALLBACK_ENGINE}'")
         engine = _POLLY_FALLBACK_ENGINE

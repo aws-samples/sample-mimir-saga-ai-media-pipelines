@@ -61,7 +61,7 @@
   },
   {
     "ParameterKey": "PollyVoiceId",
-    "ParameterValue": "Matthew",
-    "Description": "Amazon Polly voice ID for AI voice-over narration. Must support PollyEngine. US English generative voices: Matthew, Stephen, Kenneth, Nate (male); Ruth, Danielle, Joanna, Salli, Tiffany (female). Long-form: Gregory, Patrick (male); Ruth, Danielle (female). A cloned (custom) voice ID also works with the generative engine."
+    "ParameterValue": "Stephen",
+    "Description": "Amazon Polly voice ID for AI voice-over narration (default: Stephen). Must support PollyEngine. For about half the cost, set PollyVoiceId to Matthew and PollyEngine to neural. US English generative voices: Matthew, Stephen, Kenneth, Nate (male); Ruth, Danielle, Joanna, Salli, Tiffany (female). Long-form: Gregory, Patrick (male); Ruth, Danielle (female). A cloned (custom) voice ID also works with the generative engine."
   }
 ]
