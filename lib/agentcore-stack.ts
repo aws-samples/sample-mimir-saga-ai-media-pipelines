@@ -42,7 +42,7 @@ export class AgentCoreStack extends cdk.Stack {
 
     // AI voice-over voice (parameters.json: PollyEngine / PollyVoiceId).
     const pollyEngine = String(this.node.tryGetContext('pollyEngine') || 'generative').toLowerCase();
-    const pollyVoiceId = String(this.node.tryGetContext('pollyVoiceId') || 'Matthew');
+    const pollyVoiceId = String(this.node.tryGetContext('pollyVoiceId') || 'Stephen');
     if (!['standard', 'neural', 'long-form', 'generative'].includes(pollyEngine)) {
       throw new Error(`PollyEngine must be standard, neural, long-form or generative (got '${pollyEngine}')`);
     }

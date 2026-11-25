@@ -234,7 +234,8 @@ The rough-cut-agent model is configured via environment variables in `lib/agentc
 
 - `AGENT_MODEL_ID` — Model for source material and timeline assembly (default: Claude Sonnet 4.6, `us.anthropic.claude-sonnet-4-6`). If it is not accessible, the agent falls back to Amazon Nova Pro (`us.amazon.nova-pro-v1:0`)
 - `SCRIPT_ANALYSIS_MODEL_ID` — Model for script analysis (falls back to `AGENT_MODEL_ID`)
-- `POLLY_VOICE_ID` — Amazon Polly voice for VO synthesis (default: `Matthew`)
+- `POLLY_VOICE_ID` — Amazon Polly voice for VO synthesis (default: `Stephen`, set with `PollyVoiceId`)
+- `POLLY_ENGINE` — Amazon Polly engine (default: `generative`, set with `PollyEngine`). Matthew on the neural engine costs about half as much ($16 vs $30 per 1M characters): set `PollyVoiceId` to `Matthew` and `PollyEngine` to `neural` in `parameters.json` and redeploy. Matthew generative is also available.
 
 ### Mimir Integrations (Auto-Registered)
 

@@ -40,8 +40,8 @@ def _clear_env(monkeypatch):
     monkeypatch.delenv("POLLY_VOICE_ID", raising=False)
 
 
-def test_defaults_to_generative_matthew():
-    assert tools.polly_voice_config() == ("generative", "Matthew")
+def test_defaults_to_generative_stephen():
+    assert tools.polly_voice_config() == ("generative", "Stephen")
 
 
 def test_reads_engine_and_voice_from_env(monkeypatch):
