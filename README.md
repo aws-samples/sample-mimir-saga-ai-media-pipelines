@@ -208,7 +208,7 @@ Never pass API keys in `--environment-variables-override` as `PLAINTEXT`: overri
      { "ParameterKey": "MimirInstance", "ParameterValue": "us" }
    ]
    ```
-   Optional parameters: `SummaryFieldName`, `MimirAllowedIssuer`, `EnableTranscribeFallback`, `EnableEmbeddingsWebhook`, `EmbeddingsFilterField`, `EmbeddingsFilterValues`, `EmbeddingsFilterFieldKey` — see `parameters.example.json` for descriptions and [Embeddings Filter](#embeddings-filter-optional).
+   Optional parameters: `SummaryFieldName`, `MimirAllowedIssuer`, `EnableTranscribeFallback`, `EnableEmbeddingsWebhook`, `EmbeddingsFilterField`, `EmbeddingsFilterValues`, `EmbeddingsFilterFieldKey`, `PollyEngine`, `PollyVoiceId` — see `parameters.example.json` for descriptions and [Embeddings Filter](#embeddings-filter-optional).
 3. Install dependencies:
    ```bash
    npm install
@@ -384,7 +384,7 @@ You are responsible for the cost of the AWS services used while running this sam
 | Amazon Bedrock AgentCore | Agent runtimes + gateway | Per invocation / runtime-seconds |
 | Amazon Transcribe | Transcript fallback + rough-cut transcription | Per audio minute (skipped when Mimir already has a transcript) |
 | AWS Elemental MediaConvert | Smart-crop reframes + graphics compositing | Per output minute |
-| Amazon Polly | Voice-over synthesis | Per character |
+| Amazon Polly | Voice-over synthesis | Per character (generative $30, neural $16 per 1M; set with `PollyEngine`) |
 | AWS Lambda / Step Functions / S3 / DynamoDB | Orchestration, staging, state | Minor at sample scale |
 
 Costs scale with the number and length of videos processed. Delete the stacks when finished evaluating (see Cleanup).
