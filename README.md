@@ -208,7 +208,7 @@ Never pass API keys in `--environment-variables-override` as `PLAINTEXT`: overri
      { "ParameterKey": "MimirInstance", "ParameterValue": "us" }
    ]
    ```
-   Optional parameters: `SummaryFieldName`, `MimirAllowedIssuer`, `EnableTranscribeFallback`, `EnableEmbeddingsWebhook`, `EmbeddingsFilterField`, `EmbeddingsFilterValues`, `EmbeddingsFilterFieldKey` — see `parameters.example.json` for descriptions and [Embeddings Filter](#embeddings-filter-optional).
+   Optional parameters: `SummaryFieldName`, `MimirAllowedIssuer`, `EnableTranscribeFallback`, `EnableEmbeddingsWebhook`, `EmbeddingsFilterField`, `EmbeddingsFilterValues`, `EmbeddingsFilterFieldKey`, `PollyEngine`, `PollyVoiceId` — see `parameters.example.json` for descriptions and [Embeddings Filter](#embeddings-filter-optional).
 3. Install dependencies:
    ```bash
    npm install
@@ -230,7 +230,8 @@ The rough-cut-agent model is configured via environment variables in `lib/agentc
 
 - `AGENT_MODEL_ID` — Model for source material and timeline assembly (default: Claude Sonnet 4.6, `us.anthropic.claude-sonnet-4-6`). If it is not accessible, the agent falls back to Amazon Nova Pro (`us.amazon.nova-pro-v1:0`)
 - `SCRIPT_ANALYSIS_MODEL_ID` — Model for script analysis (falls back to `AGENT_MODEL_ID`)
-- `POLLY_VOICE_ID` — Amazon Polly voice for VO synthesis (default: `Matthew`)
+- `POLLY_VOICE_ID` — Amazon Polly voice for VO synthesis (default: `Stephen`, set with `PollyVoiceId`)
+- `POLLY_ENGINE` — Amazon Polly engine (default: `generative`, set with `PollyEngine`). Matthew on the neural engine costs about half as much ($16 vs $30 per 1M characters): set `PollyVoiceId` to `Matthew` and `PollyEngine` to `neural` in `parameters.json` and redeploy. Matthew generative is also available.
 
 ### Mimir Integrations (Auto-Registered)
 
@@ -384,7 +385,7 @@ You are responsible for the cost of the AWS services used while running this sam
 | Amazon Bedrock AgentCore | Agent runtimes + gateway | Per invocation / runtime-seconds |
 | Amazon Transcribe | Transcript fallback + rough-cut transcription | Per audio minute (skipped when Mimir already has a transcript) |
 | AWS Elemental MediaConvert | Smart-crop reframes + graphics compositing | Per output minute |
-| Amazon Polly | Voice-over synthesis | Per character |
+| Amazon Polly | Voice-over synthesis | Per character (generative $30, neural $16 per 1M; set with `PollyEngine`) |
 | AWS Lambda / Step Functions / S3 / DynamoDB | Orchestration, staging, state | Minor at sample scale |
 
 Costs scale with the number and length of videos processed. Delete the stacks when finished evaluating (see Cleanup).
