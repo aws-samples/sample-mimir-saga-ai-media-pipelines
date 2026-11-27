@@ -27,7 +27,17 @@
   {
     "ParameterKey": "MimirAllowedIssuer",
     "ParameterValue": "",
-    "Description": "Optional. Pin the Cognito issuer URL allowed to invoke custom actions (e.g. https://cognito-idp.us-east-1.amazonaws.com/us-east-1_XXXXXXXXX). Leave blank to accept any valid AWS Cognito issuer — tokens must still be signature-valid, unexpired Cognito ID tokens. Set this to lock the API to your specific Mimir tenant."
+    "Description": "Usually leave blank: ./deploy.sh derives it from Mimir's public config at https://<MimirInstance>.mjoll.no/api/v1 (clientConfig.cognitoEndpoint). Set it only to override, e.g. https://cognito-idp.us-east-1.amazonaws.com/us-east-1_XXXXXXXXX. If it is blank at deploy time (derivation failed, or you deploy without deploy.sh), every Mimir custom action is rejected with 401."
+  },
+  {
+    "ParameterKey": "MimirAllowedAudience",
+    "ParameterValue": "",
+    "Description": "Usually leave blank: ./deploy.sh derives it from the same public config (clientConfig.appClientId). Comma-separated Mimir app client IDs (the ID token's 'aud' claim). The client is shared by all tenants in a Mimir region, so this is not a tenant check."
+  },
+  {
+    "ParameterKey": "MimirAllowedTenant",
+    "ParameterValue": "",
+    "Description": "Recommended. Your Mimir tenant id (the token's mimir:tenant_id claim). Mimir shares one Cognito user pool across all tenants in a region, so while this is blank ANY Mimir user in your region can trigger your custom actions. To find it, run any custom action once and read the 'MIMIR_ALLOWED_TENANT is not set; allowing tenant ...' line in the mimir-handler log, or ask Mimir support."
   },
   {
     "ParameterKey": "EnableTranscribeFallback",
