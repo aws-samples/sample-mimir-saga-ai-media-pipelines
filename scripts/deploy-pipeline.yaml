@@ -31,6 +31,7 @@ Metadata:
         Parameters:
           - ProductName
           - VisibilityGroupMap
+          - GraphicsTemplatePrefix
       - Label:
           default: "Deployment Source"
         Parameters:
@@ -58,6 +59,8 @@ Metadata:
         default: "Product Name"
       VisibilityGroupMap:
         default: "Visibility Group Map (optional JSON)"
+      GraphicsTemplatePrefix:
+        default: "Graphics Template Prefix"
       RepoUrl:
         default: "Git Repository URL"
       GitBranch:
@@ -154,6 +157,18 @@ Parameters:
       Optional JSON map of ingest source name to Mimir visibility group, with
       '*' as fallback (e.g., {"reuters":"agency-content","*":null}). Leave
       blank to use the tenant default visibility for all sources.
+
+  GraphicsTemplatePrefix:
+    Type: String
+    Default: graphics-overlay
+    AllowedPattern: ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$
+    Description: >
+      Base name of the Reframe + Graphics Lottie templates in the templates
+      bucket (templates/<prefix>-1080x1920-9x16.json and the 1x1 / 4x5
+      files). Default graphics-overlay is the reference template every deploy
+      uploads. Use your own name (e.g. my-station) for a customer template
+      you upload yourself, so the deploy never overwrites it. Seeds SSM on
+      the first build only; later, change it with MSAI_PARAM_OVERRIDES.
 
   RepoUrl:
     Type: String
@@ -301,6 +316,8 @@ Resources:
             Value: !Ref ProductName
           - Name: MSAI_VISIBILITY_GROUP_MAP
             Value: !Ref VisibilityGroupMap
+          - Name: MSAI_GRAPHICS_TEMPLATE_PREFIX
+            Value: !Ref GraphicsTemplatePrefix
           - Name: MSAI_PARAM_OVERRIDES
             Value: '{}'
       Source:
@@ -390,7 +407,8 @@ Resources:
                         SummaryFieldName: process.env.MSAI_SUMMARY_FIELD,
                         MimirAllowedIssuer: process.env.MSAI_ALLOWED_ISSUER || '',
                         MimirAllowedTenant: process.env.MSAI_ALLOWED_TENANT || '',
-                        EnableTranscribeFallback: process.env.MSAI_TRANSCRIBE_FALLBACK || 'true'
+                        EnableTranscribeFallback: process.env.MSAI_TRANSCRIBE_FALLBACK || 'true',
+                        GraphicsTemplatePrefix: process.env.MSAI_GRAPHICS_TEMPLATE_PREFIX || 'graphics-overlay'
                       };
                       for (const [key, value] of Object.entries(values)) {
                         const p = params.find(p => p.ParameterKey === key);

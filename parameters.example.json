@@ -45,6 +45,11 @@
     "Description": "When 'true', the Summarize action runs AWS Transcribe on items that have no Mimir transcript, publishes the transcript back to Mimir, and includes it in the summary. Set to 'false' to keep summaries visual-only and avoid Transcribe costs."
   },
   {
+    "ParameterKey": "GraphicsTemplatePrefix",
+    "ParameterValue": "graphics-overlay",
+    "Description": "Base name of the Reframe + Graphics Lottie templates in the templates bucket: templates/<prefix>-1080x1920-9x16.json, -1080x1080-1x1.json and -1080x1350-4x5.json. Default 'graphics-overlay' is the reference template that every deploy uploads from graphics/templates/. For a customer template use its own name (e.g. 'my-station') so the deploy never overwrites it. Letters, digits, '.', '_' and '-' only; no '/' or '..'."
+  },
+  {
     "ParameterKey": "EnableEmbeddingsWebhook",
     "ParameterValue": "true",
     "Description": "When 'true', the deploy registers the Mimir 'Embed Video Content' webhook so new video items are embedded automatically. Set to 'false' to register no embeddings webhook (an existing one is removed on deploy)."
