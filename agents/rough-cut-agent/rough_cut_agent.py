@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import boto3
+import botocore.exceptions
 
 # Configure logging so the agent's own INFO logs reach stdout (and therefore the
 # AgentCore CloudWatch runtime logs). Without an explicit handler, the root
@@ -30,6 +31,11 @@ app = BedrockAgentCoreApp()
 stepfunctions = boto3.client('stepfunctions')
 
 
+# Task tokens that already got a SendTaskSuccess/SendTaskFailure, so invoke()'s
+# outer handler only reports errors that no stage reported.
+_callback_sent: set = set()
+
+
 def send_task_success(task_token: str, timeline_item_id: str, summary: dict):
     """Send success callback to Step Functions with timeline results."""
     try:
@@ -41,6 +47,7 @@ def send_task_success(task_token: str, timeline_item_id: str, summary: dict):
             taskToken=task_token,
             output=json.dumps(output),
         )
+        _callback_sent.add(task_token)
         logger.info(f"SendTaskSuccess sent for timeline item {timeline_item_id}")
     except Exception as e:
         logger.error(f"Failed to send task success: {e}")
@@ -55,6 +62,7 @@ def send_task_failure(task_token: str, error: str, cause: str):
             error=error,
             cause=cause,
         )
+        _callback_sent.add(task_token)
         logger.info(f"SendTaskFailure sent: {error}")
     except Exception as e:
         logger.error(f"Failed to send task failure: {e}")
@@ -83,18 +91,49 @@ _VALID_SECTION_TYPES = {
 _PARSED_SECTION_REQUIRED_KEYS = {"sectionType", "content", "orderIndex", "estimatedDurationMs"}
 
 
+def _norm_enum(value):
+    """Normalise a model-supplied enum string: trim, lower-case, and turn
+    spaces/hyphens into underscores ("PKG VO" -> "pkg_vo"). Non-strings are
+    returned unchanged so the caller's membership check still rejects them."""
+    if isinstance(value, str):
+        return re.sub(r"[\s-]+", "_", value.strip().lower())
+    return value
+
+
+def _as_number(value, path: str):
+    """Accept a number or a numeric string ("5000", " 5000.0 "); raise otherwise."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        try:
+            number = float(value.strip())
+            return int(number) if number.is_integer() else number
+        except ValueError:
+            pass
+    raise ValueError(f"{path} must be a number")
+
+
 def _validate_script_analysis(data: dict) -> None:
     """Validate that *data* conforms to the ScriptAnalysis schema.
 
     Raises ``ValueError`` when required fields are missing or have the wrong
     shape.  Only structural checks are performed — content quality is left to
-    the LLM.
+    the LLM. Formatting differences between models are normalised in place
+    instead of failing the run: enum case/whitespace, numeric strings, and
+    ``null`` for an empty array.
     """
     missing = _SCRIPT_ANALYSIS_REQUIRED_KEYS - set(data.keys())
     if missing:
         raise ValueError(f"ScriptAnalysis missing required keys: {missing}")
 
+    for key in ("soundbites", "interviewSegments", "voiceOverSections"):
+        if data[key] is None:
+            data[key] = []
+    if isinstance(data.get("body"), dict) and data["body"].get("mainPoints", []) is None:
+        data["body"]["mainPoints"] = []
+
     # scriptFormat
+    data["scriptFormat"] = _norm_enum(data["scriptFormat"])
     script_format = data["scriptFormat"]
     if script_format not in _VALID_SCRIPT_FORMATS:
         raise ValueError(
@@ -113,19 +152,20 @@ def _validate_script_analysis(data: dict) -> None:
             raise ValueError(
                 f"parsedSections[{i}] missing required keys: {section_missing}"
             )
+        section["sectionType"] = _norm_enum(section["sectionType"])
         if section["sectionType"] not in _VALID_SECTION_TYPES:
             raise ValueError(
                 f"parsedSections[{i}].sectionType must be one of "
                 f"{_VALID_SECTION_TYPES}, got: {section['sectionType']!r}"
             )
-        if not isinstance(section["estimatedDurationMs"], (int, float)):
-            raise ValueError(
-                f"parsedSections[{i}].estimatedDurationMs must be a number"
-            )
+        section["estimatedDurationMs"] = _as_number(
+            section["estimatedDurationMs"], f"parsedSections[{i}].estimatedDurationMs"
+        )
 
     # totalEstimatedDurationMs
-    if not isinstance(data["totalEstimatedDurationMs"], (int, float)):
-        raise ValueError("totalEstimatedDurationMs must be a number")
+    data["totalEstimatedDurationMs"] = _as_number(
+        data["totalEstimatedDurationMs"], "totalEstimatedDurationMs"
+    )
 
     # lead
     lead = data["lead"]
@@ -154,6 +194,27 @@ def _validate_script_analysis(data: dict) -> None:
     for key in ("soundbites", "interviewSegments", "voiceOverSections"):
         if not isinstance(data[key], list):
             raise ValueError(f"{key} must be an array")
+
+
+_JSON_ATTEMPTS = 2
+
+
+def _run_json_agent(make_agent, user_message: str, parse, stage: str):
+    """Run a fresh agent on *user_message* and return ``parse(response_text)``.
+
+    Retries once, with a fresh agent, when ``parse`` raises ``ValueError``
+    (invalid JSON or a schema check). Bedrock errors are not retried here:
+    botocore and Strands already retry throttling, and a model or access
+    error would only repeat.
+    """
+    for attempt in range(1, _JSON_ATTEMPTS + 1):
+        response_text = str(make_agent()(user_message))
+        try:
+            return parse(response_text)
+        except ValueError as exc:
+            if attempt == _JSON_ATTEMPTS:
+                raise
+            logger.warning(f"{stage}: model output rejected ({exc}); retrying once")
 
 
 def run_script_analysis(story_context: dict, profile_directive: str = "") -> dict:
@@ -223,34 +284,35 @@ def run_script_analysis(story_context: dict, profile_directive: str = "") -> dic
     # Use SCRIPT_ANALYSIS_MODEL_ID if set, otherwise fall back to AGENT_MODEL_ID
     bedrock_model = _get_bedrock_model(env_key="SCRIPT_ANALYSIS_MODEL_ID")
 
-    agent = Agent(
-        model=bedrock_model,
-        system_prompt=SCRIPT_ANALYSIS_PROMPT + (profile_directive or ""),
-    )
+    def make_agent():
+        return Agent(
+            model=bedrock_model,
+            system_prompt=SCRIPT_ANALYSIS_PROMPT + (profile_directive or ""),
+        )
 
-    # Invoke the agent
-    result = agent(user_message)
+    def parse(response_text: str) -> dict:
+        # Parse JSON from the response — the prompt asks for raw JSON but the
+        # model may occasionally wrap it in markdown fences.
+        json_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", response_text)
+        if json_match:
+            json_str = json_match.group(1).strip()
+        else:
+            json_str = response_text.strip()
 
-    # Extract the text response from the agent result
-    response_text = str(result)
+        try:
+            analysis = json.loads(json_str)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Script Analysis Agent returned invalid JSON: {exc}"
+            ) from exc
+        if not isinstance(analysis, dict):
+            raise ValueError("Script Analysis Agent returned JSON that is not an object")
 
-    # Parse JSON from the response — the prompt asks for raw JSON but the
-    # model may occasionally wrap it in markdown fences.
-    json_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", response_text)
-    if json_match:
-        json_str = json_match.group(1).strip()
-    else:
-        json_str = response_text.strip()
+        # Validate the parsed output
+        _validate_script_analysis(analysis)
+        return analysis
 
-    try:
-        analysis = json.loads(json_str)
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"Script Analysis Agent returned invalid JSON: {exc}"
-        ) from exc
-
-    # Validate the parsed output
-    _validate_script_analysis(analysis)
+    analysis = _run_json_agent(make_agent, user_message, parse, "Script Analysis")
 
     logger.info("Script analysis completed and validated successfully")
     return analysis
@@ -286,6 +348,15 @@ def _validate_source_material(data: dict) -> None:
         for j, candidate in enumerate(segment["candidates"]):
             cpath = f"candidateSegments[{i}].candidates[{j}]"
 
+            # Normalise enum formatting; a null optional field counts as absent
+            # (newer models send null instead of omitting a key).
+            for key in ("trackPlacement", "audioType", "matchConfidence", "voiceoverSource"):
+                if key in candidate:
+                    if candidate[key] is None or candidate[key] == "":
+                        del candidate[key]
+                    else:
+                        candidate[key] = _norm_enum(candidate[key])
+
             if "trackPlacement" in candidate:
                 if candidate["trackPlacement"] not in _VALID_TRACK_PLACEMENTS:
                     raise ValueError(
@@ -316,10 +387,10 @@ def _validate_source_material(data: dict) -> None:
                     )
 
     # coveragePercentage — default to 0 if missing, validate type if present
-    if "coveragePercentage" not in data:
+    if data.get("coveragePercentage") is None:
         data["coveragePercentage"] = 0
-    elif not isinstance(data["coveragePercentage"], (int, float)):
-        raise ValueError("coveragePercentage must be a number")
+    else:
+        data["coveragePercentage"] = _as_number(data["coveragePercentage"], "coveragePercentage")
 
     if "gaps" not in data:
         data["gaps"] = []
@@ -336,6 +407,16 @@ def _validate_source_material(data: dict) -> None:
 # ---------------------------------------------------------------------------
 # Configurable Bedrock Model Helper
 # ---------------------------------------------------------------------------
+
+_TRANSIENT_BEDROCK_CODES = {
+    "ThrottlingException", "TooManyRequestsException", "ServiceUnavailableException",
+    "InternalServerException", "ModelNotReadyException", "ModelTimeoutException",
+}
+_TRANSIENT_BEDROCK_ERRORS = (
+    botocore.exceptions.ReadTimeoutError,
+    botocore.exceptions.ConnectTimeoutError,
+    botocore.exceptions.EndpointConnectionError,
+)
 
 _DEFAULT_MODEL_ID = "us.amazon.nova-pro-v1:0"
 _DEFAULT_MAX_TOKENS = 10000
@@ -390,12 +471,22 @@ def _get_bedrock_model(env_key: str = "AGENT_MODEL_ID") -> BedrockModel:
         )
         logger.info(f"Model {model_id} validated successfully")
     except Exception as e:
-        logger.warning(
-            f"Model {model_id} is not accessible ({e}), "
-            f"falling back to default: {_DEFAULT_MODEL_ID}"
-        )
-        model_id = _DEFAULT_MODEL_ID
-        max_tokens = _DEFAULT_MAX_TOKENS
+        code = ((getattr(e, "response", None) or {}).get("Error") or {}).get("Code", "")
+        if code in _TRANSIENT_BEDROCK_CODES or isinstance(e, _TRANSIENT_BEDROCK_ERRORS):
+            # A busy model is still the right model: keep it. Strands retries
+            # throttling on the real calls; falling back here would silently
+            # switch the whole stage to another model for one 1-token probe.
+            logger.warning(
+                f"Model {model_id} check hit a transient error ({code or type(e).__name__}); "
+                f"keeping {model_id}"
+            )
+        else:
+            logger.error(
+                f"Model {model_id} is not accessible ({e}), "
+                f"falling back to default: {_DEFAULT_MODEL_ID}"
+            )
+            model_id = _DEFAULT_MODEL_ID
+            max_tokens = _DEFAULT_MAX_TOKENS
 
     return BedrockModel(
         model_id=model_id,
@@ -818,48 +909,51 @@ def run_source_material(script_analysis: dict, enriched_assets: list) -> dict:
 
     bedrock_model = _get_bedrock_model()
 
-    agent = Agent(
-        model=bedrock_model,
-        system_prompt=SOURCE_MATERIAL_PROMPT,
-        tools=[get_word_timing],
-    )
+    def make_agent():
+        return Agent(
+            model=bedrock_model,
+            system_prompt=SOURCE_MATERIAL_PROMPT,
+            tools=[get_word_timing],
+        )
 
-    result = agent(user_message)
+    def parse(response_text: str) -> dict:
+        # Parse JSON — try all json blocks, prefer the last valid one
+        json_blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)```", response_text)
+        if not json_blocks:
+            xml_match = re.search(r"<json>\s*([\s\S]*?)</json>", response_text)
+            if xml_match:
+                json_blocks = [xml_match.group(1)]
+            else:
+                brace_match = re.search(r"\{[\s\S]*\}", response_text)
+                json_blocks = [brace_match.group(0)] if brace_match else [response_text]
 
-    response_text = str(result)
+        source_material = None
+        last_error = None
+        for block in reversed(json_blocks):
+            try:
+                candidate = json.loads(block.strip())
+                if isinstance(candidate, dict) and "candidateSegments" in candidate:
+                    source_material = candidate
+                    break
+            except json.JSONDecodeError as exc:
+                last_error = exc
+                continue
 
-    # Parse JSON — try all json blocks, prefer the last valid one
-    json_blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)```", response_text)
-    if not json_blocks:
-        xml_match = re.search(r"<json>\s*([\s\S]*?)</json>", response_text)
-        if xml_match:
-            json_blocks = [xml_match.group(1)]
-        else:
-            brace_match = re.search(r"\{[\s\S]*\}", response_text)
-            json_blocks = [brace_match.group(0)] if brace_match else [response_text]
+        if source_material is None:
+            # Fall back to trying the last block raw
+            try:
+                source_material = json.loads(json_blocks[-1].strip())
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Source Material Agent returned invalid JSON: {last_error or exc}"
+                ) from exc
+        if not isinstance(source_material, dict):
+            raise ValueError("Source Material Agent returned JSON that is not an object")
 
-    source_material = None
-    last_error = None
-    for block in reversed(json_blocks):
-        try:
-            candidate = json.loads(block.strip())
-            if isinstance(candidate, dict) and "candidateSegments" in candidate:
-                source_material = candidate
-                break
-        except json.JSONDecodeError as exc:
-            last_error = exc
-            continue
+        _validate_source_material(source_material)
+        return source_material
 
-    if source_material is None:
-        # Fall back to trying the last block raw
-        try:
-            source_material = json.loads(json_blocks[-1].strip())
-        except json.JSONDecodeError as exc:
-            raise ValueError(
-                f"Source Material Agent returned invalid JSON: {last_error or exc}"
-            ) from exc
-
-    _validate_source_material(source_material)
+    source_material = _run_json_agent(make_agent, user_message, parse, "Source Material")
 
     # Post-process: inject B-roll candidates for pkg_vo sections from pre-computed data.
     # The agent may not have selected B-roll clips, so we ensure they're available
@@ -2215,16 +2309,14 @@ def run_timeline_assembly(
     bedrock_model = _get_bedrock_model()
 
     # Zero-tool agent — only produces sequenceDetails JSON
-    agent = Agent(
-        model=bedrock_model,
-        system_prompt=TIMELINE_ASSEMBLY_PROMPT + (profile_directive or ""),
-        tools=[],
-    )
+    def make_agent():
+        return Agent(
+            model=bedrock_model,
+            system_prompt=TIMELINE_ASSEMBLY_PROMPT + (profile_directive or ""),
+            tools=[],
+        )
 
-    try:
-        result = agent(user_message)
-        response_text = str(result)
-
+    def parse(response_text: str) -> dict:
         # Parse JSON — try all json blocks, prefer the last valid one
         json_blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)```", response_text)
         if not json_blocks:
@@ -2255,12 +2347,16 @@ def run_timeline_assembly(
                     f"Timeline Assembly Agent returned invalid JSON: {last_error or exc}"
                 ) from exc
 
+        # Validate the assembly has sequenceDetails
+        if not isinstance(assembly, dict) or not isinstance(assembly.get("sequenceDetails"), dict):
+            raise ValueError("Timeline Assembly Agent output missing 'sequenceDetails' object")
+        return assembly
+
+    try:
+        assembly = _run_json_agent(make_agent, user_message, parse, "Timeline Assembly")
+
         # Save the agent's raw output as an artifact
         _save_artifact(story_id, "timeline-assembly-agent-output", assembly, run_id)
-
-        # Validate the assembly has sequenceDetails
-        if "sequenceDetails" not in assembly or not isinstance(assembly.get("sequenceDetails"), dict):
-            raise ValueError("Timeline Assembly Agent output missing 'sequenceDetails' object")
 
         # No-AI-voice profiles (Generate VO / VOSOT): the anchor reads the
         # script live, so there must be NO voice-over audio on A1 (track id 3).
@@ -3266,8 +3362,17 @@ def invoke(payload):
     except Exception as e:
         logger.error(f"Error in Rough Cut Agent: {e}")
         # Stages 1/2 send their own SendTaskFailure before re-raising, and
-        # Stage 3 handles callbacks internally. This outer handler returns
-        # an error dict so the entrypoint always produces a response.
+        # Stage 3 handles callbacks internally. An error anywhere else (story
+        # parsing, Stage 0, the model check before Stage 3's try) sent nothing,
+        # so the execution waited out InvokeRoughCutAgent's 30-minute timeout.
+        if task_token and task_token not in _callback_sent:
+            send_task_failure(
+                task_token=task_token,
+                error="RoughCutAgentError",
+                cause=f"{type(e).__name__}: {e}"[:4000],
+            )
+        # This outer handler returns an error dict so the entrypoint always
+        # produces a response.
         return {
             "error": str(e),
             "status": "error",

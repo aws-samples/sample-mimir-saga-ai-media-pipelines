@@ -15,6 +15,23 @@ const agentCoreClient = new BedrockAgentCoreClient();
 const sfnClient = new SFNClient();
 const ssmClient = new SSMClient();
 
+// Adds generatedTranscriptS3Uri from the TranscribeAssets Map results to each
+// asset. This used to be a JSONata $map in the state machine, which hit the
+// Step Functions "Expression evaluation memory limit" on a 114-asset story,
+// returned an object instead of an array for a one-asset story, and an array
+// of URIs when an asset appeared twice in the results.
+function mergeGeneratedTranscripts(assets, transcribeResults) {
+  const uris = new Map();
+  for (const r of [].concat(transcribeResults || [])) {
+    if (r && r.status === 'completed' && r.transcriptS3Uri && !uris.has(r.mimirItemId)) {
+      uris.set(r.mimirItemId, r.transcriptS3Uri);
+    }
+  }
+  return [].concat(assets || []).map((a) => (
+    a && uris.has(a.mimirItemId) ? { ...a, generatedTranscriptS3Uri: uris.get(a.mimirItemId) } : a
+  ));
+}
+
 async function sendTaskFailure(taskToken, error, cause) {
   try {
     await sfnClient.send(new SendTaskFailureCommand({
@@ -48,12 +65,14 @@ exports.handler = async (event) => {
 
     const sessionId = randomUUID();
 
+    const assets = mergeGeneratedTranscripts(event.storyContext?.assets, event.transcribeResults);
+
     // Build payload — include task_token so the agent can callback
     const agentPayload = {
       task_token: taskToken,
-      storyContext: event.storyContext || {},
+      storyContext: { ...(event.storyContext || {}), assets },
       story: event.storyContext?.story || event.story || {},
-      assets: event.storyContext?.assets || [],
+      assets,
       instances: event.storyContext?.instances || [],
       notes: event.storyContext?.notes || [],
       storyId: event.storyId || '',
@@ -98,3 +117,5 @@ exports.handler = async (event) => {
     throw err;
   }
 };
+
+exports.mergeGeneratedTranscripts = mergeGeneratedTranscripts;
